@@ -1,8 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"regexp"
@@ -15,7 +18,89 @@ import (
 	"github.com/slack-go/slack/socketmode"
 )
 
-var ghPRPattern = regexp.MustCompile(`<?https://github\.com/([^/>\s]+)/([^/>\s]+)/pull/(\d+)[^>\s]*>?`)
+type ReviewMode string
+
+const (
+	ModeInitial  ReviewMode = "initial"
+	ModeReReview ReviewMode = "re-review"
+	ModeQuick    ReviewMode = "quick"
+	ModeFinal    ReviewMode = "final"
+)
+
+type ReviewRequest struct {
+	Diff            string
+	PRURL           string
+	Questions       string
+	Mode            ReviewMode
+	SelfReview      bool
+	JiraTicket      string
+	JiraContext     string
+	PreviousReviews string
+}
+
+type claudeResponse struct {
+	Result        string  `json:"result"`
+	TotalCostUSD  float64 `json:"total_cost_usd"`
+	DurationMS    int64   `json:"duration_ms"`
+	DurationAPIMS int64   `json:"duration_api_ms"`
+	NumTurns      int     `json:"num_turns"`
+	IsError       bool    `json:"is_error"`
+	Usage         struct {
+		InputTokens              int64 `json:"input_tokens"`
+		OutputTokens             int64 `json:"output_tokens"`
+		CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+		CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+	} `json:"usage"`
+}
+
+type UsageStats struct {
+	mu                sync.Mutex
+	TotalCostUSD      float64
+	TotalDurationMS   int64
+	TotalInputTokens  int64
+	TotalOutputTokens int64
+	TotalCacheRead    int64
+	AgentCalls        int
+}
+
+func (u *UsageStats) Add(resp claudeResponse) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.TotalCostUSD += resp.TotalCostUSD
+	u.TotalDurationMS += resp.DurationAPIMS
+	u.TotalInputTokens += resp.Usage.InputTokens
+	u.TotalOutputTokens += resp.Usage.OutputTokens
+	u.TotalCacheRead += resp.Usage.CacheReadInputTokens
+	u.AgentCalls++
+}
+
+func (u *UsageStats) String() string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return fmt.Sprintf("%d calls | $%.4f | %s in + %s out tokens | %ds API time",
+		u.AgentCalls, u.TotalCostUSD,
+		formatTokens(u.TotalInputTokens), formatTokens(u.TotalOutputTokens),
+		u.TotalDurationMS/1000)
+}
+
+func formatTokens(n int64) string {
+	if n < 1000 {
+		return fmt.Sprintf("%d", n)
+	}
+	return fmt.Sprintf("%.1fk", float64(n)/1000)
+}
+
+type perspective struct {
+	name   string
+	prompt string
+}
+
+var (
+	ghPRPattern       = regexp.MustCompile(`<?https://github\.com/([^/>\s]+)/([^/>\s]+)/pull/(\d+)[^>\s]*>?`)
+	jiraTicketPattern = regexp.MustCompile(`\b[A-Z]{2,}-\d+\b`)
+	modePattern       = regexp.MustCompile(`--(initial|re-review|quick|final)\b`)
+	selfPattern       = regexp.MustCompile(`--self\b`)
+)
 
 func main() {
 	_ = godotenv.Load()
@@ -24,7 +109,6 @@ func main() {
 	appToken := mustEnv("SLACK_APP_TOKEN")
 	channelID := mustEnv("WATCHED_CHANNEL_ID")
 	notifyUserID := mustEnv("NOTIFY_USER_ID")
-
 	reviewQuestions := os.Getenv("REVIEW_QUESTIONS")
 
 	api := slack.New(botToken, slack.OptionAppLevelToken(appToken))
@@ -60,7 +144,6 @@ func main() {
 			for _, m := range matches {
 				owner, repo, prNum := m[1], m[2], m[3]
 				prURL := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, prNum)
-
 				go handlePR(api, ev, prURL, owner, repo, prNum, channelID, notifyUserID, reviewQuestions)
 			}
 		}
@@ -72,21 +155,102 @@ func main() {
 	}
 }
 
+func parseMode(text string) ReviewMode {
+	if m := modePattern.FindStringSubmatch(text); m != nil {
+		return ReviewMode(m[1])
+	}
+	return ModeInitial
+}
+
+func parseJiraTicket(text string) string {
+	cleaned := ghPRPattern.ReplaceAllString(text, "")
+	cleaned = modePattern.ReplaceAllString(cleaned, "")
+	cleaned = selfPattern.ReplaceAllString(cleaned, "")
+	if m := jiraTicketPattern.FindString(cleaned); m != "" {
+		return m
+	}
+	return ""
+}
+
 func handlePR(api *slack.Client, ev *slackevents.MessageEvent, prURL, owner, repo, prNum, channelID, notifyUserID, reviewQuestions string) {
+	mode := parseMode(ev.Text)
+	selfReview := selfPattern.MatchString(ev.Text)
+	jiraTicket := parseJiraTicket(ev.Text)
+
 	_ = api.AddReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
-	dmUser(api, notifyUserID, fmt.Sprintf("Starting review of <%s>...", prURL))
+
+	modeDesc := string(mode)
+	if selfReview {
+		modeDesc += " (self)"
+	}
+	dmUser(api, notifyUserID, fmt.Sprintf("Starting %s review of <%s>...", modeDesc, prURL))
 
 	dmUser(api, notifyUserID, fmt.Sprintf("Fetching diff for <%s>...", prURL))
 	diff, err := fetchDiff(owner, repo, prNum)
 	if err != nil {
-		postError(api, ev, prURL, channelID, notifyUserID, err)
+		if selfReview {
+			dmUser(api, notifyUserID, fmt.Sprintf("Failed to review <%s>: %v", prURL, err))
+		} else {
+			postError(api, ev, prURL, channelID, notifyUserID, err)
+		}
 		return
 	}
-	dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Launching 4 review agents...", len(diff)))
 
-	review, err := reviewWithClaude(api, notifyUserID, diff, prURL, reviewQuestions)
+	if jiraTicket == "" {
+		if title := fetchPRTitle(owner, repo, prNum); title != "" {
+			if m := jiraTicketPattern.FindString(title); m != "" {
+				jiraTicket = m
+			}
+		}
+	}
+
+	var jiraContext string
+	if jiraTicket != "" {
+		jiraContext = fetchJiraContext(jiraTicket)
+		if jiraContext != "" {
+			dmUser(api, notifyUserID, fmt.Sprintf("Including Jira context for %s...", jiraTicket))
+		}
+	}
+
+	var previousReviews string
+	if mode == ModeReReview {
+		previousReviews = fetchPreviousReviews(owner, repo, prNum)
+	}
+
+	agentCount := 4
+	if mode == ModeQuick {
+		agentCount = 1
+	}
+	dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Launching %d agent(s) in %s mode...", len(diff), agentCount, mode))
+
+	req := ReviewRequest{
+		Diff:            diff,
+		PRURL:           prURL,
+		Questions:       reviewQuestions,
+		Mode:            mode,
+		SelfReview:      selfReview,
+		JiraTicket:      jiraTicket,
+		JiraContext:     jiraContext,
+		PreviousReviews: previousReviews,
+	}
+
+	review, stats, err := reviewWithClaude(api, notifyUserID, req)
 	if err != nil {
-		postError(api, ev, prURL, channelID, notifyUserID, err)
+		if selfReview {
+			dmUser(api, notifyUserID, fmt.Sprintf("Failed to review <%s>: %v", prURL, err))
+		} else {
+			postError(api, ev, prURL, channelID, notifyUserID, err)
+		}
+		return
+	}
+
+	modeLabel := capitalize(string(mode))
+
+	if selfReview {
+		dmUser(api, notifyUserID, fmt.Sprintf("*%s review for <%s>:*\n\n%s", modeLabel, prURL, review))
+		_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+		_ = api.AddReaction("white_check_mark", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+		dmUser(api, notifyUserID, fmt.Sprintf("Done! %s review for <%s> sent via DM only.\nUsage: %s", modeLabel, prURL, stats))
 		return
 	}
 
@@ -98,7 +262,7 @@ func handlePR(api *slack.Client, ev *slackevents.MessageEvent, prURL, owner, rep
 
 	_, _, err = api.PostMessage(
 		channelID,
-		slack.MsgOptionText(fmt.Sprintf("*Review for <%s>:*\n\n%s", prURL, review), false),
+		slack.MsgOptionText(fmt.Sprintf("*%s review for <%s>:*\n\n%s", modeLabel, prURL, review), false),
 		slack.MsgOptionTS(ev.TimeStamp),
 	)
 	if err != nil {
@@ -108,7 +272,7 @@ func handlePR(api *slack.Client, ev *slackevents.MessageEvent, prURL, owner, rep
 	_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 	_ = api.AddReaction("white_check_mark", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 
-	dmUser(api, notifyUserID, fmt.Sprintf("Done! Review for <%s> posted on GitHub and in <#%s>.", prURL, channelID))
+	dmUser(api, notifyUserID, fmt.Sprintf("Done! %s review for <%s> posted on GitHub and in <#%s>.\nUsage: %s", modeLabel, prURL, channelID, stats))
 }
 
 func fetchDiff(owner, repo, prNum string) (string, error) {
@@ -129,16 +293,202 @@ func fetchDiff(owner, repo, prNum string) (string, error) {
 	return diff, nil
 }
 
-func reviewWithClaude(api *slack.Client, notifyUserID, diff, prURL, reviewQuestions string) (string, error) {
-	perspectives := []struct {
-		name   string
-		prompt string
-	}{
+func fetchPRTitle(owner, repo, prNum string) string {
+	cmd := exec.Command("gh", "pr", "view", prNum,
+		"--repo", fmt.Sprintf("%s/%s", owner, repo),
+		"--json", "title", "--jq", ".title")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func fetchPreviousReviews(owner, repo, prNum string) string {
+	cmd := exec.Command("gh", "pr", "view", prNum,
+		"--repo", fmt.Sprintf("%s/%s", owner, repo),
+		"--json", "comments", "--jq", ".comments[].body")
+	out, err := cmd.Output()
+	if err != nil {
+		log.Printf("failed to fetch previous reviews for %s/%s#%s: %v", owner, repo, prNum, err)
+		return ""
+	}
+	result := strings.TrimSpace(string(out))
+	if len(result) > 8000 {
+		result = result[:8000] + "\n[truncated]"
+	}
+	return result
+}
+
+func fetchJiraContext(ticketKey string) string {
+	baseURL := os.Getenv("JIRA_BASE_URL")
+	email := os.Getenv("JIRA_EMAIL")
+	token := os.Getenv("JIRA_API_TOKEN")
+
+	if baseURL == "" || email == "" || token == "" {
+		return ""
+	}
+
+	apiURL := fmt.Sprintf("%s/rest/api/2/issue/%s?fields=summary,description",
+		strings.TrimRight(baseURL, "/"), ticketKey)
+
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		log.Printf("jira: failed to create request: %v", err)
+		return ""
+	}
+	req.SetBasicAuth(email, token)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("jira: request failed for %s: %v", ticketKey, err)
+		return ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		log.Printf("jira: status %d for %s: %s", resp.StatusCode, ticketKey, string(body))
+		return ""
+	}
+
+	var issue struct {
+		Key    string `json:"key"`
+		Fields struct {
+			Summary     string `json:"summary"`
+			Description string `json:"description"`
+		} `json:"fields"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&issue); err != nil {
+		log.Printf("jira: decode failed for %s: %v", ticketKey, err)
+		return ""
+	}
+
+	desc := issue.Fields.Description
+	if len(desc) > 2000 {
+		desc = desc[:2000] + "\n[truncated]"
+	}
+
+	return fmt.Sprintf("## Jira Ticket: %s\n**Summary:** %s\n**Description:**\n%s\n\nEvaluate whether this PR adequately addresses the ticket requirements.",
+		issue.Key, issue.Fields.Summary, desc)
+}
+
+func reviewWithClaude(api *slack.Client, notifyUserID string, req ReviewRequest) (string, *UsageStats, error) {
+	stats := &UsageStats{}
+
+	var extraContext strings.Builder
+	if req.JiraContext != "" {
+		extraContext.WriteString("\n\n" + req.JiraContext + "\n")
+	}
+	if req.PreviousReviews != "" {
+		extraContext.WriteString(fmt.Sprintf("\n\n## Previous Review Comments\nThis PR was reviewed before. Consider whether previous feedback was addressed:\n\n%s\n", req.PreviousReviews))
+	}
+	contextBlock := extraContext.String()
+	questionsStr := questionsBlock(req.Questions)
+
+	if req.Mode == ModeQuick {
+		result, err := runQuickReview(req.PRURL, req.Diff, contextBlock, questionsStr, stats)
+		return result, stats, err
+	}
+
+	perspectives := buildPerspectives(req.PRURL, req.Diff, req.Mode, contextBlock, questionsStr)
+
+	reviews := make([]string, len(perspectives))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var firstErr error
+
+	for i, p := range perspectives {
+		wg.Add(1)
+		go func(idx int, name, prompt string) {
+			defer wg.Done()
+			log.Printf("agent %s: starting %s review for %s", name, req.Mode, req.PRURL)
+			text, resp, err := runClaude(prompt)
+			if err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("agent %s failed: %w", name, err)
+				}
+				mu.Unlock()
+				return
+			}
+			stats.Add(resp)
+			mu.Lock()
+			reviews[idx] = fmt.Sprintf("## %s Review\n\n%s", strings.ToUpper(name), text)
+			mu.Unlock()
+			log.Printf("agent %s: done for %s ($%.4f)", name, req.PRURL, resp.TotalCostUSD)
+		}(i, p.name, p.prompt)
+	}
+	wg.Wait()
+
+	if firstErr != nil {
+		return "", stats, firstErr
+	}
+
+	dmUser(api, notifyUserID, fmt.Sprintf("All %d agents done. Running validator...", len(perspectives)))
+	allReviews := strings.Join(reviews, "\n\n---\n\n")
+
+	log.Printf("validator: starting for %s", req.PRURL)
+	validated, valResp, err := runClaude(fmt.Sprintf(`You are a review validator. You have %d independent code reviews of a PR and the original diff.
+
+Your job:
+1. Check each review for accuracy — are the claims correct given the actual diff?
+2. Flag any incorrect or misleading feedback
+3. Note if reviewers missed anything important
+4. Check if any questions raised by reviewers can be answered from the diff itself — if so, answer them
+
+Be concise. Output a validation report.
+
+## Original Diff
+`+"```diff\n%s\n```"+`
+
+## Reviews to Validate
+%s`, len(perspectives), req.Diff, allReviews))
+	if err != nil {
+		return "", stats, fmt.Errorf("validator failed: %w", err)
+	}
+	stats.Add(valResp)
+	log.Printf("validator: done for %s ($%.4f)", req.PRURL, valResp.TotalCostUSD)
+
+	dmUser(api, notifyUserID, "Validator done. Merging reviews...")
+	log.Printf("merger: starting for %s", req.PRURL)
+	merged, mergeResp, err := runMerger(allReviews, validated, req.Mode)
+	if err != nil {
+		return "", stats, err
+	}
+	stats.Add(mergeResp)
+	log.Printf("merger: done for %s ($%.4f)", req.PRURL, mergeResp.TotalCostUSD)
+
+	return merged, stats, nil
+}
+
+func buildPerspectives(prURL, diff string, mode ReviewMode, contextBlock, questionsStr string) []perspective {
+	var modePreamble string
+	switch mode {
+	case ModeReReview:
+		modePreamble = `NOTE: This is a RE-REVIEW. This PR has been reviewed before by an automated system. Focus on:
+- Whether previously identified issues have been addressed
+- Any new issues introduced since the last review
+- Remaining concerns that still need attention
+Do not repeat feedback that has clearly been addressed.
+
+`
+	case ModeFinal:
+		modePreamble = `NOTE: This is a FINAL REVIEW before merge. Err on the side of approval:
+- Only flag truly critical/blocking issues (bugs, security, data loss)
+- Mention nice-to-haves and nit picks as OPTIONAL/non-blocking
+- If the code is generally sound and functional, recommend approval
+
+`
+	}
+
+	return []perspective{
 		{
 			name: "correctness",
-			prompt: fmt.Sprintf(`You are a code review agent focused on CORRECTNESS and SECURITY.
+			prompt: fmt.Sprintf(`%sYou are a code review agent focused on CORRECTNESS and SECURITY.
 Review this pull request: %s
-
+%s
 Focus on:
 - Bugs, logic errors, edge cases
 - Security vulnerabilities (injection, auth issues, data leaks)
@@ -149,13 +499,13 @@ Be specific. Reference exact lines. No fluff.
 
 %s
 
-`+"```diff\n%s\n```", prURL, questionsBlock(reviewQuestions), diff),
+`+"```diff\n%s\n```", modePreamble, prURL, contextBlock, questionsStr, diff),
 		},
 		{
 			name: "design",
-			prompt: fmt.Sprintf(`You are a code review agent focused on DESIGN and MAINTAINABILITY.
+			prompt: fmt.Sprintf(`%sYou are a code review agent focused on DESIGN and MAINTAINABILITY.
 Review this pull request: %s
-
+%s
 Focus on:
 - Architecture and design patterns
 - Code organization, naming, readability
@@ -167,13 +517,13 @@ Be specific. Reference exact lines. No fluff.
 
 %s
 
-`+"```diff\n%s\n```", prURL, questionsBlock(reviewQuestions), diff),
+`+"```diff\n%s\n```", modePreamble, prURL, contextBlock, questionsStr, diff),
 		},
 		{
 			name: "pragmatic",
-			prompt: fmt.Sprintf(`You are a pragmatic senior engineer reviewing this PR.
+			prompt: fmt.Sprintf(`%sYou are a pragmatic senior engineer reviewing this PR.
 Review this pull request: %s
-
+%s
 Focus on:
 - Does this actually solve the problem it claims to?
 - What could break in production?
@@ -184,14 +534,14 @@ Be direct and opinionated. Skip obvious things that are fine.
 
 %s
 
-`+"```diff\n%s\n```", prURL, questionsBlock(reviewQuestions), diff),
+`+"```diff\n%s\n```", modePreamble, prURL, contextBlock, questionsStr, diff),
 		},
 		{
 			name: "go-expert",
-			prompt: fmt.Sprintf(`You are an elite Go code reviewer with deep expertise in Go 1.26, its standard library, and production-grade Go development. You review with the rigor of a senior staff engineer at a top-tier infrastructure company.
+			prompt: fmt.Sprintf(`%sYou are an elite Go code reviewer with deep expertise in Go 1.26, its standard library, and production-grade Go development. You review with the rigor of a senior staff engineer at a top-tier infrastructure company.
 
 Review this pull request: %s
-
+%s
 ## Review Criteria
 
 ### Correctness
@@ -249,69 +599,66 @@ Be specific, not vague. Show exactly what and why. Respect existing codebase pat
 
 %s
 
-`+"```diff\n%s\n```", prURL, questionsBlock(reviewQuestions), diff),
+`+"```diff\n%s\n```", modePreamble, prURL, contextBlock, questionsStr, diff),
 		},
 	}
+}
 
-	reviews := make([]string, len(perspectives))
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	var firstErr error
+func runQuickReview(prURL, diff, contextBlock, questionsStr string, stats *UsageStats) (string, error) {
+	prompt := fmt.Sprintf(`You are an expert Go code reviewer doing a QUICK REVIEW. Be concise and focused.
 
-	for i, p := range perspectives {
-		wg.Add(1)
-		go func(idx int, name, prompt string) {
-			defer wg.Done()
-			log.Printf("agent %s: starting review for %s", name, prURL)
-			out, err := runClaude(prompt)
-			if err != nil {
-				mu.Lock()
-				if firstErr == nil {
-					firstErr = fmt.Errorf("agent %s failed: %w", name, err)
-				}
-				mu.Unlock()
-				return
-			}
-			mu.Lock()
-			reviews[idx] = fmt.Sprintf("## %s Review\n\n%s", strings.ToUpper(name), out)
-			mu.Unlock()
-			log.Printf("agent %s: done for %s", name, prURL)
-		}(i, p.name, p.prompt)
-	}
-	wg.Wait()
+Review this pull request: %s
+%s
+Prioritize:
+1. Critical bugs, security issues, data loss risks
+2. Correctness problems and race conditions
+3. Obvious design issues
 
-	if firstErr != nil {
-		return "", firstErr
-	}
+Skip: style nits, minor naming suggestions, test coverage gaps for non-critical paths.
 
-	dmUser(api, notifyUserID, "All 4 agents done. Running validator...")
+Output format:
+- **Summary** — one sentence on what this PR does
+- **Issues** (if any) — what's wrong and how to fix it
+- **Verdict** — Approve / Request Changes
 
-	allReviews := strings.Join(reviews, "\n\n---\n\n")
+Keep it short. If the code is sound, say so and approve.
 
-	log.Printf("validator: starting for %s", prURL)
-	validated, err := runClaude(fmt.Sprintf(`You are a review validator. You have 4 independent code reviews of a PR and the original diff.
+%s
 
-Your job:
-1. Check each review for accuracy — are the claims correct given the actual diff?
-2. Flag any incorrect or misleading feedback
-3. Note if reviewers missed anything important
-4. Check if any questions raised by reviewers can be answered from the diff itself — if so, answer them
+`+"```diff\n%s\n```", prURL, contextBlock, questionsStr, diff)
 
-Be concise. Output a validation report.
-
-## Original Diff
-`+"```diff\n%s\n```"+`
-
-## Reviews to Validate
-%s`, diff, allReviews))
+	log.Printf("quick-review: starting for %s", prURL)
+	text, resp, err := runClaude(prompt)
 	if err != nil {
-		return "", fmt.Errorf("validator failed: %w", err)
+		return "", fmt.Errorf("quick review failed: %w", err)
 	}
-	log.Printf("validator: done for %s", prURL)
+	stats.Add(resp)
+	log.Printf("quick-review: done for %s ($%.4f)", prURL, resp.TotalCostUSD)
+	return text, nil
+}
 
-	dmUser(api, notifyUserID, "Validator done. Merging reviews...")
-	log.Printf("merger: starting for %s", prURL)
-	merged, err := runClaude(fmt.Sprintf(`You are a review synthesizer. You have 4 independent code reviews and a validation report.
+func runMerger(allReviews, validated string, mode ReviewMode) (string, claudeResponse, error) {
+	var modeRules string
+	switch mode {
+	case ModeFinal:
+		modeRules = `
+IMPORTANT — FINAL REVIEW RULES:
+- The bar for "Request Changes" is HIGH — only for genuine bugs, security issues, or data loss risks
+- If there are no critical/blocking issues, the verdict MUST be "Approve"
+- All non-critical feedback should be marked as OPTIONAL and NON-BLOCKING
+- Frame suggestions as "Consider for a future PR" rather than required changes
+`
+	case ModeReReview:
+		modeRules = `
+RE-REVIEW RULES:
+- Focus on what changed since the previous review
+- Briefly acknowledge resolved issues
+- Emphasize remaining or newly introduced concerns
+- If all previous critical issues are resolved and no new ones appeared, lean toward approval
+`
+	}
+
+	text, resp, err := runClaude(fmt.Sprintf(`You are a review synthesizer. You have 4 independent code reviews and a validation report.
 
 Merge them into ONE cohesive, comprehensive review. Structure:
 
@@ -329,18 +676,16 @@ Rules:
 - Incorporate answers to reviewer questions from the validation
 - Keep it actionable and specific
 - Reference file names and line numbers where relevant
-
+%s
 ## Reviews
 %s
 
 ## Validation Report
-%s`, allReviews, validated))
+%s`, modeRules, allReviews, validated))
 	if err != nil {
-		return "", fmt.Errorf("merger failed: %w", err)
+		return "", claudeResponse{}, fmt.Errorf("merger failed: %w", err)
 	}
-	log.Printf("merger: done for %s", prURL)
-
-	return merged, nil
+	return text, resp, nil
 }
 
 func questionsBlock(questions string) string {
@@ -350,16 +695,25 @@ func questionsBlock(questions string) string {
 	return fmt.Sprintf("Also specifically answer these questions:\n%s", questions)
 }
 
-func runClaude(prompt string) (string, error) {
-	cmd := exec.Command("claude", "-p", prompt, "--output-format", "text")
+func runClaude(prompt string) (string, claudeResponse, error) {
+	cmd := exec.Command("claude", "-p", prompt, "--output-format", "json")
 	out, err := cmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			return "", fmt.Errorf("claude CLI: %s", string(exitErr.Stderr))
+			return "", claudeResponse{}, fmt.Errorf("claude CLI: %s", string(exitErr.Stderr))
 		}
-		return "", err
+		return "", claudeResponse{}, err
 	}
-	return strings.TrimSpace(string(out)), nil
+
+	var resp claudeResponse
+	if err := json.Unmarshal(out, &resp); err != nil {
+		return strings.TrimSpace(string(out)), claudeResponse{}, nil
+	}
+	if resp.IsError {
+		return "", claudeResponse{}, fmt.Errorf("claude returned error: %s", resp.Result)
+	}
+
+	return strings.TrimSpace(resp.Result), resp, nil
 }
 
 func postGitHubComment(owner, repo, prNum, review string) error {
@@ -402,4 +756,11 @@ func mustEnv(key string) string {
 		log.Fatalf("required env var %s not set", key)
 	}
 	return v
+}
+
+func capitalize(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
 }
