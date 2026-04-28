@@ -4,6 +4,8 @@ vars:
   GO: /usr/local/go/bin/go
   BINARY: pr-review-bot
   TMUX_SESSION: bot
+  ROOT_DIR:
+    sh: pwd
 
 tasks:
   build:
@@ -14,18 +16,16 @@ tasks:
   restart:
     desc: Kill running bot in tmux and restart it
     cmds:
-      - tmux send-keys -t {{.TMUX_SESSION}} C-c
-      - sleep 1
-      - tmux send-keys -t {{.TMUX_SESSION}} "./{{.BINARY}}" Enter
+      - tmux kill-session -t {{.TMUX_SESSION}} 2>/dev/null || true
+      - tmux new-session -d -s {{.TMUX_SESSION}} -c {{.ROOT_DIR}} "./{{.BINARY}}"
 
   deploy:
     desc: Pull latest code, rebuild, and restart the bot
     cmds:
       - git pull
       - "{{.GO}} build -o {{.BINARY}} ."
-      - tmux send-keys -t {{.TMUX_SESSION}} C-c
-      - sleep 1
-      - tmux send-keys -t {{.TMUX_SESSION}} "./{{.BINARY}}" Enter
+      - tmux kill-session -t {{.TMUX_SESSION}} 2>/dev/null || true
+      - tmux new-session -d -s {{.TMUX_SESSION}} -c {{.ROOT_DIR}} "./{{.BINARY}}"
 
   logs:
     desc: Tail the bot log
