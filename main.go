@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -95,11 +96,23 @@ type perspective struct {
 	prompt string
 }
 
+type ScoreResult struct {
+	Correctness         int    `json:"correctness"`
+	Security            int    `json:"security"`
+	Design              int    `json:"design"`
+	GoQuality           int    `json:"go_quality"`
+	Testing             int    `json:"testing"`
+	ProductionReadiness int    `json:"production_readiness"`
+	Overall             int    `json:"overall"`
+	Summary             string `json:"summary"`
+}
+
 var (
-	ghPRPattern       = regexp.MustCompile(`<?https://github\.com/([^/>\s]+)/([^/>\s]+)/pull/(\d+)[^>\s]*>?`)
-	jiraTicketPattern = regexp.MustCompile(`\b[A-Z]{2,}-\d+\b`)
-	modePattern       = regexp.MustCompile(`--(initial|re-review|quick|final)\b`)
-	selfPattern       = regexp.MustCompile(`--self\b`)
+	ghPRPattern          = regexp.MustCompile(`<?https://github\.com/([^/>\s]+)/([^/>\s]+)/pull/(\d+)[^>\s]*>?`)
+	jiraTicketPattern    = regexp.MustCompile(`\b[A-Z]{2,}-\d+\b`)
+	modePattern          = regexp.MustCompile(`--(initial|re-review|quick|final)\b`)
+	selfPattern          = regexp.MustCompile(`--self\b`)
+	previousScorePattern = regexp.MustCompile(`\*\*Quality Score: (\d+)/100\*\*`)
 )
 
 func main() {
@@ -234,7 +247,7 @@ func handlePR(api *slack.Client, ev *slackevents.MessageEvent, prURL, owner, rep
 		PreviousReviews: previousReviews,
 	}
 
-	review, stats, err := reviewWithClaude(api, notifyUserID, req)
+	review, score, stats, err := reviewWithClaude(api, notifyUserID, req)
 	if err != nil {
 		if selfReview {
 			dmUser(api, notifyUserID, fmt.Sprintf("Failed to review <%s>: %v", prURL, err))
@@ -245,12 +258,16 @@ func handlePR(api *slack.Client, ev *slackevents.MessageEvent, prURL, owner, rep
 	}
 
 	modeLabel := capitalize(string(mode))
+	scoreMsg := ""
+	if score != nil {
+		scoreMsg = fmt.Sprintf(" | Score: %d/100", score.Overall)
+	}
 
 	if selfReview {
 		dmUser(api, notifyUserID, fmt.Sprintf("*%s review for <%s>:*\n\n%s", modeLabel, prURL, review))
 		_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 		_ = api.AddReaction("white_check_mark", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
-		dmUser(api, notifyUserID, fmt.Sprintf("Done! %s review for <%s> sent via DM only.\nUsage: %s", modeLabel, prURL, stats))
+		dmUser(api, notifyUserID, fmt.Sprintf("Done! %s review for <%s> sent via DM only.%s\nUsage: %s", modeLabel, prURL, scoreMsg, stats))
 		return
 	}
 
@@ -272,7 +289,7 @@ func handlePR(api *slack.Client, ev *slackevents.MessageEvent, prURL, owner, rep
 	_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 	_ = api.AddReaction("white_check_mark", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 
-	dmUser(api, notifyUserID, fmt.Sprintf("Done! %s review for <%s> posted on GitHub and in <#%s>.\nUsage: %s", modeLabel, prURL, channelID, stats))
+	dmUser(api, notifyUserID, fmt.Sprintf("Done! %s review for <%s> posted on GitHub and in <#%s>.%s\nUsage: %s", modeLabel, prURL, channelID, scoreMsg, stats))
 }
 
 func fetchDiff(owner, repo, prNum string) (string, error) {
@@ -374,7 +391,7 @@ func fetchJiraContext(ticketKey string) string {
 		issue.Key, issue.Fields.Summary, desc)
 }
 
-func reviewWithClaude(api *slack.Client, notifyUserID string, req ReviewRequest) (string, *UsageStats, error) {
+func reviewWithClaude(api *slack.Client, notifyUserID string, req ReviewRequest) (string, *ScoreResult, *UsageStats, error) {
 	stats := &UsageStats{}
 
 	var extraContext strings.Builder
@@ -387,9 +404,34 @@ func reviewWithClaude(api *slack.Client, notifyUserID string, req ReviewRequest)
 	contextBlock := extraContext.String()
 	questionsStr := questionsBlock(req.Questions)
 
+	var score ScoreResult
+	var scoreErr error
+	var scoreWg sync.WaitGroup
+	scoreWg.Add(1)
+	go func() {
+		defer scoreWg.Done()
+		log.Printf("scorer: starting for %s", req.PRURL)
+		var resp claudeResponse
+		score, resp, scoreErr = runScorer(req.Diff)
+		if scoreErr != nil {
+			log.Printf("scorer: failed for %s: %v", req.PRURL, scoreErr)
+		} else {
+			stats.Add(resp)
+			log.Printf("scorer: done for %s (score: %d/100, $%.4f)", req.PRURL, score.Overall, resp.TotalCostUSD)
+		}
+	}()
+
 	if req.Mode == ModeQuick {
 		result, err := runQuickReview(req.PRURL, req.Diff, contextBlock, questionsStr, stats)
-		return result, stats, err
+		if err != nil {
+			return "", nil, stats, err
+		}
+		scoreWg.Wait()
+		if scoreErr == nil {
+			result = formatScoreHeader(score, req.PreviousReviews) + "\n\n---\n\n" + result
+			return result, &score, stats, nil
+		}
+		return result, nil, stats, nil
 	}
 
 	perspectives := buildPerspectives(req.PRURL, req.Diff, req.Mode, contextBlock, questionsStr)
@@ -423,7 +465,7 @@ func reviewWithClaude(api *slack.Client, notifyUserID string, req ReviewRequest)
 	wg.Wait()
 
 	if firstErr != nil {
-		return "", stats, firstErr
+		return "", nil, stats, firstErr
 	}
 
 	dmUser(api, notifyUserID, fmt.Sprintf("All %d agents done. Running validator...", len(perspectives)))
@@ -446,7 +488,7 @@ Be concise. Output a validation report.
 ## Reviews to Validate
 %s`, len(perspectives), req.Diff, allReviews))
 	if err != nil {
-		return "", stats, fmt.Errorf("validator failed: %w", err)
+		return "", nil, stats, fmt.Errorf("validator failed: %w", err)
 	}
 	stats.Add(valResp)
 	log.Printf("validator: done for %s ($%.4f)", req.PRURL, valResp.TotalCostUSD)
@@ -455,12 +497,18 @@ Be concise. Output a validation report.
 	log.Printf("merger: starting for %s", req.PRURL)
 	merged, mergeResp, err := runMerger(allReviews, validated, req.Mode)
 	if err != nil {
-		return "", stats, err
+		return "", nil, stats, err
 	}
 	stats.Add(mergeResp)
 	log.Printf("merger: done for %s ($%.4f)", req.PRURL, mergeResp.TotalCostUSD)
 
-	return merged, stats, nil
+	scoreWg.Wait()
+	if scoreErr == nil {
+		merged = formatScoreHeader(score, req.PreviousReviews) + "\n\n---\n\n" + merged
+		return merged, &score, stats, nil
+	}
+
+	return merged, nil, stats, nil
 }
 
 func buildPerspectives(prURL, diff string, mode ReviewMode, contextBlock, questionsStr string) []perspective {
@@ -635,6 +683,86 @@ Keep it short. If the code is sound, say so and approve.
 	stats.Add(resp)
 	log.Printf("quick-review: done for %s ($%.4f)", prURL, resp.TotalCostUSD)
 	return text, nil
+}
+
+func runScorer(diff string) (ScoreResult, claudeResponse, error) {
+	prompt := fmt.Sprintf(`You are a code quality scorer. Evaluate this PR diff and rate the code quality.
+
+Score each dimension 0-10 (10 = excellent, 0 = critical problems):
+- correctness: Logic errors, bugs, edge cases, error handling
+- security: Vulnerabilities, data leaks, auth issues, injection risks
+- design: Architecture, complexity, naming, readability
+- go_quality: Idiomatic Go, stdlib usage, concurrency patterns, error wrapping
+- testing: Test presence and quality, edge case coverage
+- production_readiness: Logging, monitoring, graceful degradation
+
+If a dimension has no relevant code in the diff (e.g., no security-sensitive changes), score 8-9 reflecting no risk introduced.
+
+Respond with ONLY this JSON object, no markdown fences, no other text:
+{"correctness":N,"security":N,"design":N,"go_quality":N,"testing":N,"production_readiness":N,"overall":N,"summary":"one sentence"}
+
+`+"```diff\n%s\n```", diff)
+
+	text, resp, err := runClaude(prompt)
+	if err != nil {
+		return ScoreResult{}, claudeResponse{}, err
+	}
+
+	var score ScoreResult
+	raw := strings.TrimSpace(text)
+	if i := strings.Index(raw, "{"); i >= 0 {
+		if j := strings.LastIndex(raw, "}"); j > i {
+			raw = raw[i : j+1]
+		}
+	}
+
+	if err := json.Unmarshal([]byte(raw), &score); err != nil {
+		return ScoreResult{}, resp, fmt.Errorf("scorer JSON parse: %w", err)
+	}
+
+	score.Overall = (score.Correctness*25 + score.Security*20 + score.Design*15 +
+		score.GoQuality*15 + score.Testing*15 + score.ProductionReadiness*10) / 10
+
+	return score, resp, nil
+}
+
+func formatScoreHeader(score ScoreResult, previousReviews string) string {
+	header := fmt.Sprintf("## Quality Score: %d/100", score.Overall)
+
+	if previousReviews != "" {
+		if matches := previousScorePattern.FindAllStringSubmatch(previousReviews, -1); len(matches) > 0 {
+			last := matches[len(matches)-1]
+			if prev, err := strconv.Atoi(last[1]); err == nil {
+				delta := score.Overall - prev
+				switch {
+				case delta > 0:
+					header += fmt.Sprintf(" (↑ +%d)", delta)
+				case delta < 0:
+					header += fmt.Sprintf(" (↓ %d)", delta)
+				default:
+					header += " (no change)"
+				}
+			}
+		}
+	}
+
+	header += fmt.Sprintf(`
+
+| Dimension | Score |
+|---|---|
+| Correctness | %d/10 |
+| Security | %d/10 |
+| Design | %d/10 |
+| Go Quality | %d/10 |
+| Testing | %d/10 |
+| Production Readiness | %d/10 |
+
+> %s`,
+		score.Correctness, score.Security, score.Design,
+		score.GoQuality, score.Testing, score.ProductionReadiness,
+		score.Summary)
+
+	return header
 }
 
 func runMerger(allReviews, validated string, mode ReviewMode) (string, claudeResponse, error) {

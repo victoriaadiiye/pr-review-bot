@@ -1,0 +1,36 @@
+version: "3"
+
+vars:
+  GO: /usr/local/go/bin/go
+  BINARY: pr-review-bot
+  TMUX_SESSION: bot
+
+tasks:
+  build:
+    desc: Build the binary
+    cmds:
+      - "{{.GO}} build -o {{.BINARY}} ."
+
+  restart:
+    desc: Kill running bot in tmux and restart it
+    cmds:
+      - tmux send-keys -t {{.TMUX_SESSION}} C-c
+      - sleep 1
+      - tmux send-keys -t {{.TMUX_SESSION}} "./{{.BINARY}}" Enter
+
+  deploy:
+    desc: Pull latest code, rebuild, and restart the bot
+    cmds:
+      - git pull
+      - task build
+      - task restart
+
+  logs:
+    desc: Tail the bot log
+    cmds:
+      - tail -f bot.log
+
+  status:
+    desc: Show tmux session status
+    cmds:
+      - tmux capture-pane -t {{.TMUX_SESSION}} -p | tail -20

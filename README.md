@@ -1,6 +1,6 @@
 # PR Review Bot
 
-Multi-agent code review bot that watches a Slack channel for GitHub PR links, runs parallel Claude-powered review agents, and posts synthesized reviews back to GitHub and Slack.
+Multi-agent code review bot that watches a Slack channel for GitHub PR links, runs parallel Claude-powered review agents, and posts synthesized reviews back to GitHub and Slack. Includes a **Quality Score** (0-100) that breaks down across 6 dimensions and tracks improvement across re-reviews.
 
 ## How it works
 
@@ -10,10 +10,11 @@ Multi-agent code review bot that watches a Slack channel for GitHub PR links, ru
    - **Design** -- architecture, complexity, naming, test quality
    - **Pragmatic** -- does it solve the problem, what breaks in prod, simpler approaches
    - **Go Expert** -- idiomatic Go, Go 1.26 features, project-specific patterns (highest authority)
-3. A **validator** checks all 4 reviews against the actual diff for accuracy
-4. A **merger** synthesizes everything into one cohesive review with verdict
-5. Review posted as a GitHub PR comment and Slack thread reply
-6. Bot reacts with :white_check_mark: and DMs you usage stats
+3. A **scorer** evaluates code quality across 6 dimensions (runs in parallel with agents)
+4. A **validator** checks all 4 reviews against the actual diff for accuracy
+5. A **merger** synthesizes everything into one cohesive review with verdict
+6. Review posted as a GitHub PR comment and Slack thread reply with quality score header
+7. Bot reacts with :white_check_mark: and DMs you usage stats + score
 
 ## Review modes
 
@@ -51,15 +52,48 @@ https://github.com/org/repo/pull/42 --quick PROJ-123   # works with any mode
 
 No Jira env vars? Feature silently skips. No ticket in message or PR title? Same.
 
+## Quality Score
+
+Every review includes a quality score header:
+
+```
+## Quality Score: 78/100
+
+| Dimension | Score |
+|---|---|
+| Correctness | 8/10 |
+| Security | 9/10 |
+| Design | 7/10 |
+| Go Quality | 8/10 |
+| Testing | 6/10 |
+| Production Readiness | 8/10 |
+```
+
+**Dimensions** (weighted for overall score):
+- **Correctness** (25%) -- bugs, logic errors, edge cases, error handling
+- **Security** (20%) -- vulnerabilities, data leaks, auth, injection risks
+- **Design** (15%) -- architecture, complexity, naming, readability
+- **Go Quality** (15%) -- idiomatic Go, stdlib usage, concurrency, error wrapping
+- **Testing** (15%) -- test presence, quality, edge case coverage
+- **Production Readiness** (10%) -- logging, monitoring, graceful degradation
+
+On `--re-review`, the score shows a delta from the previous review:
+
+```
+## Quality Score: 85/100 (↑ +12)
+```
+
+The scorer runs as a parallel agent alongside the review agents, adding minimal latency.
+
 ## Usage tracking
 
 Every review DM includes a usage summary:
 
 ```
-6 calls | $0.1523 | 45.2k in + 8.1k out tokens | 32s API time
+7 calls | $0.1823 | 52.1k in + 9.4k out tokens | 38s API time
 ```
 
-Tracks cost, token counts, and API time across all agent calls (reviewers + validator + merger).
+Tracks cost, token counts, and API time across all agent calls (reviewers + scorer + validator + merger).
 
 ## Setup
 
@@ -113,7 +147,19 @@ go build -o pr-review-bot .
 ./pr-review-bot
 ```
 
-### 4. Run as macOS service (optional)
+### 4. Deploy on coder box
+
+Requires [Task](https://taskfile.dev/) (`go install github.com/go-task/task/v3/cmd/task@latest`).
+
+```sh
+task deploy    # git pull + rebuild + restart tmux session
+task build     # build only
+task restart   # restart the bot in tmux
+task logs      # tail bot.log
+task status    # show last 20 lines from tmux pane
+```
+
+### 5. Run as macOS service (optional)
 
 Edit `com.vuifhaolain.pr-review-bot.plist` to match your paths, then:
 
@@ -148,20 +194,23 @@ Slack message (PR link + flags)
   fetchPreviousReviews (gh pr view) -- if --re-review
         |
         v
-  +-----------+-----------+-----------+-----------+
-  |correctness|  design   | pragmatic | go-expert |  (parallel)
-  +-----------+-----------+-----------+-----------+
-        |           |           |           |
-        +-----+-----+-----+-----+
-              |
-              v
-         validator (checks accuracy)
-              |
-              v
-         merger (synthesizes final review)
-              |
-              v
-     GitHub comment + Slack thread + DM with usage stats
+  +-----------+-----------+-----------+-----------+---------+
+  |correctness|  design   | pragmatic | go-expert | scorer  |  (parallel)
+  +-----------+-----------+-----------+-----------+---------+
+        |           |           |           |           |
+        +-----+-----+-----+-----+           |
+              |                              |
+              v                              |
+         validator (checks accuracy)         |
+              |                              |
+              v                              |
+         merger (synthesizes final review)   |
+              |                              |
+              +----------+-------------------+
+                         |
+                         v
+     Score header + merged review
+     GitHub comment + Slack thread + DM with score + usage stats
      (or DM-only if --self)
 ```
 
