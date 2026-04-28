@@ -296,10 +296,8 @@ func fetchDiff(owner, repo, prNum string) (string, error) {
 	cmd := exec.Command("gh", "pr", "diff", prNum, "--repo", fmt.Sprintf("%s/%s", owner, repo))
 	out, err := cmd.Output()
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return "", fmt.Errorf("gh pr diff failed: %s", string(exitErr.Stderr))
-		}
-		return "", fmt.Errorf("gh pr diff failed: %w", err)
+		log.Printf("gh pr diff failed for %s/%s#%s, trying git fallback", owner, repo, prNum)
+		return fetchDiffViaGit(owner, repo, prNum)
 	}
 
 	diff := string(out)
@@ -307,6 +305,56 @@ func fetchDiff(owner, repo, prNum string) (string, error) {
 	if len(diff) > maxChars {
 		diff = diff[:maxChars] + "\n\n[diff truncated]"
 	}
+	return diff, nil
+}
+
+func fetchDiffViaGit(owner, repo, prNum string) (string, error) {
+	repoSlug := fmt.Sprintf("%s/%s", owner, repo)
+	repoURL := fmt.Sprintf("https://github.com/%s/%s.git", owner, repo)
+
+	baseCmd := exec.Command("gh", "pr", "view", prNum, "--repo", repoSlug, "--json", "baseRefName", "--jq", ".baseRefName")
+	baseOut, err := baseCmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("get PR base ref: %w", err)
+	}
+	baseRef := strings.TrimSpace(string(baseOut))
+
+	tmpDir, err := os.MkdirTemp("", "pr-diff-*")
+	if err != nil {
+		return "", fmt.Errorf("create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	if out, err := exec.Command("git", "init", tmpDir).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("git init: %s", string(out))
+	}
+	if out, err := exec.Command("git", "-C", tmpDir, "remote", "add", "origin", repoURL).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("git remote add: %s", string(out))
+	}
+
+	log.Printf("fetching base ref %s and PR #%s head via git for %s", baseRef, prNum, repoSlug)
+	if out, err := exec.Command("git", "-C", tmpDir, "fetch", "--depth=1", "origin", baseRef+":base").CombinedOutput(); err != nil {
+		return "", fmt.Errorf("fetch base: %s", string(out))
+	}
+	if out, err := exec.Command("git", "-C", tmpDir, "fetch", "--depth=1", "origin", fmt.Sprintf("pull/%s/head:pr", prNum)).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("fetch PR head: %s", string(out))
+	}
+
+	diffCmd := exec.Command("git", "-C", tmpDir, "diff", "base..pr")
+	out, err := diffCmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return "", fmt.Errorf("git diff: %s", string(exitErr.Stderr))
+		}
+		return "", fmt.Errorf("git diff: %w", err)
+	}
+
+	diff := string(out)
+	const maxChars = 80_000
+	if len(diff) > maxChars {
+		diff = diff[:maxChars] + "\n\n[diff truncated]"
+	}
+	log.Printf("git fallback: got %d char diff for %s#%s", len(diff), repoSlug, prNum)
 	return diff, nil
 }
 
