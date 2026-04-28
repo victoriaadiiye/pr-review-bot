@@ -22,8 +22,10 @@ tasks:
     desc: Pull latest code, rebuild, and restart the bot
     cmds:
       - git pull
-      - task build
-      - task restart
+      - "{{.GO}} build -o {{.BINARY}} ."
+      - tmux send-keys -t {{.TMUX_SESSION}} C-c
+      - sleep 1
+      - tmux send-keys -t {{.TMUX_SESSION}} "./{{.BINARY}}" Enter
 
   logs:
     desc: Tail the bot log
