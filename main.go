@@ -74,26 +74,28 @@ func main() {
 
 func handlePR(api *slack.Client, ev *slackevents.MessageEvent, prURL, owner, repo, prNum, channelID, notifyUserID, reviewQuestions string) {
 	_ = api.AddReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+	dmUser(api, notifyUserID, fmt.Sprintf("Starting review of <%s>...", prURL))
 
+	dmUser(api, notifyUserID, fmt.Sprintf("Fetching diff for <%s>...", prURL))
 	diff, err := fetchDiff(owner, repo, prNum)
 	if err != nil {
 		postError(api, ev, prURL, channelID, notifyUserID, err)
 		return
 	}
+	dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Launching 4 review agents...", len(diff)))
 
-	review, err := reviewWithClaude(diff, prURL, reviewQuestions)
+	review, err := reviewWithClaude(api, notifyUserID, diff, prURL, reviewQuestions)
 	if err != nil {
 		postError(api, ev, prURL, channelID, notifyUserID, err)
 		return
 	}
 
-	// Post review to GitHub PR
+	dmUser(api, notifyUserID, fmt.Sprintf("Posting review to GitHub PR <%s>...", prURL))
 	if err := postGitHubComment(owner, repo, prNum, review); err != nil {
 		log.Printf("failed to post GitHub comment for %s: %v", prURL, err)
 		dmUser(api, notifyUserID, fmt.Sprintf("Failed to post review on <%s>: %v", prURL, err))
 	}
 
-	// Post review back into private channel (for Workflow 2 to pick up)
 	_, _, err = api.PostMessage(
 		channelID,
 		slack.MsgOptionText(fmt.Sprintf("*Review for <%s>:*\n\n%s", prURL, review), false),
@@ -106,7 +108,7 @@ func handlePR(api *slack.Client, ev *slackevents.MessageEvent, prURL, owner, rep
 	_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 	_ = api.AddReaction("white_check_mark", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 
-	dmUser(api, notifyUserID, fmt.Sprintf("Reviewed <%s>. Posted on GitHub and in <#%s>.", prURL, channelID))
+	dmUser(api, notifyUserID, fmt.Sprintf("Done! Review for <%s> posted on GitHub and in <#%s>.", prURL, channelID))
 }
 
 func fetchDiff(owner, repo, prNum string) (string, error) {
@@ -127,7 +129,7 @@ func fetchDiff(owner, repo, prNum string) (string, error) {
 	return diff, nil
 }
 
-func reviewWithClaude(diff, prURL, reviewQuestions string) (string, error) {
+func reviewWithClaude(api *slack.Client, notifyUserID, diff, prURL, reviewQuestions string) (string, error) {
 	perspectives := []struct {
 		name   string
 		prompt string
@@ -282,6 +284,8 @@ Be specific, not vague. Show exactly what and why. Respect existing codebase pat
 		return "", firstErr
 	}
 
+	dmUser(api, notifyUserID, "All 4 agents done. Running validator...")
+
 	allReviews := strings.Join(reviews, "\n\n---\n\n")
 
 	log.Printf("validator: starting for %s", prURL)
@@ -305,6 +309,7 @@ Be concise. Output a validation report.
 	}
 	log.Printf("validator: done for %s", prURL)
 
+	dmUser(api, notifyUserID, "Validator done. Merging reviews...")
 	log.Printf("merger: starting for %s", prURL)
 	merged, err := runClaude(fmt.Sprintf(`You are a review synthesizer. You have 4 independent code reviews and a validation report.
 
