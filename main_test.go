@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -185,5 +186,116 @@ func TestDmUser_PostsToUser(t *testing.T) {
 	}
 	if mock.messages[0].channel != "U123" {
 		t.Errorf("DM sent to %s, want U123", mock.messages[0].channel)
+	}
+}
+
+func TestPreviousSpecPattern_ExtractsPath(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantNil bool
+	}{
+		{
+			name:  "repo-relative path",
+			input: "some review text\n\n<!-- spec: docs/SPEC.md -->",
+			want:  "docs/SPEC.md",
+		},
+		{
+			name:  "absolute path",
+			input: "review\n<!-- spec: /Users/dan/specs/api.md -->",
+			want:  "/Users/dan/specs/api.md",
+		},
+		{
+			name:  "multiple specs takes last",
+			input: "<!-- spec: old/spec.md -->\nstuff\n<!-- spec: new/spec.md -->",
+			want:  "new/spec.md",
+		},
+		{
+			name:    "no spec tag",
+			input:   "just a normal review comment with no metadata",
+			wantNil: true,
+		},
+		{
+			name:    "empty string",
+			input:   "",
+			wantNil: true,
+		},
+		{
+			name:  "spec tag among other html comments",
+			input: "<!-- something else -->\n<!-- spec: path/to/spec.md -->\n<!-- another -->",
+			want:  "path/to/spec.md",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			matches := previousSpecPattern.FindAllStringSubmatch(tt.input, -1)
+			if tt.wantNil {
+				if len(matches) != 0 {
+					t.Errorf("expected no matches, got %v", matches)
+				}
+				return
+			}
+			if len(matches) == 0 {
+				t.Fatal("expected matches, got none")
+			}
+			got := matches[len(matches)-1][1]
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSpecMetadataAppended(t *testing.T) {
+	review := "## Quality Score: 85/100\n\n---\n\n## Summary\nLooks good."
+	specPath := "docs/API-SPEC.md"
+
+	result := review + fmt.Sprintf("\n\n<!-- spec: %s -->", specPath)
+
+	matches := previousSpecPattern.FindAllStringSubmatch(result, -1)
+	if len(matches) == 0 {
+		t.Fatal("spec metadata not found in review output")
+	}
+	got := matches[0][1]
+	if got != specPath {
+		t.Errorf("extracted spec %q, want %q", got, specPath)
+	}
+}
+
+func TestSpecMetadata_NotAppendedWithoutSpec(t *testing.T) {
+	review := "## Summary\nAll good."
+	specPath := ""
+
+	result := review
+	if specPath != "" {
+		result += fmt.Sprintf("\n\n<!-- spec: %s -->", specPath)
+	}
+
+	matches := previousSpecPattern.FindAllStringSubmatch(result, -1)
+	if len(matches) != 0 {
+		t.Error("spec metadata should not be present when no spec used")
+	}
+}
+
+func TestParseSpecPath(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"https://github.com/org/repo/pull/1 --spec docs/SPEC.md", "docs/SPEC.md"},
+		{"https://github.com/org/repo/pull/1 --spec /abs/path.md --re-review", "/abs/path.md"},
+		{"https://github.com/org/repo/pull/1", ""},
+		{"https://github.com/org/repo/pull/1 --re-review", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := parseSpecPath(tt.input)
+			if got != tt.want {
+				t.Errorf("parseSpecPath(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
 	}
 }

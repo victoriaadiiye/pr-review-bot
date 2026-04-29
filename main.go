@@ -46,6 +46,7 @@ type ReviewRequest struct {
 	JiraContext     string
 	PreviousReviews string
 	SpecContent     string
+	SpecPath        string
 }
 
 type claudeResponse struct {
@@ -124,6 +125,7 @@ var (
 	selfPattern          = regexp.MustCompile(`--self\b`)
 	specPattern          = regexp.MustCompile(`--spec\s+(\S+)`)
 	previousScorePattern = regexp.MustCompile(`\*\*Quality Score: (\d+)/100\*\*`)
+	previousSpecPattern  = regexp.MustCompile(`<!-- spec: (\S+) -->`)
 
 	activeReviews   = make(map[string]context.CancelFunc)
 	activeReviewsMu sync.Mutex
@@ -287,7 +289,15 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 		}
 	}
 
+	previousReviews := fetchPRContext(owner, repo, prNum)
+
 	specPath := parseSpecPath(ev.Text)
+	if specPath == "" {
+		if matches := previousSpecPattern.FindAllStringSubmatch(previousReviews, -1); len(matches) > 0 {
+			specPath = matches[len(matches)-1][1]
+			dmUser(api, notifyUserID, fmt.Sprintf("Reusing spec from previous review: %s", specPath))
+		}
+	}
 	var specContent string
 	if specPath != "" {
 		var specErr error
@@ -301,11 +311,6 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 		} else {
 			dmUser(api, notifyUserID, fmt.Sprintf("Including spec from %s (%d chars)...", specPath, len(specContent)))
 		}
-	}
-
-	var previousReviews string
-	if mode == ModeReReview {
-		previousReviews = fetchPreviousReviews(owner, repo, prNum)
 	}
 
 	agentCount := 4
@@ -324,6 +329,7 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 		JiraContext:     jiraContext,
 		PreviousReviews: previousReviews,
 		SpecContent:     specContent,
+		SpecPath:        specPath,
 	}
 
 	review, score, stats, err := reviewWithClaude(ctx, api, notifyUserID, req)
@@ -338,6 +344,10 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 			postError(api, ev, prURL, channelID, notifyUserID, err)
 		}
 		return
+	}
+
+	if req.SpecPath != "" {
+		review += fmt.Sprintf("\n\n<!-- spec: %s -->", req.SpecPath)
 	}
 
 	modeLabel := capitalize(string(mode))
@@ -452,19 +462,46 @@ func fetchPRTitle(owner, repo, prNum string) string {
 	return strings.TrimSpace(string(out))
 }
 
-func fetchPreviousReviews(owner, repo, prNum string) string {
-	cmd := exec.Command("gh", "pr", "view", prNum,
-		"--repo", fmt.Sprintf("%s/%s", owner, repo),
-		"--json", "comments", "--jq", ".comments[].body")
-	out, err := cmd.Output()
-	if err != nil {
-		log.Printf("failed to fetch previous reviews for %s/%s#%s: %v", owner, repo, prNum, err)
+func fetchPRContext(owner, repo, prNum string) string {
+	repoSlug := fmt.Sprintf("%s/%s", owner, repo)
+
+	descCmd := exec.Command("gh", "pr", "view", prNum,
+		"--repo", repoSlug,
+		"--json", "title,body,author",
+		"--jq", `"## PR: " + .title + "\nAuthor: " + .author.login + "\n\n" + .body`)
+	descOut, _ := descCmd.Output()
+
+	commentsCmd := exec.Command("gh", "pr", "view", prNum,
+		"--repo", repoSlug,
+		"--json", "comments",
+		"--jq", `.comments[] | "### Comment by " + .author.login + " (" + .createdAt + ")\n" + .body`)
+	commentsOut, _ := commentsCmd.Output()
+
+	reviewsCmd := exec.Command("gh", "pr", "view", prNum,
+		"--repo", repoSlug,
+		"--json", "reviews",
+		"--jq", `.reviews[] | select(.body != "") | "### Review by " + .author.login + " [" + .state + "] (" + .submittedAt + ")\n" + .body`)
+	reviewsOut, _ := reviewsCmd.Output()
+
+	var parts []string
+	if desc := strings.TrimSpace(string(descOut)); desc != "" {
+		parts = append(parts, desc)
+	}
+	if reviews := strings.TrimSpace(string(reviewsOut)); reviews != "" {
+		parts = append(parts, reviews)
+	}
+	if comments := strings.TrimSpace(string(commentsOut)); comments != "" {
+		parts = append(parts, comments)
+	}
+
+	result := strings.Join(parts, "\n\n---\n\n")
+	if len(result) > 12000 {
+		result = result[:12000] + "\n[truncated]"
+	}
+	if result == "" {
 		return ""
 	}
-	result := strings.TrimSpace(string(out))
-	if len(result) > 8000 {
-		result = result[:8000] + "\n[truncated]"
-	}
+	log.Printf("pr-context: fetched %d chars for %s/%s#%s", len(result), owner, repo, prNum)
 	return result
 }
 
@@ -569,7 +606,11 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 		extraContext.WriteString("\n\n" + req.JiraContext + "\n")
 	}
 	if req.PreviousReviews != "" {
-		extraContext.WriteString(fmt.Sprintf("\n\n## Previous Review Comments\nThis PR was reviewed before. Consider whether previous feedback was addressed:\n\n%s\n", req.PreviousReviews))
+		if req.Mode == ModeReReview {
+			extraContext.WriteString(fmt.Sprintf("\n\n## PR Discussion & Previous Reviews\nThis PR was reviewed before. Consider whether previous feedback was addressed and focus on what changed:\n\n%s\n", req.PreviousReviews))
+		} else {
+			extraContext.WriteString(fmt.Sprintf("\n\n## PR Discussion Context\nThe following is the PR description, review comments, and discussion so far. Use this to understand the author's intent and any concerns already raised:\n\n%s\n", req.PreviousReviews))
+		}
 	}
 	if req.SpecContent != "" {
 		extraContext.WriteString(fmt.Sprintf("\n\n## Specification / Requirements\nThe following spec defines what this PR should implement. Evaluate whether the PR accurately implements the spec and flag any drift from requirements — missing features, extra unspecified behavior, or contradictions:\n\n%s\n", req.SpecContent))
