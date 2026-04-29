@@ -220,16 +220,13 @@ func main() {
 				if !ok {
 					continue
 				}
-				if rev.Item.Channel != channelID {
-					continue
-				}
 				if rev.Reaction == "no_entry_sign" {
 					if cancelReview(rev.Item.Timestamp) {
-						log.Printf("review cancelled by reaction on %s", rev.Item.Timestamp)
+						log.Printf("review cancelled by reaction on %s in %s", rev.Item.Timestamp, rev.Item.Channel)
 					}
 				}
 				if rev.Reaction == "claude_it" {
-					go handleReactionReview(api, rev, channelID, notifyUserID, reviewQuestions)
+					go handleReactionReview(api, rev, rev.Item.Channel, notifyUserID, reviewQuestions)
 				}
 
 			case string(slackevents.AppMention):
