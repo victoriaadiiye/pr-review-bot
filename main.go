@@ -537,20 +537,20 @@ func readSpecFile(path string) (string, error) {
 
 func fetchSpecFromRepo(owner, repo, specPath, prNum string) (string, error) {
 	repoSlug := fmt.Sprintf("%s/%s", owner, repo)
-	baseCmd := exec.Command("gh", "pr", "view", prNum, "--repo", repoSlug,
-		"--json", "baseRefName", "--jq", ".baseRefName")
-	baseOut, err := baseCmd.Output()
+	headCmd := exec.Command("gh", "pr", "view", prNum, "--repo", repoSlug,
+		"--json", "headRefName", "--jq", ".headRefName")
+	headOut, err := headCmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("get base ref for spec: %w", err)
+		return "", fmt.Errorf("get head ref for spec: %s", strings.TrimSpace(string(headOut)))
 	}
-	baseRef := strings.TrimSpace(string(baseOut))
+	headRef := strings.TrimSpace(string(headOut))
 
 	cmd := exec.Command("gh", "api",
-		fmt.Sprintf("repos/%s/%s/contents/%s?ref=%s", owner, repo, specPath, baseRef),
+		fmt.Sprintf("repos/%s/%s/contents/%s?ref=%s", owner, repo, specPath, headRef),
 		"-H", "Accept: application/vnd.github.raw")
-	out, err := cmd.Output()
+	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("fetch %s from %s@%s: %w", specPath, repoSlug, baseRef, err)
+		return "", fmt.Errorf("fetch %s from %s@%s: %s", specPath, repoSlug, headRef, strings.TrimSpace(string(out)))
 	}
 
 	content := string(out)
