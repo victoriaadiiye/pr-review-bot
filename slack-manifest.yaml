@@ -1,15 +1,10 @@
-_metadata:
-  major_version: 1
-
 display_information:
   name: PR Review Bot
   description: Reviews PRs posted in channels
-
 features:
   bot_user:
     display_name: pr-review-bot
     always_online: true
-
 oauth_config:
   scopes:
     bot:
@@ -21,13 +16,16 @@ oauth_config:
       - im:write
       - reactions:read
       - reactions:write
-
+  pkce_enabled: false
 settings:
   event_subscriptions:
     bot_events:
       - message.channels
       - message.groups
       - reaction_added
+  interactivity:
+    is_enabled: true
   org_deploy_enabled: false
   socket_mode_enabled: true
   token_rotation_enabled: false
+  is_mcp_enabled: false
