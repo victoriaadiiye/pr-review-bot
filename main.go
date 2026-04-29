@@ -1594,7 +1594,8 @@ func runClaude(ctx context.Context, prompt string) (string, claudeResponse, erro
 	if model == "" {
 		model = "claude-opus-4-6"
 	}
-	cmd := exec.CommandContext(ctx, "claude", "-p", prompt, "--output-format", "json", "--model", model)
+	cmd := exec.CommandContext(ctx, "claude", "-p", "Follow the instructions provided on stdin.", "--output-format", "json", "--model", model)
+	cmd.Stdin = strings.NewReader(prompt)
 	out, err := cmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
