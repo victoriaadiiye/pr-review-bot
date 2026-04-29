@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -123,7 +124,33 @@ var (
 	selfPattern          = regexp.MustCompile(`--self\b`)
 	specPattern          = regexp.MustCompile(`--spec\s+(\S+)`)
 	previousScorePattern = regexp.MustCompile(`\*\*Quality Score: (\d+)/100\*\*`)
+
+	activeReviews   = make(map[string]context.CancelFunc)
+	activeReviewsMu sync.Mutex
 )
+
+func trackReview(ts string, cancel context.CancelFunc) {
+	activeReviewsMu.Lock()
+	defer activeReviewsMu.Unlock()
+	activeReviews[ts] = cancel
+}
+
+func untrackReview(ts string) {
+	activeReviewsMu.Lock()
+	defer activeReviewsMu.Unlock()
+	delete(activeReviews, ts)
+}
+
+func cancelReview(ts string) bool {
+	activeReviewsMu.Lock()
+	defer activeReviewsMu.Unlock()
+	if cancel, ok := activeReviews[ts]; ok {
+		cancel()
+		delete(activeReviews, ts)
+		return true
+	}
+	return false
+}
 
 func main() {
 	_ = godotenv.Load()
@@ -148,26 +175,39 @@ func main() {
 			}
 			client.Ack(*evt.Request)
 
-			if outer.InnerEvent.Type != string(slackevents.Message) {
-				continue
-			}
-			ev, ok := outer.InnerEvent.Data.(*slackevents.MessageEvent)
-			if !ok || ev.BotID != "" || ev.SubType != "" {
-				continue
-			}
-			if ev.Channel != channelID {
-				continue
-			}
+			switch outer.InnerEvent.Type {
+			case string(slackevents.ReactionAdded):
+				rev, ok := outer.InnerEvent.Data.(*slackevents.ReactionAddedEvent)
+				if !ok {
+					continue
+				}
+				if rev.Reaction == "no_entry_sign" && rev.Item.Channel == channelID {
+					if cancelReview(rev.Item.Timestamp) {
+						log.Printf("review cancelled by reaction on %s", rev.Item.Timestamp)
+					}
+				}
 
-			matches := ghPRPattern.FindAllStringSubmatch(ev.Text, -1)
-			if len(matches) == 0 {
-				continue
-			}
+			case string(slackevents.Message):
+				ev, ok := outer.InnerEvent.Data.(*slackevents.MessageEvent)
+				if !ok || ev.BotID != "" || ev.SubType != "" {
+					continue
+				}
+				if ev.Channel != channelID {
+					continue
+				}
 
-			for _, m := range matches {
-				owner, repo, prNum := m[1], m[2], m[3]
-				prURL := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, prNum)
-				go handlePR(api, ev, prURL, owner, repo, prNum, channelID, notifyUserID, reviewQuestions)
+				matches := ghPRPattern.FindAllStringSubmatch(ev.Text, -1)
+				if len(matches) == 0 {
+					continue
+				}
+
+				for _, m := range matches {
+					owner, repo, prNum := m[1], m[2], m[3]
+					prURL := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, prNum)
+					ctx, cancel := context.WithCancel(context.Background())
+					trackReview(ev.TimeStamp, cancel)
+					go handlePR(ctx, api, ev, prURL, owner, repo, prNum, channelID, notifyUserID, reviewQuestions)
+				}
 			}
 		}
 	}()
@@ -203,7 +243,9 @@ func parseJiraTicket(text string) string {
 	return ""
 }
 
-func handlePR(api SlackAPI, ev *slackevents.MessageEvent, prURL, owner, repo, prNum, channelID, notifyUserID, reviewQuestions string) {
+func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, prURL, owner, repo, prNum, channelID, notifyUserID, reviewQuestions string) {
+	defer untrackReview(ev.TimeStamp)
+
 	mode := parseMode(ev.Text)
 	selfReview := selfPattern.MatchString(ev.Text)
 	jiraTicket := parseJiraTicket(ev.Text)
@@ -284,9 +326,11 @@ func handlePR(api SlackAPI, ev *slackevents.MessageEvent, prURL, owner, repo, pr
 		SpecContent:     specContent,
 	}
 
-	review, score, stats, err := reviewWithClaude(api, notifyUserID, req)
+	review, score, stats, err := reviewWithClaude(ctx, api, notifyUserID, req)
 	if err != nil {
-		if selfReview {
+		if ctx.Err() != nil {
+			postCancelled(api, ev, prURL, channelID, notifyUserID)
+		} else if selfReview {
 			_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 			_ = api.AddReaction("x", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 			dmUser(api, notifyUserID, fmt.Sprintf("Failed to review <%s>: %v", prURL, err))
@@ -517,7 +561,7 @@ func fetchSpecFromRepo(owner, repo, specPath, prNum string) (string, error) {
 	return content, nil
 }
 
-func reviewWithClaude(api SlackAPI, notifyUserID string, req ReviewRequest) (string, *ScoreResult, *UsageStats, error) {
+func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, req ReviewRequest) (string, *ScoreResult, *UsageStats, error) {
 	stats := &UsageStats{}
 
 	var extraContext strings.Builder
@@ -541,7 +585,7 @@ func reviewWithClaude(api SlackAPI, notifyUserID string, req ReviewRequest) (str
 		defer scoreWg.Done()
 		log.Printf("scorer: starting for %s", req.PRURL)
 		var resp claudeResponse
-		score, resp, scoreErr = runScorer(req.Diff, req.SpecContent)
+		score, resp, scoreErr = runScorer(ctx, req.Diff, req.SpecContent)
 		if scoreErr != nil {
 			log.Printf("scorer: failed for %s: %v", req.PRURL, scoreErr)
 		} else {
@@ -551,7 +595,7 @@ func reviewWithClaude(api SlackAPI, notifyUserID string, req ReviewRequest) (str
 	}()
 
 	if req.Mode == ModeQuick {
-		result, err := runQuickReview(req.PRURL, req.Diff, contextBlock, questionsStr, stats)
+		result, err := runQuickReview(ctx, req.PRURL, req.Diff, contextBlock, questionsStr, stats)
 		if err != nil {
 			return "", nil, stats, err
 		}
@@ -575,7 +619,7 @@ func reviewWithClaude(api SlackAPI, notifyUserID string, req ReviewRequest) (str
 		go func(idx int, name, prompt string) {
 			defer wg.Done()
 			log.Printf("agent %s: starting %s review for %s", name, req.Mode, req.PRURL)
-			text, resp, err := runClaude(prompt)
+			text, resp, err := runClaude(ctx, prompt)
 			if err != nil {
 				mu.Lock()
 				if firstErr == nil {
@@ -601,7 +645,7 @@ func reviewWithClaude(api SlackAPI, notifyUserID string, req ReviewRequest) (str
 	allReviews := strings.Join(reviews, "\n\n---\n\n")
 
 	log.Printf("validator: starting for %s", req.PRURL)
-	validated, valResp, err := runClaude(fmt.Sprintf(`You are a review validator. You have %d independent code reviews of a PR and the original diff.
+	validated, valResp, err := runClaude(ctx, fmt.Sprintf(`You are a review validator. You have %d independent code reviews of a PR and the original diff.
 
 Your job:
 1. Check each review for accuracy — are the claims correct given the actual diff?
@@ -624,7 +668,7 @@ Be concise. Output a validation report.
 
 	dmUser(api, notifyUserID, "Validator done. Merging reviews...")
 	log.Printf("merger: starting for %s", req.PRURL)
-	merged, mergeResp, err := runMerger(allReviews, validated, req.Mode, req.SpecContent)
+	merged, mergeResp, err := runMerger(ctx, allReviews, validated, req.Mode, req.SpecContent)
 	if err != nil {
 		return "", nil, stats, err
 	}
@@ -781,7 +825,7 @@ Be specific, not vague. Show exactly what and why. Respect existing codebase pat
 	}
 }
 
-func runQuickReview(prURL, diff, contextBlock, questionsStr string, stats *UsageStats) (string, error) {
+func runQuickReview(ctx context.Context, prURL, diff, contextBlock, questionsStr string, stats *UsageStats) (string, error) {
 	prompt := fmt.Sprintf(`You are an expert Go code reviewer doing a QUICK REVIEW. Be concise and focused.
 
 Review this pull request: %s
@@ -805,7 +849,7 @@ Keep it short. If the code is sound, say so and approve.
 `+"```diff\n%s\n```", prURL, contextBlock, questionsStr, diff)
 
 	log.Printf("quick-review: starting for %s", prURL)
-	text, resp, err := runClaude(prompt)
+	text, resp, err := runClaude(ctx, prompt)
 	if err != nil {
 		return "", fmt.Errorf("quick review failed: %w", err)
 	}
@@ -814,7 +858,7 @@ Keep it short. If the code is sound, say so and approve.
 	return text, nil
 }
 
-func runScorer(diff string, specContent string) (ScoreResult, claudeResponse, error) {
+func runScorer(ctx context.Context, diff string, specContent string) (ScoreResult, claudeResponse, error) {
 	specDimension := ""
 	specBlock := ""
 	specJSON := ""
@@ -841,7 +885,7 @@ Respond with ONLY this JSON object, no markdown fences, no other text:
 
 `+"```diff\n%s\n```", specDimension, specBlock, specJSON, diff)
 
-	text, resp, err := runClaude(prompt)
+	text, resp, err := runClaude(ctx, prompt)
 	if err != nil {
 		return ScoreResult{}, claudeResponse{}, err
 	}
@@ -914,7 +958,7 @@ func formatScoreHeader(score ScoreResult, previousReviews string) string {
 	return header
 }
 
-func runMerger(allReviews, validated string, mode ReviewMode, specContent string) (string, claudeResponse, error) {
+func runMerger(ctx context.Context, allReviews, validated string, mode ReviewMode, specContent string) (string, claudeResponse, error) {
 	var modeRules string
 	switch mode {
 	case ModeFinal:
@@ -944,7 +988,7 @@ RE-REVIEW RULES:
 		specContext = fmt.Sprintf("\n\n## Specification\n%s", specContent)
 	}
 
-	text, resp, err := runClaude(fmt.Sprintf(`You are a review synthesizer. You have 4 independent code reviews and a validation report.
+	text, resp, err := runClaude(ctx, fmt.Sprintf(`You are a review synthesizer. You have 4 independent code reviews and a validation report.
 
 Merge them into ONE cohesive, comprehensive review. Structure:
 
@@ -981,8 +1025,8 @@ func questionsBlock(questions string) string {
 	return fmt.Sprintf("Also specifically answer these questions:\n%s", questions)
 }
 
-func runClaude(prompt string) (string, claudeResponse, error) {
-	cmd := exec.Command("claude", "-p", prompt, "--output-format", "json")
+func runClaude(ctx context.Context, prompt string) (string, claudeResponse, error) {
+	cmd := exec.CommandContext(ctx, "claude", "-p", prompt, "--output-format", "json")
 	out, err := cmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -1036,6 +1080,18 @@ func postError(api SlackAPI, ev *slackevents.MessageEvent, prURL, channelID, not
 		slack.MsgOptionTS(ev.TimeStamp),
 	)
 	dmUser(api, notifyUserID, fmt.Sprintf("Failed to review <%s>: %v", prURL, reviewErr))
+}
+
+func postCancelled(api SlackAPI, ev *slackevents.MessageEvent, prURL, channelID, notifyUserID string) {
+	log.Printf("review cancelled for %s", prURL)
+	_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+	_ = api.AddReaction("no_entry_sign", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+	_, _, _ = api.PostMessage(
+		channelID,
+		slack.MsgOptionText(fmt.Sprintf("Review cancelled for <%s>", prURL), false),
+		slack.MsgOptionTS(ev.TimeStamp),
+	)
+	dmUser(api, notifyUserID, fmt.Sprintf("Review cancelled for <%s>", prURL))
 }
 
 func mustEnv(key string) string {

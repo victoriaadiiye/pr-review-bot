@@ -103,6 +103,79 @@ func TestPostError_PostsThreadReply(t *testing.T) {
 	}
 }
 
+func TestPostCancelled_RemovesEyesAndAddsNoEntry(t *testing.T) {
+	mock := &mockSlack{}
+	ev := &slackevents.MessageEvent{
+		Channel:   "C123",
+		TimeStamp: "1234567890.123456",
+	}
+
+	postCancelled(mock, ev, "https://github.com/org/repo/pull/1", "C123", "U999")
+
+	wantReactions := []reactionCall{
+		{action: "remove", name: "eyes"},
+		{action: "add", name: "no_entry_sign"},
+	}
+
+	if len(mock.reactions) != len(wantReactions) {
+		t.Fatalf("got %d reactions, want %d: %+v", len(mock.reactions), len(wantReactions), mock.reactions)
+	}
+	for i, want := range wantReactions {
+		got := mock.reactions[i]
+		if got != want {
+			t.Errorf("reaction[%d] = %+v, want %+v", i, got, want)
+		}
+	}
+}
+
+func TestPostCancelled_PostsThreadAndDM(t *testing.T) {
+	mock := &mockSlack{}
+	ev := &slackevents.MessageEvent{
+		Channel:   "C123",
+		TimeStamp: "1234567890.123456",
+	}
+
+	postCancelled(mock, ev, "https://github.com/org/repo/pull/1", "C123", "U999")
+
+	var channelPost bool
+	var dmPost bool
+	for _, msg := range mock.messages {
+		if msg.channel == "C123" {
+			channelPost = true
+		}
+		if msg.channel == "U999" {
+			dmPost = true
+		}
+	}
+	if !channelPost {
+		t.Error("expected thread reply in channel C123")
+	}
+	if !dmPost {
+		t.Error("expected DM to user U999")
+	}
+}
+
+func TestCancelReview_ReturnsTrueAndCallsCancel(t *testing.T) {
+	called := false
+	trackReview("ts123", func() { called = true })
+
+	if !cancelReview("ts123") {
+		t.Error("cancelReview should return true for tracked review")
+	}
+	if !called {
+		t.Error("cancel func should have been called")
+	}
+	if cancelReview("ts123") {
+		t.Error("cancelReview should return false after already cancelled")
+	}
+}
+
+func TestCancelReview_ReturnsFalseForUnknown(t *testing.T) {
+	if cancelReview("unknown") {
+		t.Error("cancelReview should return false for unknown timestamp")
+	}
+}
+
 func TestDmUser_PostsToUser(t *testing.T) {
 	mock := &mockSlack{}
 	dmUser(mock, "U123", "hello")
