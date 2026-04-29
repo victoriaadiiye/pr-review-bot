@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -462,9 +463,11 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 
 func fetchDiff(ctx context.Context, owner, repo, prNum string) (string, error) {
 	cmd := exec.CommandContext(ctx, "gh", "pr", "diff", prNum, "--repo", fmt.Sprintf("%s/%s", owner, repo))
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
-		log.Printf("gh pr diff failed for %s/%s#%s, trying git fallback", owner, repo, prNum)
+		log.Printf("gh pr diff failed for %s/%s#%s: %v; stderr: %s; trying git fallback", owner, repo, prNum, err, strings.TrimSpace(stderr.String()))
 		return fetchDiffViaGit(owner, repo, prNum)
 	}
 
@@ -481,9 +484,11 @@ func fetchDiffViaGit(owner, repo, prNum string) (string, error) {
 	repoURL := fmt.Sprintf("https://github.com/%s/%s.git", owner, repo)
 
 	baseCmd := exec.Command("gh", "pr", "view", prNum, "--repo", repoSlug, "--json", "baseRefName", "--jq", ".baseRefName")
+	var baseStderr bytes.Buffer
+	baseCmd.Stderr = &baseStderr
 	baseOut, err := baseCmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("get PR base ref: %w", err)
+		return "", fmt.Errorf("get PR base ref: %w; stderr: %s", err, strings.TrimSpace(baseStderr.String()))
 	}
 	baseRef := strings.TrimSpace(string(baseOut))
 
