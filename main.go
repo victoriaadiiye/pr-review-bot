@@ -1067,7 +1067,11 @@ func questionsBlock(questions string) string {
 }
 
 func runClaude(ctx context.Context, prompt string) (string, claudeResponse, error) {
-	cmd := exec.CommandContext(ctx, "claude", "-p", prompt, "--output-format", "json")
+	model := os.Getenv("CLAUDE_MODEL")
+	if model == "" {
+		model = "claude-opus-4-6"
+	}
+	cmd := exec.CommandContext(ctx, "claude", "-p", prompt, "--output-format", "json", "--model", model)
 	out, err := cmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
