@@ -333,3 +333,100 @@ func TestParseSpecPath(t *testing.T) {
 		})
 	}
 }
+
+func TestAckPattern_MatchesExpected(t *testing.T) {
+	shouldMatch := []string{
+		"ack",
+		"Ack, will fix in follow-up",
+		"acknowledged",
+		"Acknowledged — this is by design",
+		"won't fix",
+		"wont fix — intentional complexity",
+		"wontfix",
+		"This is intentional",
+		"by design",
+		"noted, will address later",
+		"accepted",
+		"will fix later",
+		"will address later",
+		"tracking in PROJ-123",
+		"known issue",
+		"out of scope for this PR",
+		"deferred to next sprint",
+	}
+
+	for _, input := range shouldMatch {
+		if !ackPattern.MatchString(input) {
+			t.Errorf("ackPattern should match %q", input)
+		}
+	}
+}
+
+func TestAckPattern_RejectsNonAck(t *testing.T) {
+	shouldNotMatch := []string{
+		"this looks like a bug",
+		"please fix this",
+		"I disagree with this approach",
+		"can you explain why?",
+		"LGTM",
+		"nice work",
+		"needs more tests",
+		"what about edge cases?",
+	}
+
+	for _, input := range shouldNotMatch {
+		if ackPattern.MatchString(input) {
+			t.Errorf("ackPattern should NOT match %q", input)
+		}
+	}
+}
+
+func TestIsReviewActive_DetectsByPRURL(t *testing.T) {
+	prURL := "https://github.com/org/repo/pull/42"
+	trackReview("ts-active-1", prURL, func() {})
+	defer untrackReview("ts-active-1", prURL)
+
+	if !isReviewActive(prURL) {
+		t.Error("isReviewActive should return true for tracked PR")
+	}
+	if isReviewActive("https://github.com/org/repo/pull/99") {
+		t.Error("isReviewActive should return false for untracked PR")
+	}
+}
+
+func TestParallelTracking_IndependentReviews(t *testing.T) {
+	pr1 := "https://github.com/org/repo/pull/1"
+	pr2 := "https://github.com/org/repo/pull/2"
+
+	var called1, called2 bool
+	trackReview("ts-par-1", pr1, func() { called1 = true })
+	trackReview("ts-par-2", pr2, func() { called2 = true })
+
+	cancelReview("ts-par-1")
+	if !called1 {
+		t.Error("cancel should have fired for PR 1")
+	}
+	if called2 {
+		t.Error("cancel should NOT have fired for PR 2")
+	}
+
+	untrackReview("ts-par-2", pr2)
+}
+
+func TestCancelReview_CancelsAllInSameMessage(t *testing.T) {
+	pr1 := "https://github.com/org/repo/pull/10"
+	pr2 := "https://github.com/org/repo/pull/20"
+	ts := "ts-multi-pr"
+
+	var called1, called2 bool
+	trackReview(ts, pr1, func() { called1 = true })
+	trackReview(ts, pr2, func() { called2 = true })
+
+	cancelReview(ts)
+	if !called1 {
+		t.Error("cancel should fire for PR 1 in same message")
+	}
+	if !called2 {
+		t.Error("cancel should fire for PR 2 in same message")
+	}
+}

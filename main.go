@@ -40,16 +40,17 @@ const (
 )
 
 type ReviewRequest struct {
-	Diff            string
-	PRURL           string
-	Questions       string
-	Mode            ReviewMode
-	SelfReview      bool
-	JiraTicket      string
-	JiraContext     string
-	PreviousReviews string
-	SpecContent     string
-	SpecPath        string
+	Diff               string
+	PRURL              string
+	Questions          string
+	Mode               ReviewMode
+	SelfReview         bool
+	JiraTicket         string
+	JiraContext        string
+	PreviousReviews    string
+	AcknowledgedIssues string
+	SpecContent        string
+	SpecPath           string
 }
 
 type claudeResponse struct {
@@ -130,6 +131,7 @@ var (
 	previousScorePattern = regexp.MustCompile(`\*\*Quality Score: (\d+)/100\*\*`)
 	previousSpecPattern  = regexp.MustCompile(`<!-- spec: (\S+) -->`)
 	reviewRequestPattern = regexp.MustCompile(`(?i)\breview\b`)
+	ackPattern           = regexp.MustCompile(`(?i)\b(ack(nowledg(ed?|ing))?|won'?t\s*fix|wontfix|intentional|by\s*design|noted|accepted|will\s*(fix|address)\s*later|tracking\s+in|known\s+issue|out\s*of\s*scope|deferred)\b`)
 
 	activeReviews   = make(map[string]context.CancelFunc)
 	activeReviewsMu sync.Mutex
@@ -509,6 +511,10 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 	}
 
 	previousReviews := fetchPRContext(ctx, owner, repo, prNum)
+	acknowledgedIssues := fetchAcknowledgedIssues(ctx, owner, repo, prNum)
+	if acknowledgedIssues != "" {
+		dmUser(api, notifyUserID, fmt.Sprintf("Found acknowledged issues for <%s>", prURL))
+	}
 
 	specPath := parseSpecPath(ev.Text)
 	if specPath == "" {
@@ -539,16 +545,17 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 	dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Launching %d agent(s) in %s mode...", len(diff), agentCount, mode))
 
 	req := ReviewRequest{
-		Diff:            diff,
-		PRURL:           prURL,
-		Questions:       reviewQuestions,
-		Mode:            mode,
-		SelfReview:      selfReview,
-		JiraTicket:      jiraTicket,
-		JiraContext:     jiraContext,
-		PreviousReviews: previousReviews,
-		SpecContent:     specContent,
-		SpecPath:        specPath,
+		Diff:               diff,
+		PRURL:              prURL,
+		Questions:          reviewQuestions,
+		Mode:               mode,
+		SelfReview:         selfReview,
+		JiraTicket:         jiraTicket,
+		JiraContext:        jiraContext,
+		PreviousReviews:    previousReviews,
+		AcknowledgedIssues: acknowledgedIssues,
+		SpecContent:        specContent,
+		SpecPath:           specPath,
 	}
 
 	if ctx.Err() != nil {
@@ -733,6 +740,67 @@ func fetchPRContext(ctx context.Context, owner, repo, prNum string) string {
 	return result
 }
 
+func fetchAcknowledgedIssues(ctx context.Context, owner, repo, prNum string) string {
+	repoSlug := fmt.Sprintf("%s/%s", owner, repo)
+
+	// Fetch issue-level comments
+	issueCmd := exec.CommandContext(ctx, "gh", "pr", "view", prNum,
+		"--repo", repoSlug, "--json", "comments")
+	issueOut, _ := issueCmd.Output()
+
+	// Fetch inline review comments
+	reviewCmd := exec.CommandContext(ctx, "gh", "api",
+		fmt.Sprintf("repos/%s/%s/pulls/%s/comments", owner, repo, prNum))
+	reviewOut, _ := reviewCmd.Output()
+
+	type comment struct {
+		Author string
+		Body   string
+	}
+	var acked []comment
+
+	var issueResult struct {
+		Comments []struct {
+			Author struct {
+				Login string `json:"login"`
+			} `json:"author"`
+			Body string `json:"body"`
+		} `json:"comments"`
+	}
+	if json.Unmarshal(issueOut, &issueResult) == nil {
+		for _, c := range issueResult.Comments {
+			if ackPattern.MatchString(c.Body) {
+				acked = append(acked, comment{Author: c.Author.Login, Body: c.Body})
+			}
+		}
+	}
+
+	var reviewComments []struct {
+		User struct {
+			Login string `json:"login"`
+		} `json:"user"`
+		Body string `json:"body"`
+	}
+	if json.Unmarshal(reviewOut, &reviewComments) == nil {
+		for _, c := range reviewComments {
+			if ackPattern.MatchString(c.Body) {
+				acked = append(acked, comment{Author: c.User.Login, Body: c.Body})
+			}
+		}
+	}
+
+	if len(acked) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	for _, c := range acked {
+		fmt.Fprintf(&sb, "**%s:** %s\n\n", c.Author, c.Body)
+	}
+	log.Printf("ack: found %d acknowledged issues for %s/%s#%s", len(acked), owner, repo, prNum)
+	return strings.TrimSpace(sb.String())
+}
+
 func fetchJiraContext(ticketKey string) string {
 	baseURL := os.Getenv("JIRA_BASE_URL")
 	email := os.Getenv("JIRA_EMAIL")
@@ -843,6 +911,9 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 	if req.SpecContent != "" {
 		extraContext.WriteString(fmt.Sprintf("\n\n## Specification / Requirements\nThe following spec defines what this PR should implement. Evaluate whether the PR accurately implements the spec and flag any drift from requirements — missing features, extra unspecified behavior, or contradictions:\n\n%s\n", req.SpecContent))
 	}
+	if req.AcknowledgedIssues != "" {
+		extraContext.WriteString(fmt.Sprintf("\n\n## Acknowledged Issues\nThe following issues from previous reviews have been explicitly acknowledged by the author (via ack, won't fix, intentional, by design, etc.). Do NOT re-flag these as issues. Do NOT penalize the score for these items. Only mention them if the code has materially changed in a way that reintroduces the concern:\n\n%s\n", req.AcknowledgedIssues))
+	}
 	contextBlock := extraContext.String()
 	questionsStr := questionsBlock(req.Questions)
 
@@ -854,7 +925,7 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 		defer scoreWg.Done()
 		log.Printf("scorer: starting for %s", req.PRURL)
 		var resp claudeResponse
-		score, resp, scoreErr = runScorer(ctx, req.Diff, req.SpecContent)
+		score, resp, scoreErr = runScorer(ctx, req.Diff, req.SpecContent, req.AcknowledgedIssues)
 		if scoreErr != nil {
 			log.Printf("scorer: failed for %s: %v", req.PRURL, scoreErr)
 		} else {
@@ -937,7 +1008,7 @@ Be concise. Output a validation report.
 
 	dmUser(api, notifyUserID, "Validator done. Merging reviews...")
 	log.Printf("merger: starting for %s", req.PRURL)
-	merged, mergeResp, err := runMerger(ctx, allReviews, validated, req.Mode, req.SpecContent)
+	merged, mergeResp, err := runMerger(ctx, allReviews, validated, req.Mode, req.SpecContent, req.AcknowledgedIssues)
 	if err != nil {
 		return "", nil, stats, err
 	}
@@ -1127,7 +1198,7 @@ Keep it short. If the code is sound, say so and approve.
 	return text, nil
 }
 
-func runScorer(ctx context.Context, diff string, specContent string) (ScoreResult, claudeResponse, error) {
+func runScorer(ctx context.Context, diff, specContent, acknowledgedIssues string) (ScoreResult, claudeResponse, error) {
 	specDimension := ""
 	specBlock := ""
 	specJSON := ""
@@ -1135,6 +1206,11 @@ func runScorer(ctx context.Context, diff string, specContent string) (ScoreResul
 		specDimension = "\n- spec_compliance: How accurately and completely the diff implements the spec requirements, without drift or missing items"
 		specBlock = fmt.Sprintf("\n## Specification\nEvaluate the diff against this spec:\n\n%s\n\n", specContent)
 		specJSON = `,"spec_compliance":N`
+	}
+
+	ackBlock := ""
+	if acknowledgedIssues != "" {
+		ackBlock = fmt.Sprintf("\n## Acknowledged Issues\nThe following issues were explicitly acknowledged by the author (ack, won't fix, intentional, by design, etc.). Do NOT penalize scores for these items — they represent informed decisions, not oversights:\n\n%s\n\n", acknowledgedIssues)
 	}
 
 	prompt := fmt.Sprintf(`You are a code quality scorer. Evaluate this PR diff and rate the code quality.
@@ -1148,11 +1224,11 @@ Score each dimension 0-10 (10 = excellent, 0 = critical problems):
 - production_readiness: Logging, monitoring, graceful degradation%s
 
 If a dimension has no relevant code in the diff (e.g., no security-sensitive changes), score 8-9 reflecting no risk introduced.
-%s
+%s%s
 Respond with ONLY this JSON object, no markdown fences, no other text:
 {"correctness":N,"security":N,"design":N,"go_quality":N,"testing":N,"production_readiness":N%s,"overall":N,"summary":"one sentence"}
 
-`+"```diff\n%s\n```", specDimension, specBlock, specJSON, diff)
+`+"```diff\n%s\n```", specDimension, specBlock, ackBlock, specJSON, diff)
 
 	text, resp, err := runClaude(ctx, prompt)
 	if err != nil {
@@ -1227,7 +1303,7 @@ func formatScoreHeader(score ScoreResult, previousReviews string) string {
 	return header
 }
 
-func runMerger(ctx context.Context, allReviews, validated string, mode ReviewMode, specContent string) (string, claudeResponse, error) {
+func runMerger(ctx context.Context, allReviews, validated string, mode ReviewMode, specContent, acknowledgedIssues string) (string, claudeResponse, error) {
 	var modeRules string
 	switch mode {
 	case ModeFinal:
@@ -1257,6 +1333,13 @@ RE-REVIEW RULES:
 		specContext = fmt.Sprintf("\n\n## Specification\n%s", specContent)
 	}
 
+	ackSection := ""
+	ackRule := ""
+	if acknowledgedIssues != "" {
+		ackSection = "\n8. **Acknowledged Issues** — briefly list items the author already acknowledged, confirming they are not blocking"
+		ackRule = "\n- Issues explicitly acknowledged by the author (ack, won't fix, intentional, by design) must NOT appear in Critical Issues or Design Concerns. List them separately as acknowledged. Do not let them influence the verdict negatively"
+	}
+
 	text, resp, err := runClaude(ctx, fmt.Sprintf(`You are a review synthesizer. You have 4 independent code reviews and a validation report.
 
 Merge them into ONE cohesive, comprehensive review. Structure:
@@ -1266,7 +1349,7 @@ Merge them into ONE cohesive, comprehensive review. Structure:
 3. **Design Concerns** — architecture, complexity, maintainability (if any)
 4. **Suggestions** — improvements worth making
 5. **What's Good** — brief acknowledgment of things done well (1-2 lines max)
-6. **Verdict** — Approve / Request Changes / Needs Discussion%s
+6. **Verdict** — Approve / Request Changes / Needs Discussion%s%s
 
 Rules:
 - The GO-EXPERT review is the most authoritative voice. When reviewers conflict, defer to GO-EXPERT. Its critical issues are always included. Its verdict carries the most weight in the final verdict.
@@ -1274,13 +1357,13 @@ Rules:
 - Drop anything the validator flagged as incorrect
 - Incorporate answers to reviewer questions from the validation
 - Keep it actionable and specific
-- Reference file names and line numbers where relevant%s
+- Reference file names and line numbers where relevant%s%s
 %s
 ## Reviews
 %s
 
 ## Validation Report
-%s%s`, specSection, specRule, modeRules, allReviews, validated, specContext))
+%s%s`, specSection, ackSection, specRule, ackRule, modeRules, allReviews, validated, specContext))
 	if err != nil {
 		return "", claudeResponse{}, fmt.Errorf("merger failed: %w", err)
 	}
