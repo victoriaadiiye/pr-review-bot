@@ -37,6 +37,7 @@ type ReviewRequest struct {
 	JiraTicket      string
 	JiraContext     string
 	PreviousReviews string
+	SpecContent     string
 }
 
 type claudeResponse struct {
@@ -103,6 +104,7 @@ type ScoreResult struct {
 	GoQuality           int    `json:"go_quality"`
 	Testing             int    `json:"testing"`
 	ProductionReadiness int    `json:"production_readiness"`
+	SpecCompliance      int    `json:"spec_compliance"`
 	Overall             int    `json:"overall"`
 	Summary             string `json:"summary"`
 }
@@ -112,6 +114,7 @@ var (
 	jiraTicketPattern    = regexp.MustCompile(`\b[A-Z]{2,}-\d+\b`)
 	modePattern          = regexp.MustCompile(`--(initial|re-review|quick|final)\b`)
 	selfPattern          = regexp.MustCompile(`--self\b`)
+	specPattern          = regexp.MustCompile(`--spec\s+(\S+)`)
 	previousScorePattern = regexp.MustCompile(`\*\*Quality Score: (\d+)/100\*\*`)
 )
 
@@ -175,10 +178,18 @@ func parseMode(text string) ReviewMode {
 	return ModeInitial
 }
 
+func parseSpecPath(text string) string {
+	if m := specPattern.FindStringSubmatch(text); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
 func parseJiraTicket(text string) string {
 	cleaned := ghPRPattern.ReplaceAllString(text, "")
 	cleaned = modePattern.ReplaceAllString(cleaned, "")
 	cleaned = selfPattern.ReplaceAllString(cleaned, "")
+	cleaned = specPattern.ReplaceAllString(cleaned, "")
 	if m := jiraTicketPattern.FindString(cleaned); m != "" {
 		return m
 	}
@@ -225,6 +236,22 @@ func handlePR(api *slack.Client, ev *slackevents.MessageEvent, prURL, owner, rep
 		}
 	}
 
+	specPath := parseSpecPath(ev.Text)
+	var specContent string
+	if specPath != "" {
+		var specErr error
+		if strings.HasPrefix(specPath, "/") || strings.HasPrefix(specPath, "~") || strings.HasPrefix(specPath, ".") {
+			specContent, specErr = readSpecFile(specPath)
+		} else {
+			specContent, specErr = fetchSpecFromRepo(owner, repo, specPath, prNum)
+		}
+		if specErr != nil {
+			dmUser(api, notifyUserID, fmt.Sprintf("Warning: could not read spec %s: %v (continuing without spec)", specPath, specErr))
+		} else {
+			dmUser(api, notifyUserID, fmt.Sprintf("Including spec from %s (%d chars)...", specPath, len(specContent)))
+		}
+	}
+
 	var previousReviews string
 	if mode == ModeReReview {
 		previousReviews = fetchPreviousReviews(owner, repo, prNum)
@@ -245,6 +272,7 @@ func handlePR(api *slack.Client, ev *slackevents.MessageEvent, prURL, owner, rep
 		JiraTicket:      jiraTicket,
 		JiraContext:     jiraContext,
 		PreviousReviews: previousReviews,
+		SpecContent:     specContent,
 	}
 
 	review, score, stats, err := reviewWithClaude(api, notifyUserID, req)
@@ -439,6 +467,45 @@ func fetchJiraContext(ticketKey string) string {
 		issue.Key, issue.Fields.Summary, desc)
 }
 
+func readSpecFile(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read spec file %s: %w", path, err)
+	}
+	content := string(data)
+	const maxChars = 20_000
+	if len(content) > maxChars {
+		content = content[:maxChars] + "\n[spec truncated]"
+	}
+	return content, nil
+}
+
+func fetchSpecFromRepo(owner, repo, specPath, prNum string) (string, error) {
+	repoSlug := fmt.Sprintf("%s/%s", owner, repo)
+	baseCmd := exec.Command("gh", "pr", "view", prNum, "--repo", repoSlug,
+		"--json", "baseRefName", "--jq", ".baseRefName")
+	baseOut, err := baseCmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("get base ref for spec: %w", err)
+	}
+	baseRef := strings.TrimSpace(string(baseOut))
+
+	cmd := exec.Command("gh", "api",
+		fmt.Sprintf("repos/%s/%s/contents/%s?ref=%s", owner, repo, specPath, baseRef),
+		"-H", "Accept: application/vnd.github.raw")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("fetch %s from %s@%s: %w", specPath, repoSlug, baseRef, err)
+	}
+
+	content := string(out)
+	const maxChars = 20_000
+	if len(content) > maxChars {
+		content = content[:maxChars] + "\n[spec truncated]"
+	}
+	return content, nil
+}
+
 func reviewWithClaude(api *slack.Client, notifyUserID string, req ReviewRequest) (string, *ScoreResult, *UsageStats, error) {
 	stats := &UsageStats{}
 
@@ -448,6 +515,9 @@ func reviewWithClaude(api *slack.Client, notifyUserID string, req ReviewRequest)
 	}
 	if req.PreviousReviews != "" {
 		extraContext.WriteString(fmt.Sprintf("\n\n## Previous Review Comments\nThis PR was reviewed before. Consider whether previous feedback was addressed:\n\n%s\n", req.PreviousReviews))
+	}
+	if req.SpecContent != "" {
+		extraContext.WriteString(fmt.Sprintf("\n\n## Specification / Requirements\nThe following spec defines what this PR should implement. Evaluate whether the PR accurately implements the spec and flag any drift from requirements — missing features, extra unspecified behavior, or contradictions:\n\n%s\n", req.SpecContent))
 	}
 	contextBlock := extraContext.String()
 	questionsStr := questionsBlock(req.Questions)
@@ -460,7 +530,7 @@ func reviewWithClaude(api *slack.Client, notifyUserID string, req ReviewRequest)
 		defer scoreWg.Done()
 		log.Printf("scorer: starting for %s", req.PRURL)
 		var resp claudeResponse
-		score, resp, scoreErr = runScorer(req.Diff)
+		score, resp, scoreErr = runScorer(req.Diff, req.SpecContent)
 		if scoreErr != nil {
 			log.Printf("scorer: failed for %s: %v", req.PRURL, scoreErr)
 		} else {
@@ -543,7 +613,7 @@ Be concise. Output a validation report.
 
 	dmUser(api, notifyUserID, "Validator done. Merging reviews...")
 	log.Printf("merger: starting for %s", req.PRURL)
-	merged, mergeResp, err := runMerger(allReviews, validated, req.Mode)
+	merged, mergeResp, err := runMerger(allReviews, validated, req.Mode, req.SpecContent)
 	if err != nil {
 		return "", nil, stats, err
 	}
@@ -733,7 +803,16 @@ Keep it short. If the code is sound, say so and approve.
 	return text, nil
 }
 
-func runScorer(diff string) (ScoreResult, claudeResponse, error) {
+func runScorer(diff string, specContent string) (ScoreResult, claudeResponse, error) {
+	specDimension := ""
+	specBlock := ""
+	specJSON := ""
+	if specContent != "" {
+		specDimension = "\n- spec_compliance: How accurately and completely the diff implements the spec requirements, without drift or missing items"
+		specBlock = fmt.Sprintf("\n## Specification\nEvaluate the diff against this spec:\n\n%s\n\n", specContent)
+		specJSON = `,"spec_compliance":N`
+	}
+
 	prompt := fmt.Sprintf(`You are a code quality scorer. Evaluate this PR diff and rate the code quality.
 
 Score each dimension 0-10 (10 = excellent, 0 = critical problems):
@@ -742,14 +821,14 @@ Score each dimension 0-10 (10 = excellent, 0 = critical problems):
 - design: Architecture, complexity, naming, readability
 - go_quality: Idiomatic Go, stdlib usage, concurrency patterns, error wrapping
 - testing: Test presence and quality, edge case coverage
-- production_readiness: Logging, monitoring, graceful degradation
+- production_readiness: Logging, monitoring, graceful degradation%s
 
 If a dimension has no relevant code in the diff (e.g., no security-sensitive changes), score 8-9 reflecting no risk introduced.
-
+%s
 Respond with ONLY this JSON object, no markdown fences, no other text:
-{"correctness":N,"security":N,"design":N,"go_quality":N,"testing":N,"production_readiness":N,"overall":N,"summary":"one sentence"}
+{"correctness":N,"security":N,"design":N,"go_quality":N,"testing":N,"production_readiness":N%s,"overall":N,"summary":"one sentence"}
 
-`+"```diff\n%s\n```", diff)
+`+"```diff\n%s\n```", specDimension, specBlock, specJSON, diff)
 
 	text, resp, err := runClaude(prompt)
 	if err != nil {
@@ -768,8 +847,14 @@ Respond with ONLY this JSON object, no markdown fences, no other text:
 		return ScoreResult{}, resp, fmt.Errorf("scorer JSON parse: %w", err)
 	}
 
-	score.Overall = (score.Correctness*25 + score.Security*20 + score.Design*15 +
-		score.GoQuality*15 + score.Testing*15 + score.ProductionReadiness*10) / 10
+	if score.SpecCompliance > 0 {
+		score.Overall = (score.Correctness*20 + score.Security*16 + score.Design*12 +
+			score.GoQuality*12 + score.Testing*12 + score.ProductionReadiness*8 +
+			score.SpecCompliance*20) / 10
+	} else {
+		score.Overall = (score.Correctness*25 + score.Security*20 + score.Design*15 +
+			score.GoQuality*15 + score.Testing*15 + score.ProductionReadiness*10) / 10
+	}
 
 	return score, resp, nil
 }
@@ -794,6 +879,11 @@ func formatScoreHeader(score ScoreResult, previousReviews string) string {
 		}
 	}
 
+	specRow := ""
+	if score.SpecCompliance > 0 {
+		specRow = fmt.Sprintf("| Spec Compliance | %d/10 |\n", score.SpecCompliance)
+	}
+
 	header += fmt.Sprintf(`
 
 | Dimension | Score |
@@ -804,16 +894,16 @@ func formatScoreHeader(score ScoreResult, previousReviews string) string {
 | Go Quality | %d/10 |
 | Testing | %d/10 |
 | Production Readiness | %d/10 |
-
+%s
 > %s`,
 		score.Correctness, score.Security, score.Design,
 		score.GoQuality, score.Testing, score.ProductionReadiness,
-		score.Summary)
+		specRow, score.Summary)
 
 	return header
 }
 
-func runMerger(allReviews, validated string, mode ReviewMode) (string, claudeResponse, error) {
+func runMerger(allReviews, validated string, mode ReviewMode, specContent string) (string, claudeResponse, error) {
 	var modeRules string
 	switch mode {
 	case ModeFinal:
@@ -834,6 +924,15 @@ RE-REVIEW RULES:
 `
 	}
 
+	specSection := ""
+	specRule := ""
+	specContext := ""
+	if specContent != "" {
+		specSection = "\n7. **Spec Compliance** — how well the PR implements the spec, deviations, missing requirements"
+		specRule = "\n- Include a dedicated Spec Compliance section evaluating requirement coverage, drift, and any unspecified behavior"
+		specContext = fmt.Sprintf("\n\n## Specification\n%s", specContent)
+	}
+
 	text, resp, err := runClaude(fmt.Sprintf(`You are a review synthesizer. You have 4 independent code reviews and a validation report.
 
 Merge them into ONE cohesive, comprehensive review. Structure:
@@ -843,7 +942,7 @@ Merge them into ONE cohesive, comprehensive review. Structure:
 3. **Design Concerns** — architecture, complexity, maintainability (if any)
 4. **Suggestions** — improvements worth making
 5. **What's Good** — brief acknowledgment of things done well (1-2 lines max)
-6. **Verdict** — Approve / Request Changes / Needs Discussion
+6. **Verdict** — Approve / Request Changes / Needs Discussion%s
 
 Rules:
 - The GO-EXPERT review is the most authoritative voice. When reviewers conflict, defer to GO-EXPERT. Its critical issues are always included. Its verdict carries the most weight in the final verdict.
@@ -851,13 +950,13 @@ Rules:
 - Drop anything the validator flagged as incorrect
 - Incorporate answers to reviewer questions from the validation
 - Keep it actionable and specific
-- Reference file names and line numbers where relevant
+- Reference file names and line numbers where relevant%s
 %s
 ## Reviews
 %s
 
 ## Validation Report
-%s`, modeRules, allReviews, validated))
+%s%s`, specSection, specRule, modeRules, allReviews, validated, specContext))
 	if err != nil {
 		return "", claudeResponse{}, fmt.Errorf("merger failed: %w", err)
 	}

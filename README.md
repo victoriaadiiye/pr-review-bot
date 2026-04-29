@@ -27,6 +27,8 @@ https://github.com/org/repo/pull/42 --re-review        # focus on previously fla
 https://github.com/org/repo/pull/42 --final            # err on approval, nits are optional
 https://github.com/org/repo/pull/42 --self              # DM only, no GitHub/channel post
 https://github.com/org/repo/pull/42 --self --quick     # combine any mode with --self
+https://github.com/org/repo/pull/42 --spec docs/SPEC.md  # check drift from spec (repo-relative)
+https://github.com/org/repo/pull/42 --spec /abs/path.md  # check drift from spec (local file)
 ```
 
 | Mode | Agents | Validator | Merger | Behavior |
@@ -52,6 +54,28 @@ https://github.com/org/repo/pull/42 --quick PROJ-123   # works with any mode
 
 No Jira env vars? Feature silently skips. No ticket in message or PR title? Same.
 
+## Spec compliance
+
+Use `--spec <path>` to check the PR against a requirements/spec document. The bot evaluates whether the diff accurately implements the spec and flags drift — missing features, extra unspecified behavior, or contradictions.
+
+```
+https://github.com/org/repo/pull/42 --spec docs/REQUIREMENTS.md
+https://github.com/org/repo/pull/42 --spec internal/auth/SPEC.md --final
+https://github.com/org/repo/pull/42 --spec /Users/me/specs/auth-spec.md
+```
+
+**Path resolution:**
+- Starts with `/`, `~`, or `.` — read from local filesystem
+- Otherwise — fetched from the PR's base branch in the same GitHub repo via `gh api`
+
+When a spec is provided:
+- All review agents see the spec and evaluate compliance
+- The scorer adds a **Spec Compliance** dimension (weighted 20%, other dimensions scaled down proportionally)
+- The merger includes a dedicated **Spec Compliance** section in the final review
+- Score header shows the spec compliance row
+
+If the spec file can't be read, the bot warns via DM and continues the review without it.
+
 ## Quality Score
 
 Every review includes a quality score header:
@@ -76,6 +100,7 @@ Every review includes a quality score header:
 - **Go Quality** (15%) -- idiomatic Go, stdlib usage, concurrency, error wrapping
 - **Testing** (15%) -- test presence, quality, edge case coverage
 - **Production Readiness** (10%) -- logging, monitoring, graceful degradation
+- **Spec Compliance** (20%, only with `--spec`) -- requirement coverage, drift, unspecified behavior. When present, other weights scale down proportionally to make room.
 
 On `--re-review`, the score shows a delta from the previous review:
 
@@ -185,13 +210,14 @@ launchctl load ~/Library/LaunchAgents/com.vuifhaolain.pr-review-bot.plist
 Slack message (PR link + flags)
         |
         v
-  parseMode() + parseJiraTicket()
+  parseMode() + parseJiraTicket() + parseSpecPath()
         |
         v
   fetchDiff (gh pr diff)
-  fetchPRTitle (gh pr view)        -- Jira ticket auto-detect
-  fetchJiraContext (Jira REST API)  -- if ticket found
-  fetchPreviousReviews (gh pr view) -- if --re-review
+  fetchPRTitle (gh pr view)          -- Jira ticket auto-detect
+  fetchJiraContext (Jira REST API)    -- if ticket found
+  readSpecFile / fetchSpecFromRepo   -- if --spec
+  fetchPreviousReviews (gh pr view)  -- if --re-review
         |
         v
   +-----------+-----------+-----------+-----------+---------+
