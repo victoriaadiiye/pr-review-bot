@@ -261,7 +261,7 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 	dmUser(api, notifyUserID, fmt.Sprintf("Starting %s review of <%s>...", modeDesc, prURL))
 
 	dmUser(api, notifyUserID, fmt.Sprintf("Fetching diff for <%s>...", prURL))
-	diff, err := fetchDiff(owner, repo, prNum)
+	diff, err := fetchDiff(ctx, owner, repo, prNum)
 	if err != nil {
 		if selfReview {
 			_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
@@ -274,7 +274,7 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 	}
 
 	if jiraTicket == "" {
-		if title := fetchPRTitle(owner, repo, prNum); title != "" {
+		if title := fetchPRTitle(ctx, owner, repo, prNum); title != "" {
 			if m := jiraTicketPattern.FindString(title); m != "" {
 				jiraTicket = m
 			}
@@ -289,7 +289,7 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 		}
 	}
 
-	previousReviews := fetchPRContext(owner, repo, prNum)
+	previousReviews := fetchPRContext(ctx, owner, repo, prNum)
 
 	specPath := parseSpecPath(ev.Text)
 	if specPath == "" {
@@ -304,7 +304,7 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 		if strings.HasPrefix(specPath, "/") || strings.HasPrefix(specPath, "~") || strings.HasPrefix(specPath, ".") {
 			specContent, specErr = readSpecFile(specPath)
 		} else {
-			specContent, specErr = fetchSpecFromRepo(owner, repo, specPath, prNum)
+			specContent, specErr = fetchSpecFromRepo(ctx, owner, repo, specPath, prNum)
 		}
 		if specErr != nil {
 			dmUser(api, notifyUserID, fmt.Sprintf("Warning: could not read spec %s: %v (continuing without spec)", specPath, specErr))
@@ -330,6 +330,11 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 		PreviousReviews: previousReviews,
 		SpecContent:     specContent,
 		SpecPath:        specPath,
+	}
+
+	if ctx.Err() != nil {
+		postCancelled(api, ev, prURL, channelID, notifyUserID)
+		return
 	}
 
 	review, score, stats, err := reviewWithClaude(ctx, api, notifyUserID, req)
@@ -385,8 +390,8 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 	dmUser(api, notifyUserID, fmt.Sprintf("Done! %s review for <%s> posted on GitHub and in <#%s>.%s\nUsage: %s", modeLabel, prURL, channelID, scoreMsg, stats))
 }
 
-func fetchDiff(owner, repo, prNum string) (string, error) {
-	cmd := exec.Command("gh", "pr", "diff", prNum, "--repo", fmt.Sprintf("%s/%s", owner, repo))
+func fetchDiff(ctx context.Context, owner, repo, prNum string) (string, error) {
+	cmd := exec.CommandContext(ctx, "gh", "pr", "diff", prNum, "--repo", fmt.Sprintf("%s/%s", owner, repo))
 	out, err := cmd.Output()
 	if err != nil {
 		log.Printf("gh pr diff failed for %s/%s#%s, trying git fallback", owner, repo, prNum)
@@ -451,8 +456,8 @@ func fetchDiffViaGit(owner, repo, prNum string) (string, error) {
 	return diff, nil
 }
 
-func fetchPRTitle(owner, repo, prNum string) string {
-	cmd := exec.Command("gh", "pr", "view", prNum,
+func fetchPRTitle(ctx context.Context, owner, repo, prNum string) string {
+	cmd := exec.CommandContext(ctx, "gh", "pr", "view", prNum,
 		"--repo", fmt.Sprintf("%s/%s", owner, repo),
 		"--json", "title", "--jq", ".title")
 	out, err := cmd.Output()
@@ -462,22 +467,22 @@ func fetchPRTitle(owner, repo, prNum string) string {
 	return strings.TrimSpace(string(out))
 }
 
-func fetchPRContext(owner, repo, prNum string) string {
+func fetchPRContext(ctx context.Context, owner, repo, prNum string) string {
 	repoSlug := fmt.Sprintf("%s/%s", owner, repo)
 
-	descCmd := exec.Command("gh", "pr", "view", prNum,
+	descCmd := exec.CommandContext(ctx, "gh", "pr", "view", prNum,
 		"--repo", repoSlug,
 		"--json", "title,body,author",
 		"--jq", `"## PR: " + .title + "\nAuthor: " + .author.login + "\n\n" + .body`)
 	descOut, _ := descCmd.Output()
 
-	commentsCmd := exec.Command("gh", "pr", "view", prNum,
+	commentsCmd := exec.CommandContext(ctx, "gh", "pr", "view", prNum,
 		"--repo", repoSlug,
 		"--json", "comments",
 		"--jq", `.comments[] | "### Comment by " + .author.login + " (" + .createdAt + ")\n" + .body`)
 	commentsOut, _ := commentsCmd.Output()
 
-	reviewsCmd := exec.Command("gh", "pr", "view", prNum,
+	reviewsCmd := exec.CommandContext(ctx, "gh", "pr", "view", prNum,
 		"--repo", repoSlug,
 		"--json", "reviews",
 		"--jq", `.reviews[] | select(.body != "") | "### Review by " + .author.login + " [" + .state + "] (" + .submittedAt + ")\n" + .body`)
@@ -572,9 +577,9 @@ func readSpecFile(path string) (string, error) {
 	return content, nil
 }
 
-func fetchSpecFromRepo(owner, repo, specPath, prNum string) (string, error) {
+func fetchSpecFromRepo(ctx context.Context, owner, repo, specPath, prNum string) (string, error) {
 	repoSlug := fmt.Sprintf("%s/%s", owner, repo)
-	headCmd := exec.Command("gh", "pr", "view", prNum, "--repo", repoSlug,
+	headCmd := exec.CommandContext(ctx, "gh", "pr", "view", prNum, "--repo", repoSlug,
 		"--json", "headRefName", "--jq", ".headRefName")
 	headOut, err := headCmd.CombinedOutput()
 	if err != nil {
@@ -582,7 +587,7 @@ func fetchSpecFromRepo(owner, repo, specPath, prNum string) (string, error) {
 	}
 	headRef := strings.TrimSpace(string(headOut))
 
-	cmd := exec.Command("gh", "api",
+	cmd := exec.CommandContext(ctx, "gh", "api",
 		fmt.Sprintf("repos/%s/%s/contents/%s?ref=%s", owner, repo, specPath, headRef),
 		"-H", "Accept: application/vnd.github.raw")
 	out, err := cmd.CombinedOutput()
