@@ -2,9 +2,26 @@
 
 Multi-agent code review bot that watches a Slack channel for GitHub PR links, runs parallel Claude-powered review agents, and posts synthesized reviews back to GitHub and Slack. Includes a **Quality Score** (0-100) that breaks down across 6 dimensions and tracks improvement across re-reviews.
 
+## How to trigger a review
+
+**Watched channel** -- post a PR link and the bot auto-reviews it:
+```
+https://github.com/org/repo/pull/42
+```
+
+**Any other channel** -- @mention the bot and ask it to review:
+```
+@pr-review-bot review https://github.com/org/repo/pull/42
+@pr-review-bot review https://github.com/org/repo/pull/42 --quick
+```
+
+The @mention must include the word "review" — casual mentions without it are ignored. The bot needs to be invited to the channel first (`/invite @pr-review-bot`).
+
+**Re-trigger via reaction** -- add a :claude_it: reaction to any message containing a PR link in the watched channel.
+
 ## How it works
 
-1. Post a GitHub PR link in the watched Slack channel
+1. Post a GitHub PR link in the watched channel (or @mention the bot with "review" in any channel)
 2. Bot reacts with :eyes: and launches up to 4 specialized review agents in parallel:
    - **Correctness** -- bugs, security, race conditions, error handling
    - **Design** -- architecture, complexity, naming, test quality
@@ -137,9 +154,9 @@ Use the included manifest to create your app:
 slack-manifest.yaml
 ```
 
-Required bot scopes: `channels:history`, `channels:read`, `groups:history`, `groups:read`, `chat:write`, `im:write`, `reactions:write`
+Required bot scopes: `channels:history`, `channels:read`, `groups:history`, `groups:read`, `chat:write`, `im:write`, `reactions:read`, `reactions:write`
 
-Required event subscriptions: `message.channels`, `message.groups`
+Required event subscriptions: `app_mention`, `message.channels`, `message.groups`, `reaction_added`
 
 Enable **Socket Mode** in your app settings and generate an app-level token (`xapp-*`).
 
@@ -207,7 +224,9 @@ launchctl load ~/Library/LaunchAgents/com.vuifhaolain.pr-review-bot.plist
 ## Architecture
 
 ```
-Slack message (PR link + flags)
+Slack message (PR link + flags in watched channel)
+  -- or --
+@mention with "review" (any channel)
         |
         v
   parseMode() + parseJiraTicket() + parseSpecPath()

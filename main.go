@@ -127,6 +127,7 @@ var (
 	specPattern          = regexp.MustCompile(`--spec\s+(\S+)`)
 	previousScorePattern = regexp.MustCompile(`\*\*Quality Score: (\d+)/100\*\*`)
 	previousSpecPattern  = regexp.MustCompile(`<!-- spec: (\S+) -->`)
+	reviewRequestPattern = regexp.MustCompile(`(?i)\breview\b`)
 
 	activeReviews   = make(map[string]context.CancelFunc)
 	activeReviewsMu sync.Mutex
@@ -228,6 +229,34 @@ func main() {
 				}
 				if rev.Reaction == "claude_it" {
 					go handleReactionReview(api, rev, channelID, notifyUserID, reviewQuestions)
+				}
+
+			case string(slackevents.AppMention):
+				ev, ok := outer.InnerEvent.Data.(*slackevents.AppMentionEvent)
+				if !ok {
+					continue
+				}
+
+				if !reviewRequestPattern.MatchString(ev.Text) {
+					continue
+				}
+
+				matches := ghPRPattern.FindAllStringSubmatch(ev.Text, -1)
+				if len(matches) == 0 {
+					continue
+				}
+
+				msgEv := &slackevents.MessageEvent{
+					Text:      ev.Text,
+					Channel:   ev.Channel,
+					TimeStamp: ev.TimeStamp,
+				}
+				for _, m := range matches {
+					owner, repo, prNum := m[1], m[2], m[3]
+					prURL := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, prNum)
+					ctx, cancel := context.WithCancel(context.Background())
+					trackReview(msgEv.TimeStamp, cancel)
+					go handlePR(ctx, api, msgEv, prURL, owner, repo, prNum, ev.Channel, notifyUserID, reviewQuestions)
 				}
 
 			case string(slackevents.Message):

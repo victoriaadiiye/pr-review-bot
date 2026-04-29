@@ -283,6 +283,32 @@ func TestSpecMetadata_NotAppendedWithoutSpec(t *testing.T) {
 	}
 }
 
+func TestReviewRequestPattern(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		{"<@U123> review https://github.com/org/repo/pull/1", true},
+		{"<@U123> Review https://github.com/org/repo/pull/1", true},
+		{"<@U123> please review https://github.com/org/repo/pull/1 --quick", true},
+		{"<@U123> can you review this? https://github.com/org/repo/pull/1", true},
+		{"<@U123> REVIEW https://github.com/org/repo/pull/1", true},
+		{"<@U123> https://github.com/org/repo/pull/1", false},
+		{"<@U123> hey check this out https://github.com/org/repo/pull/1", false},
+		{"<@U123> what do you think?", false},
+		{"<@U123> reviewed this already", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := reviewRequestPattern.MatchString(tt.input)
+			if got != tt.want {
+				t.Errorf("reviewRequestPattern.MatchString(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseSpecPath(t *testing.T) {
 	tests := []struct {
 		input string
