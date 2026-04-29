@@ -27,6 +27,7 @@ type SlackAPI interface {
 	PostMessage(channelID string, options ...slack.MsgOption) (string, string, error)
 	OpenConversation(params *slack.OpenConversationParameters) (*slack.Channel, bool, bool, error)
 	GetConversationHistory(params *slack.GetConversationHistoryParameters) (*slack.GetConversationHistoryResponse, error)
+	GetConversationReplies(params *slack.GetConversationRepliesParameters) ([]slack.Message, bool, string, error)
 }
 
 type ReviewMode string
@@ -134,27 +135,131 @@ var (
 	activeReviewsMu sync.Mutex
 )
 
-func trackReview(ts string, cancel context.CancelFunc) {
-	activeReviewsMu.Lock()
-	defer activeReviewsMu.Unlock()
-	activeReviews[ts] = cancel
+func reviewKey(ts, id string) string {
+	return ts + "|" + id
 }
 
-func untrackReview(ts string) {
+func trackReview(ts, id string, cancel context.CancelFunc) {
 	activeReviewsMu.Lock()
 	defer activeReviewsMu.Unlock()
-	delete(activeReviews, ts)
+	key := reviewKey(ts, id)
+	activeReviews[key] = cancel
+	log.Printf("tracking review %s (%d active)", key, len(activeReviews))
+}
+
+func untrackReview(ts, id string) {
+	activeReviewsMu.Lock()
+	defer activeReviewsMu.Unlock()
+	key := reviewKey(ts, id)
+	delete(activeReviews, key)
+	log.Printf("untracked review %s (%d active)", key, len(activeReviews))
+}
+
+func isReviewActive(prURL string) bool {
+	activeReviewsMu.Lock()
+	defer activeReviewsMu.Unlock()
+	suffix := "|" + prURL
+	for key := range activeReviews {
+		if strings.HasSuffix(key, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 func cancelReview(ts string) bool {
 	activeReviewsMu.Lock()
 	defer activeReviewsMu.Unlock()
-	if cancel, ok := activeReviews[ts]; ok {
-		cancel()
-		delete(activeReviews, ts)
-		return true
+	prefix := ts + "|"
+	cancelled := false
+	for key, cancel := range activeReviews {
+		if strings.HasPrefix(key, prefix) {
+			cancel()
+			delete(activeReviews, key)
+			cancelled = true
+			log.Printf("cancelled review %s", key)
+		}
 	}
-	return false
+	return cancelled
+}
+
+func findPRInThread(api SlackAPI, channelID, threadTS string) (owner, repo, prNum string, fullText string, ok bool) {
+	msgs, _, _, err := api.GetConversationReplies(&slack.GetConversationRepliesParameters{
+		ChannelID: channelID,
+		Timestamp: threadTS,
+		Limit:     50,
+	})
+	if err != nil {
+		log.Printf("failed to fetch thread %s in %s: %v", threadTS, channelID, err)
+		return "", "", "", "", false
+	}
+	for _, msg := range msgs {
+		if m := ghPRPattern.FindStringSubmatch(msg.Text); m != nil {
+			return m[1], m[2], m[3], msg.Text, true
+		}
+	}
+	return "", "", "", "", false
+}
+
+func handleThreadFollowup(ctx context.Context, api SlackAPI, ev *slackevents.AppMentionEvent, owner, repo, prNum, notifyUserID string) {
+	prURL := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, prNum)
+
+	_ = api.AddReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+
+	diff, err := fetchDiff(ctx, owner, repo, prNum)
+	if err != nil {
+		_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+		_ = api.AddReaction("x", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+		_, _, _ = api.PostMessage(ev.Channel,
+			slack.MsgOptionText(fmt.Sprintf("Failed to fetch diff for <%s>: %v", prURL, err), false),
+			slack.MsgOptionTS(ev.ThreadTimeStamp))
+		return
+	}
+
+	msgs, _, _, _ := api.GetConversationReplies(&slack.GetConversationRepliesParameters{
+		ChannelID: ev.Channel,
+		Timestamp: ev.ThreadTimeStamp,
+		Limit:     50,
+	})
+	var threadContext strings.Builder
+	for _, msg := range msgs {
+		if msg.Timestamp == ev.TimeStamp {
+			continue
+		}
+		threadContext.WriteString(msg.Text + "\n\n")
+	}
+
+	botMentionPattern := regexp.MustCompile(`<@[A-Z0-9]+>`)
+	question := strings.TrimSpace(botMentionPattern.ReplaceAllString(ev.Text, ""))
+
+	prompt := fmt.Sprintf(`You are a code review assistant. A reviewer asked a follow-up question about a PR review.
+
+Answer the question concisely based on the diff and thread context. Be specific — reference files and lines.
+
+## Question
+%s
+
+## PR Diff
+`+"```diff\n%s\n```"+`
+
+## Thread Context
+%s`, question, diff, threadContext.String())
+
+	answer, _, err := runClaude(ctx, prompt)
+	if err != nil {
+		_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+		_ = api.AddReaction("x", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+		_, _, _ = api.PostMessage(ev.Channel,
+			slack.MsgOptionText(fmt.Sprintf("Failed to answer: %v", err), false),
+			slack.MsgOptionTS(ev.ThreadTimeStamp))
+		return
+	}
+
+	_, _, _ = api.PostMessage(ev.Channel,
+		slack.MsgOptionText(answer, false),
+		slack.MsgOptionTS(ev.ThreadTimeStamp))
+	_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+	dmUser(api, notifyUserID, fmt.Sprintf("Answered follow-up question in thread for <%s>", prURL))
 }
 
 func handleReactionReview(api SlackAPI, rev *slackevents.ReactionAddedEvent, channelID, notifyUserID, reviewQuestions string) {
@@ -185,8 +290,12 @@ func handleReactionReview(api SlackAPI, rev *slackevents.ReactionAddedEvent, cha
 	for _, m := range matches {
 		owner, repo, prNum := m[1], m[2], m[3]
 		prURL := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, prNum)
+		if isReviewActive(prURL) {
+			log.Printf("skipping duplicate :claude_it: review for %s (already in progress)", prURL)
+			continue
+		}
 		ctx, cancel := context.WithCancel(context.Background())
-		trackReview(ev.TimeStamp, cancel)
+		trackReview(ev.TimeStamp, prURL, cancel)
 		go handlePR(ctx, api, ev, prURL, owner, repo, prNum, channelID, notifyUserID, reviewQuestions)
 	}
 }
@@ -235,26 +344,64 @@ func main() {
 					continue
 				}
 
-				if !reviewRequestPattern.MatchString(ev.Text) {
-					continue
-				}
-
 				matches := ghPRPattern.FindAllStringSubmatch(ev.Text, -1)
-				if len(matches) == 0 {
+				isReviewRequest := reviewRequestPattern.MatchString(ev.Text)
+				inThread := ev.ThreadTimeStamp != ""
+
+				if len(matches) > 0 && isReviewRequest {
+					msgEv := &slackevents.MessageEvent{
+						Text:      ev.Text,
+						Channel:   ev.Channel,
+						TimeStamp: ev.TimeStamp,
+					}
+					for _, m := range matches {
+						owner, repo, prNum := m[1], m[2], m[3]
+						prURL := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, prNum)
+						if isReviewActive(prURL) {
+							log.Printf("skipping duplicate @mention review for %s (already in progress)", prURL)
+							continue
+						}
+						ctx, cancel := context.WithCancel(context.Background())
+						trackReview(msgEv.TimeStamp, prURL, cancel)
+						go handlePR(ctx, api, msgEv, prURL, owner, repo, prNum, ev.Channel, notifyUserID, reviewQuestions)
+					}
 					continue
 				}
 
-				msgEv := &slackevents.MessageEvent{
-					Text:      ev.Text,
-					Channel:   ev.Channel,
-					TimeStamp: ev.TimeStamp,
-				}
-				for _, m := range matches {
-					owner, repo, prNum := m[1], m[2], m[3]
+				if inThread {
+					owner, repo, prNum, parentText, found := findPRInThread(api, ev.Channel, ev.ThreadTimeStamp)
+					if !found {
+						continue
+					}
 					prURL := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, prNum)
-					ctx, cancel := context.WithCancel(context.Background())
-					trackReview(msgEv.TimeStamp, cancel)
-					go handlePR(ctx, api, msgEv, prURL, owner, repo, prNum, ev.Channel, notifyUserID, reviewQuestions)
+					if isReviewRequest {
+						if isReviewActive(prURL) {
+							log.Printf("skipping duplicate thread re-review for %s (already in progress)", prURL)
+							continue
+						}
+						text := ev.Text
+						if parseMode(text) == ModeInitial {
+							text += " --re-review"
+						}
+						if specPath := parseSpecPath(parentText); specPath != "" && parseSpecPath(text) == "" {
+							text += " --spec " + specPath
+						}
+						msgEv := &slackevents.MessageEvent{
+							Text:      text,
+							Channel:   ev.Channel,
+							TimeStamp: ev.TimeStamp,
+						}
+						ctx, cancel := context.WithCancel(context.Background())
+						trackReview(msgEv.TimeStamp, prURL, cancel)
+						go handlePR(ctx, api, msgEv, prURL, owner, repo, prNum, ev.Channel, notifyUserID, reviewQuestions)
+					} else {
+						ctx, cancel := context.WithCancel(context.Background())
+						trackReview(ev.TimeStamp, prURL, cancel)
+						go func() {
+							defer untrackReview(ev.TimeStamp, prURL)
+							handleThreadFollowup(ctx, api, ev, owner, repo, prNum, notifyUserID)
+						}()
+					}
 				}
 
 			case string(slackevents.Message):
@@ -274,8 +421,12 @@ func main() {
 				for _, m := range matches {
 					owner, repo, prNum := m[1], m[2], m[3]
 					prURL := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, prNum)
+					if isReviewActive(prURL) {
+						log.Printf("skipping duplicate auto-review for %s (already in progress)", prURL)
+						continue
+					}
 					ctx, cancel := context.WithCancel(context.Background())
-					trackReview(ev.TimeStamp, cancel)
+					trackReview(ev.TimeStamp, prURL, cancel)
 					go handlePR(ctx, api, ev, prURL, owner, repo, prNum, channelID, notifyUserID, reviewQuestions)
 				}
 			}
@@ -314,7 +465,7 @@ func parseJiraTicket(text string) string {
 }
 
 func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, prURL, owner, repo, prNum, channelID, notifyUserID, reviewQuestions string) {
-	defer untrackReview(ev.TimeStamp)
+	defer untrackReview(ev.TimeStamp, prURL)
 
 	mode := parseMode(ev.Text)
 	selfReview := selfPattern.MatchString(ev.Text)

@@ -56,6 +56,10 @@ func (m *mockSlack) GetConversationHistory(params *slack.GetConversationHistoryP
 	return &slack.GetConversationHistoryResponse{}, nil
 }
 
+func (m *mockSlack) GetConversationReplies(params *slack.GetConversationRepliesParameters) ([]slack.Message, bool, string, error) {
+	return nil, false, "", nil
+}
+
 func TestPostError_RemovesEyesAndAddsX(t *testing.T) {
 	mock := &mockSlack{}
 	ev := &slackevents.MessageEvent{
@@ -162,7 +166,7 @@ func TestPostCancelled_PostsThreadAndDM(t *testing.T) {
 
 func TestCancelReview_ReturnsTrueAndCallsCancel(t *testing.T) {
 	called := false
-	trackReview("ts123", func() { called = true })
+	trackReview("ts123", "https://github.com/org/repo/pull/1", func() { called = true })
 
 	if !cancelReview("ts123") {
 		t.Error("cancelReview should return true for tracked review")
