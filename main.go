@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,7 +9,9 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -132,6 +133,8 @@ var (
 	previousSpecPattern  = regexp.MustCompile(`<!-- spec: (\S+) -->`)
 	reviewRequestPattern = regexp.MustCompile(`(?i)\breview\b`)
 	ackPattern           = regexp.MustCompile(`(?i)\b(ack(nowledg(ed?|ing))?|won'?t\s*fix|wontfix|intentional|by\s*design|noted|accepted|will\s*(fix|address)\s*later|tracking\s+in|known\s+issue|out\s*of\s*scope|deferred)\b`)
+
+	repoCache *RepoCache
 
 	activeReviews   = make(map[string]context.CancelFunc)
 	activeReviewsMu sync.Mutex
@@ -304,6 +307,7 @@ func handleReactionReview(api SlackAPI, rev *slackevents.ReactionAddedEvent, cha
 
 func main() {
 	_ = godotenv.Load()
+	repoCache = NewRepoCache()
 
 	botToken := mustEnv("SLACK_BOT_TOKEN")
 	appToken := mustEnv("SLACK_APP_TOKEN")
@@ -616,74 +620,282 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 	dmUser(api, notifyUserID, fmt.Sprintf("Done! %s review for <%s> posted on GitHub and in <#%s>.%s\nUsage: %s", modeLabel, prURL, channelID, scoreMsg, stats))
 }
 
-func fetchDiff(ctx context.Context, owner, repo, prNum string) (string, error) {
-	cmd := exec.CommandContext(ctx, "gh", "pr", "diff", prNum, "--repo", fmt.Sprintf("%s/%s", owner, repo))
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		log.Printf("gh pr diff failed for %s/%s#%s: %v; stderr: %s; trying git fallback", owner, repo, prNum, err, strings.TrimSpace(stderr.String()))
-		return fetchDiffViaGit(owner, repo, prNum)
-	}
+// --- Repo Cache ---
 
-	diff := string(out)
-	const maxChars = 80_000
-	if len(diff) > maxChars {
-		diff = diff[:maxChars] + "\n\n[diff truncated]"
-	}
-	return diff, nil
+type RepoCache struct {
+	baseDir string
+	mu      sync.Mutex
+	locks   map[string]*sync.Mutex
 }
 
-func fetchDiffViaGit(owner, repo, prNum string) (string, error) {
-	repoSlug := fmt.Sprintf("%s/%s", owner, repo)
-	repoURL := fmt.Sprintf("https://github.com/%s/%s.git", owner, repo)
+func NewRepoCache() *RepoCache {
+	dir := os.Getenv("REPO_CACHE_DIR")
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			log.Fatalf("repo-cache: cannot determine home dir: %v", err)
+		}
+		dir = filepath.Join(home, ".pr-review-cache")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		log.Fatalf("repo-cache: cannot create %s: %v", dir, err)
+	}
+	log.Printf("repo-cache: %s", dir)
+	return &RepoCache{
+		baseDir: dir,
+		locks:   make(map[string]*sync.Mutex),
+	}
+}
 
-	baseCmd := exec.Command("gh", "pr", "view", prNum, "--repo", repoSlug, "--json", "baseRefName", "--jq", ".baseRefName")
-	var baseStderr bytes.Buffer
-	baseCmd.Stderr = &baseStderr
-	baseOut, err := baseCmd.Output()
+func (c *RepoCache) repoLock(slug string) *sync.Mutex {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.locks[slug] == nil {
+		c.locks[slug] = &sync.Mutex{}
+	}
+	return c.locks[slug]
+}
+
+func (c *RepoCache) gitDir(owner, repo string) string {
+	return filepath.Join(c.baseDir, owner, repo+".git")
+}
+
+func (c *RepoCache) EnsureRepo(ctx context.Context, owner, repo string) (string, error) {
+	slug := owner + "/" + repo
+	mu := c.repoLock(slug)
+	mu.Lock()
+	defer mu.Unlock()
+
+	gd := c.gitDir(owner, repo)
+
+	if _, err := os.Stat(filepath.Join(gd, "HEAD")); os.IsNotExist(err) {
+		log.Printf("repo-cache: cloning %s", slug)
+		if err := os.MkdirAll(filepath.Dir(gd), 0o755); err != nil {
+			return "", fmt.Errorf("create cache dir: %w", err)
+		}
+		repoURL := fmt.Sprintf("https://github.com/%s/%s.git", owner, repo)
+		cmd := exec.CommandContext(ctx, "git", "clone", "--bare", repoURL, gd)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return "", fmt.Errorf("bare clone %s: %s", slug, string(out))
+		}
+		log.Printf("repo-cache: cloned %s", slug)
+	} else {
+		log.Printf("repo-cache: fetching %s", slug)
+		cmd := exec.CommandContext(ctx, "git", "--git-dir", gd, "fetch", "--prune", "origin")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return "", fmt.Errorf("fetch %s: %s", slug, string(out))
+		}
+	}
+
+	return gd, nil
+}
+
+func (c *RepoCache) FetchPR(ctx context.Context, gitDir, owner, repo, prNum string) error {
+	slug := owner + "/" + repo
+	mu := c.repoLock(slug)
+	mu.Lock()
+	defer mu.Unlock()
+
+	ref := fmt.Sprintf("+pull/%s/head:refs/prs/%s", prNum, prNum)
+	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "fetch", "origin", ref)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("fetch PR %s#%s: %s", slug, prNum, string(out))
+	}
+	return nil
+}
+
+func (c *RepoCache) FileContent(ctx context.Context, gitDir, ref, path string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "show", ref+":"+path)
+	out, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("get PR base ref: %w; stderr: %s", err, strings.TrimSpace(baseStderr.String()))
+		return "", err
 	}
-	baseRef := strings.TrimSpace(string(baseOut))
+	return string(out), nil
+}
 
-	tmpDir, err := os.MkdirTemp("", "pr-diff-*")
-	if err != nil {
-		return "", fmt.Errorf("create temp dir: %w", err)
-	}
-	defer os.RemoveAll(tmpDir)
+// --- Smart Diff ---
 
-	if out, err := exec.Command("git", "init", tmpDir).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("git init: %s", string(out))
-	}
-	if out, err := exec.Command("git", "-C", tmpDir, "remote", "add", "origin", repoURL).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("git remote add: %s", string(out))
+type filePriority int
+
+const (
+	prioImpl filePriority = iota
+	prioConfig
+	prioTest
+	prioGenerated
+)
+
+func classifyFile(path string) filePriority {
+	base := filepath.Base(path)
+
+	if strings.Contains(path, "vendor/") || strings.Contains(path, "node_modules/") ||
+		strings.HasSuffix(base, ".lock") || base == "package-lock.json" ||
+		base == "yarn.lock" || base == "pnpm-lock.yaml" || base == "go.sum" ||
+		strings.Contains(path, "generated") || strings.HasSuffix(base, ".gen.go") ||
+		strings.HasSuffix(base, ".pb.go") {
+		return prioGenerated
 	}
 
-	log.Printf("fetching base ref %s and PR #%s head via git for %s", baseRef, prNum, repoSlug)
-	if out, err := exec.Command("git", "-C", tmpDir, "fetch", "--depth=1", "origin", baseRef+":base").CombinedOutput(); err != nil {
-		return "", fmt.Errorf("fetch base: %s", string(out))
-	}
-	if out, err := exec.Command("git", "-C", tmpDir, "fetch", "--depth=1", "origin", fmt.Sprintf("pull/%s/head:pr", prNum)).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("fetch PR head: %s", string(out))
+	if strings.HasSuffix(base, "_test.go") ||
+		strings.HasSuffix(base, ".test.ts") || strings.HasSuffix(base, ".test.tsx") ||
+		strings.HasSuffix(base, ".test.js") || strings.HasSuffix(base, ".test.jsx") ||
+		strings.HasSuffix(base, ".spec.ts") || strings.HasSuffix(base, ".spec.tsx") ||
+		strings.Contains(path, "/test/") || strings.Contains(path, "/tests/") ||
+		strings.Contains(path, "/__tests__/") || strings.Contains(path, "/testdata/") {
+		return prioTest
 	}
 
-	diffCmd := exec.Command("git", "-C", tmpDir, "diff", "base..pr")
-	out, err := diffCmd.Output()
+	if base == "go.mod" || base == "package.json" || base == "tsconfig.json" ||
+		strings.HasSuffix(base, ".yaml") || strings.HasSuffix(base, ".yml") ||
+		strings.HasSuffix(base, ".toml") || base == ".gitignore" ||
+		base == "Dockerfile" || base == "Makefile" || base == "Taskfile.yaml" {
+		return prioConfig
+	}
+
+	return prioImpl
+}
+
+type changedFile struct {
+	path     string
+	diff     string
+	priority filePriority
+	size     int
+}
+
+var diffFilePattern = regexp.MustCompile(`(?m)^diff --git a/\S+ b/(\S+)`)
+
+func splitDiffByFile(fullDiff string) map[string]string {
+	result := make(map[string]string)
+	locs := diffFilePattern.FindAllStringSubmatchIndex(fullDiff, -1)
+	for i, loc := range locs {
+		end := len(fullDiff)
+		if i+1 < len(locs) {
+			end = locs[i+1][0]
+		}
+		path := fullDiff[loc[2]:loc[3]]
+		result[path] = fullDiff[loc[0]:end]
+	}
+	return result
+}
+
+func buildSmartDiff(ctx context.Context, gitDir, mergeBase, prRef string) (string, error) {
+	const maxChars = 120_000
+
+	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "diff", mergeBase, prRef)
+	out, err := cmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			return "", fmt.Errorf("git diff: %s", string(exitErr.Stderr))
+			return "", fmt.Errorf("diff: %s", string(exitErr.Stderr))
 		}
-		return "", fmt.Errorf("git diff: %w", err)
+		return "", fmt.Errorf("diff: %w", err)
+	}
+	fullDiff := string(out)
+
+	fileCount := len(diffFilePattern.FindAllString(fullDiff, -1))
+	log.Printf("repo-cache: diff is %d chars, %d file(s)", len(fullDiff), fileCount)
+
+	if len(fullDiff) <= maxChars {
+		return fullDiff, nil
 	}
 
-	diff := string(out)
-	const maxChars = 80_000
-	if len(diff) > maxChars {
-		diff = diff[:maxChars] + "\n\n[diff truncated]"
+	fileDiffs := splitDiffByFile(fullDiff)
+	diffs := make([]changedFile, 0, len(fileDiffs))
+	for path, d := range fileDiffs {
+		diffs = append(diffs, changedFile{
+			path:     path,
+			diff:     d,
+			priority: classifyFile(path),
+			size:     len(d),
+		})
 	}
-	log.Printf("git fallback: got %d char diff for %s#%s", len(diff), repoSlug, prNum)
-	return diff, nil
+
+	sort.Slice(diffs, func(i, j int) bool {
+		if diffs[i].priority != diffs[j].priority {
+			return diffs[i].priority < diffs[j].priority
+		}
+		return diffs[i].size < diffs[j].size
+	})
+
+	var result strings.Builder
+	var omitted []string
+	for _, f := range diffs {
+		if result.Len()+f.size > maxChars {
+			omitted = append(omitted, fmt.Sprintf("%s (%s)", f.path, humanSize(f.size)))
+			continue
+		}
+		result.WriteString(f.diff)
+	}
+
+	if len(omitted) > 0 {
+		fmt.Fprintf(&result, "\n\n[%d file(s) omitted — review separately:\n", len(omitted))
+		for _, o := range omitted {
+			fmt.Fprintf(&result, "  - %s\n", o)
+		}
+		result.WriteString("]")
+	}
+
+	log.Printf("repo-cache: smart diff %d/%d chars, %d file(s) omitted", result.Len(), maxChars, len(omitted))
+	return result.String(), nil
+}
+
+func humanSize(chars int) string {
+	if chars < 1000 {
+		return fmt.Sprintf("%d chars", chars)
+	}
+	return fmt.Sprintf("%.1fk chars", float64(chars)/1000)
+}
+
+// --- Fetch Diff ---
+
+func fetchDiff(ctx context.Context, owner, repo, prNum string) (string, error) {
+	gitDir, err := repoCache.EnsureRepo(ctx, owner, repo)
+	if err != nil {
+		return "", fmt.Errorf("repo cache: %w", err)
+	}
+
+	baseRef, err := getPRBaseRef(ctx, owner, repo, prNum)
+	if err != nil {
+		return "", err
+	}
+
+	if err := repoCache.FetchPR(ctx, gitDir, owner, repo, prNum); err != nil {
+		return "", err
+	}
+
+	prRef := "refs/prs/" + prNum
+	baseRefFull := "refs/heads/" + baseRef
+
+	mergeBase, err := gitMergeBase(ctx, gitDir, baseRefFull, prRef)
+	if err != nil {
+		return "", err
+	}
+
+	return buildSmartDiff(ctx, gitDir, mergeBase, prRef)
+}
+
+func getPRBaseRef(ctx context.Context, owner, repo, prNum string) (string, error) {
+	cmd := exec.CommandContext(ctx, "gh", "pr", "view", prNum,
+		"--repo", fmt.Sprintf("%s/%s", owner, repo),
+		"--json", "baseRefName", "--jq", ".baseRefName")
+	out, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return "", fmt.Errorf("get PR base ref: %w; stderr: %s", err, string(exitErr.Stderr))
+		}
+		return "", fmt.Errorf("get PR base ref: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func gitMergeBase(ctx context.Context, gitDir, ref1, ref2 string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "merge-base", ref1, ref2)
+	out, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return "", fmt.Errorf("merge-base %s %s: %s", ref1, ref2, string(exitErr.Stderr))
+		}
+		return "", fmt.Errorf("merge-base: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 func fetchPRTitle(ctx context.Context, owner, repo, prNum string) string {

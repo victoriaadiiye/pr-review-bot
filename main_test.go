@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -428,5 +429,103 @@ func TestCancelReview_CancelsAllInSameMessage(t *testing.T) {
 	}
 	if !called2 {
 		t.Error("cancel should fire for PR 2 in same message")
+	}
+}
+
+func TestClassifyFile(t *testing.T) {
+	tests := []struct {
+		path string
+		want filePriority
+	}{
+		{"internal/server/handler.go", prioImpl},
+		{"cmd/app/main.go", prioImpl},
+		{"README.md", prioImpl},
+		{"internal/server/handler_test.go", prioTest},
+		{"tests/integration/api_test.go", prioTest},
+		{"src/components/Button.test.tsx", prioTest},
+		{"__tests__/utils.test.js", prioTest},
+		{"pkg/store/testdata/fixture.json", prioTest},
+		{"go.mod", prioConfig},
+		{"package.json", prioConfig},
+		{"Dockerfile", prioConfig},
+		{"deploy/values.yaml", prioConfig},
+		{"Taskfile.yaml", prioConfig},
+		{"vendor/github.com/pkg/errors/errors.go", prioGenerated},
+		{"go.sum", prioGenerated},
+		{"package-lock.json", prioGenerated},
+		{"api/v1/types.pb.go", prioGenerated},
+		{"internal/generated/schema.gen.go", prioGenerated},
+		{"node_modules/react/index.js", prioGenerated},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			got := classifyFile(tt.path)
+			if got != tt.want {
+				t.Errorf("classifyFile(%q) = %d, want %d", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSplitDiffByFile(t *testing.T) {
+	diff := `diff --git a/main.go b/main.go
+index abc..def 100644
+--- a/main.go
++++ b/main.go
+@@ -1,3 +1,4 @@
+ package main
++import "fmt"
+diff --git a/util.go b/util.go
+index 111..222 100644
+--- a/util.go
++++ b/util.go
+@@ -5,2 +5,3 @@
+ func helper() {
++	return
+ }
+`
+	result := splitDiffByFile(diff)
+
+	if len(result) != 2 {
+		t.Fatalf("got %d files, want 2", len(result))
+	}
+	if _, ok := result["main.go"]; !ok {
+		t.Error("missing main.go in split result")
+	}
+	if _, ok := result["util.go"]; !ok {
+		t.Error("missing util.go in split result")
+	}
+	if !strings.Contains(result["main.go"], `import "fmt"`) {
+		t.Error("main.go diff should contain the added import")
+	}
+	if !strings.Contains(result["util.go"], "return") {
+		t.Error("util.go diff should contain the added return")
+	}
+}
+
+func TestSplitDiffByFile_Empty(t *testing.T) {
+	result := splitDiffByFile("")
+	if len(result) != 0 {
+		t.Errorf("empty diff should produce 0 files, got %d", len(result))
+	}
+}
+
+func TestHumanSize(t *testing.T) {
+	tests := []struct {
+		input int
+		want  string
+	}{
+		{500, "500 chars"},
+		{999, "999 chars"},
+		{1000, "1.0k chars"},
+		{1500, "1.5k chars"},
+		{80000, "80.0k chars"},
+	}
+	for _, tt := range tests {
+		got := humanSize(tt.input)
+		if got != tt.want {
+			t.Errorf("humanSize(%d) = %q, want %q", tt.input, got, tt.want)
+		}
 	}
 }
