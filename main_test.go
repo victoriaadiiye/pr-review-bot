@@ -52,6 +52,10 @@ func (m *mockSlack) OpenConversation(params *slack.OpenConversationParameters) (
 	return &slack.Channel{}, false, false, nil
 }
 
+func (m *mockSlack) GetConversationHistory(params *slack.GetConversationHistoryParameters) (*slack.GetConversationHistoryResponse, error) {
+	return &slack.GetConversationHistoryResponse{}, nil
+}
+
 func TestPostError_RemovesEyesAndAddsX(t *testing.T) {
 	mock := &mockSlack{}
 	ev := &slackevents.MessageEvent{

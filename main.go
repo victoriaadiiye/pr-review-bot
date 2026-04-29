@@ -25,6 +25,7 @@ type SlackAPI interface {
 	RemoveReaction(name string, item slack.ItemRef) error
 	PostMessage(channelID string, options ...slack.MsgOption) (string, string, error)
 	OpenConversation(params *slack.OpenConversationParameters) (*slack.Channel, bool, bool, error)
+	GetConversationHistory(params *slack.GetConversationHistoryParameters) (*slack.GetConversationHistoryResponse, error)
 }
 
 type ReviewMode string
@@ -154,6 +155,40 @@ func cancelReview(ts string) bool {
 	return false
 }
 
+func handleReactionReview(api SlackAPI, rev *slackevents.ReactionAddedEvent, channelID, notifyUserID, reviewQuestions string) {
+	resp, err := api.GetConversationHistory(&slack.GetConversationHistoryParameters{
+		ChannelID: channelID,
+		Latest:    rev.Item.Timestamp,
+		Inclusive: true,
+		Limit:     1,
+	})
+	if err != nil || len(resp.Messages) == 0 {
+		log.Printf("failed to fetch message for :claude_it: reaction on %s: %v", rev.Item.Timestamp, err)
+		return
+	}
+	msg := resp.Messages[0]
+
+	matches := ghPRPattern.FindAllStringSubmatch(msg.Text, -1)
+	if len(matches) == 0 {
+		log.Printf("no PR URL found in message %s for :claude_it: reaction", rev.Item.Timestamp)
+		return
+	}
+
+	ev := &slackevents.MessageEvent{
+		Text:      msg.Text,
+		Channel:   channelID,
+		TimeStamp: rev.Item.Timestamp,
+	}
+
+	for _, m := range matches {
+		owner, repo, prNum := m[1], m[2], m[3]
+		prURL := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, prNum)
+		ctx, cancel := context.WithCancel(context.Background())
+		trackReview(ev.TimeStamp, cancel)
+		go handlePR(ctx, api, ev, prURL, owner, repo, prNum, channelID, notifyUserID, reviewQuestions)
+	}
+}
+
 func main() {
 	_ = godotenv.Load()
 
@@ -183,10 +218,16 @@ func main() {
 				if !ok {
 					continue
 				}
-				if rev.Reaction == "no_entry_sign" && rev.Item.Channel == channelID {
+				if rev.Item.Channel != channelID {
+					continue
+				}
+				if rev.Reaction == "no_entry_sign" {
 					if cancelReview(rev.Item.Timestamp) {
 						log.Printf("review cancelled by reaction on %s", rev.Item.Timestamp)
 					}
+				}
+				if rev.Reaction == "claude_it" {
+					go handleReactionReview(api, rev, channelID, notifyUserID, reviewQuestions)
 				}
 
 			case string(slackevents.Message):
