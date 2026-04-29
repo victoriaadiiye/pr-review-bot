@@ -19,6 +19,13 @@ import (
 	"github.com/slack-go/slack/socketmode"
 )
 
+type SlackAPI interface {
+	AddReaction(name string, item slack.ItemRef) error
+	RemoveReaction(name string, item slack.ItemRef) error
+	PostMessage(channelID string, options ...slack.MsgOption) (string, string, error)
+	OpenConversation(params *slack.OpenConversationParameters) (*slack.Channel, bool, bool, error)
+}
+
 type ReviewMode string
 
 const (
@@ -196,7 +203,7 @@ func parseJiraTicket(text string) string {
 	return ""
 }
 
-func handlePR(api *slack.Client, ev *slackevents.MessageEvent, prURL, owner, repo, prNum, channelID, notifyUserID, reviewQuestions string) {
+func handlePR(api SlackAPI, ev *slackevents.MessageEvent, prURL, owner, repo, prNum, channelID, notifyUserID, reviewQuestions string) {
 	mode := parseMode(ev.Text)
 	selfReview := selfPattern.MatchString(ev.Text)
 	jiraTicket := parseJiraTicket(ev.Text)
@@ -213,6 +220,8 @@ func handlePR(api *slack.Client, ev *slackevents.MessageEvent, prURL, owner, rep
 	diff, err := fetchDiff(owner, repo, prNum)
 	if err != nil {
 		if selfReview {
+			_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+			_ = api.AddReaction("x", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 			dmUser(api, notifyUserID, fmt.Sprintf("Failed to review <%s>: %v", prURL, err))
 		} else {
 			postError(api, ev, prURL, channelID, notifyUserID, err)
@@ -278,6 +287,8 @@ func handlePR(api *slack.Client, ev *slackevents.MessageEvent, prURL, owner, rep
 	review, score, stats, err := reviewWithClaude(api, notifyUserID, req)
 	if err != nil {
 		if selfReview {
+			_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+			_ = api.AddReaction("x", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 			dmUser(api, notifyUserID, fmt.Sprintf("Failed to review <%s>: %v", prURL, err))
 		} else {
 			postError(api, ev, prURL, channelID, notifyUserID, err)
@@ -506,7 +517,7 @@ func fetchSpecFromRepo(owner, repo, specPath, prNum string) (string, error) {
 	return content, nil
 }
 
-func reviewWithClaude(api *slack.Client, notifyUserID string, req ReviewRequest) (string, *ScoreResult, *UsageStats, error) {
+func reviewWithClaude(api SlackAPI, notifyUserID string, req ReviewRequest) (string, *ScoreResult, *UsageStats, error) {
 	stats := &UsageStats{}
 
 	var extraContext strings.Builder
@@ -1003,7 +1014,7 @@ func postGitHubComment(owner, repo, prNum, review string) error {
 	return nil
 }
 
-func dmUser(api *slack.Client, userID, msg string) {
+func dmUser(api SlackAPI, userID, msg string) {
 	_, _, _, err := api.OpenConversation(&slack.OpenConversationParameters{Users: []string{userID}})
 	if err != nil {
 		log.Printf("failed to open DM with %s: %v", userID, err)
@@ -1015,8 +1026,10 @@ func dmUser(api *slack.Client, userID, msg string) {
 	}
 }
 
-func postError(api *slack.Client, ev *slackevents.MessageEvent, prURL, channelID, notifyUserID string, reviewErr error) {
+func postError(api SlackAPI, ev *slackevents.MessageEvent, prURL, channelID, notifyUserID string, reviewErr error) {
 	log.Printf("failed to review %s: %v", prURL, reviewErr)
+	_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+	_ = api.AddReaction("x", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 	_, _, _ = api.PostMessage(
 		channelID,
 		slack.MsgOptionText(fmt.Sprintf("Failed to review <%s>: %v", prURL, reviewErr), false),
