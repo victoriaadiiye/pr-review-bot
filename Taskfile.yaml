@@ -28,9 +28,9 @@ tasks:
       - tmux new-session -d -s {{.TMUX_SESSION}} -c {{.ROOT_DIR}} "./{{.BINARY}}"
 
   logs:
-    desc: Tail the bot log
+    desc: Tail live bot output from tmux
     cmds:
-      - tail -f bot.log
+      - tmux pipe-pane -t {{.TMUX_SESSION}} -o 'cat >> {{.ROOT_DIR}}/bot.log' && tail -f {{.ROOT_DIR}}/bot.log
 
   status:
     desc: Show tmux session status
