@@ -314,7 +314,7 @@ func main() {
 	repoCache = NewRepoCache()
 	if token := os.Getenv("CLAUDE_CODE_OAUTH_TOKEN"); token != "" {
 		anthropicClient = anthropic.NewClient(
-			option.WithAPIKey(token),
+			option.WithAuthToken(token),
 			option.WithHeader("anthropic-beta", "oauth-2025-04-20"),
 		)
 		log.Println("using Claude Code OAuth token for API auth")
