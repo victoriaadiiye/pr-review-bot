@@ -15,7 +15,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/joho/godotenv"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
@@ -134,7 +136,8 @@ var (
 	reviewRequestPattern = regexp.MustCompile(`(?i)\breview\b`)
 	ackPattern           = regexp.MustCompile(`(?i)\b(ack(nowledg(ed?|ing))?|won'?t\s*fix|wontfix|intentional|by\s*design|noted|accepted|will\s*(fix|address)\s*later|tracking\s+in|known\s+issue|out\s*of\s*scope|deferred)\b`)
 
-	repoCache *RepoCache
+	repoCache       *RepoCache
+	anthropicClient anthropic.Client
 
 	activeReviews   = make(map[string]context.CancelFunc)
 	activeReviewsMu sync.Mutex
@@ -308,6 +311,7 @@ func handleReactionReview(api SlackAPI, rev *slackevents.ReactionAddedEvent, cha
 func main() {
 	_ = godotenv.Load()
 	repoCache = NewRepoCache()
+	anthropicClient = anthropic.NewClient()
 
 	botToken := mustEnv("SLACK_BOT_TOKEN")
 	appToken := mustEnv("SLACK_APP_TOKEN")
@@ -1159,7 +1163,8 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 		return result, nil, stats, nil
 	}
 
-	perspectives := buildPerspectives(req.PRURL, req.Diff, req.Mode, contextBlock, questionsStr)
+	sharedContext := buildSharedContext(req.PRURL, req.Diff, req.Mode, contextBlock, questionsStr)
+	perspectives := buildPerspectives()
 
 	reviews := make([]string, len(perspectives))
 	var mu sync.Mutex
@@ -1171,7 +1176,7 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 		go func(idx int, name, prompt string) {
 			defer wg.Done()
 			log.Printf("agent %s: starting %s review for %s", name, req.Mode, req.PRURL)
-			text, resp, err := runClaude(ctx, prompt)
+			text, resp, err := runClaudeWithCache(ctx, sharedContext, prompt)
 			if err != nil {
 				mu.Lock()
 				if firstErr == nil {
@@ -1184,7 +1189,7 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 			mu.Lock()
 			reviews[idx] = fmt.Sprintf("## %s Review\n\n%s", strings.ToUpper(name), text)
 			mu.Unlock()
-			log.Printf("agent %s: done for %s ($%.4f)", name, req.PRURL, resp.TotalCostUSD)
+			log.Printf("agent %s: done for %s ($%.4f, cache: %d/%d)", name, req.PRURL, resp.TotalCostUSD, resp.Usage.CacheReadInputTokens, resp.Usage.InputTokens)
 		}(i, p.name, p.prompt)
 	}
 	wg.Wait()
@@ -1236,7 +1241,7 @@ Be concise. Output a validation report.
 	return merged, nil, stats, nil
 }
 
-func buildPerspectives(prURL, diff string, mode ReviewMode, contextBlock, questionsStr string) []perspective {
+func buildSharedContext(prURL, diff string, mode ReviewMode, contextBlock, questionsStr string) string {
 	var modePreamble string
 	switch mode {
 	case ModeReReview:
@@ -1256,29 +1261,31 @@ Do not repeat feedback that has clearly been addressed.
 `
 	}
 
+	return fmt.Sprintf(`%sReview this pull request: %s
+%s
+%s
+
+`+"```diff\n%s\n```", modePreamble, prURL, contextBlock, questionsStr, diff)
+}
+
+func buildPerspectives() []perspective {
 	return []perspective{
 		{
 			name: "correctness",
-			prompt: fmt.Sprintf(`%sYou are a code review agent focused on CORRECTNESS and SECURITY.
-Review this pull request: %s
-%s
+			prompt: `You are a code review agent focused on CORRECTNESS and SECURITY.
+
 Focus on:
 - Bugs, logic errors, edge cases
 - Security vulnerabilities (injection, auth issues, data leaks)
 - Race conditions, error handling gaps
 - API contract violations
 
-Be specific. Reference exact lines. No fluff.
-
-%s
-
-`+"```diff\n%s\n```", modePreamble, prURL, contextBlock, questionsStr, diff),
+Be specific. Reference exact lines. No fluff.`,
 		},
 		{
 			name: "design",
-			prompt: fmt.Sprintf(`%sYou are a code review agent focused on DESIGN and MAINTAINABILITY.
-Review this pull request: %s
-%s
+			prompt: `You are a code review agent focused on DESIGN and MAINTAINABILITY.
+
 Focus on:
 - Architecture and design patterns
 - Code organization, naming, readability
@@ -1286,40 +1293,29 @@ Focus on:
 - Missing tests or test quality
 - Performance implications
 
-Be specific. Reference exact lines. No fluff.
-
-%s
-
-`+"```diff\n%s\n```", modePreamble, prURL, contextBlock, questionsStr, diff),
+Be specific. Reference exact lines. No fluff.`,
 		},
 		{
 			name: "pragmatic",
-			prompt: fmt.Sprintf(`%sYou are a pragmatic senior engineer reviewing this PR.
-Review this pull request: %s
-%s
+			prompt: `You are a pragmatic senior engineer reviewing this PR.
+
 Focus on:
 - Does this actually solve the problem it claims to?
 - What could break in production?
 - What would you want changed before approving?
 - Are there simpler approaches?
 
-Be direct and opinionated. Skip obvious things that are fine.
-
-%s
-
-`+"```diff\n%s\n```", modePreamble, prURL, contextBlock, questionsStr, diff),
+Be direct and opinionated. Skip obvious things that are fine.`,
 		},
 		{
 			name: "go-expert",
-			prompt: fmt.Sprintf(`%sYou are an elite Go code reviewer with deep expertise in Go 1.26, its standard library, and production-grade Go development. You review with the rigor of a senior staff engineer at a top-tier infrastructure company.
+			prompt: `You are an elite Go code reviewer with deep expertise in Go 1.26, its standard library, and production-grade Go development. You review with the rigor of a senior staff engineer at a top-tier infrastructure company.
 
-Review this pull request: %s
-%s
 ## Review Criteria
 
 ### Correctness
 - Logic errors, off-by-one mistakes, race conditions
-- Proper error handling: explicit error returns, no swallowed errors, %%w for wrapping
+- Proper error handling: explicit error returns, no swallowed errors, %w for wrapping
 - No panics outside main()
 - Correct use of concurrency primitives (sync.Mutex, channels, context.Context)
 - context.Context must be the first parameter in non-handler functions
@@ -1368,11 +1364,7 @@ Well-written code worth reinforcing.
 
 For each finding: file and line, what the issue is, why it matters, concrete fix.
 
-Be specific, not vague. Show exactly what and why. Respect existing codebase patterns — don't suggest rewrites outside PR scope.
-
-%s
-
-`+"```diff\n%s\n```", modePreamble, prURL, contextBlock, questionsStr, diff),
+Be specific, not vague. Show exactly what and why. Respect existing codebase patterns — don't suggest rewrites outside PR scope.`,
 		},
 	}
 }
@@ -1589,30 +1581,93 @@ func questionsBlock(questions string) string {
 	return fmt.Sprintf("Also specifically answer these questions:\n%s", questions)
 }
 
-func runClaude(ctx context.Context, prompt string) (string, claudeResponse, error) {
+func getModel() anthropic.Model {
 	model := os.Getenv("CLAUDE_MODEL")
 	if model == "" {
-		model = "claude-opus-4-6"
+		return anthropic.ModelClaudeOpus4_6
 	}
-	cmd := exec.CommandContext(ctx, "claude", "-p", "Follow the instructions provided on stdin.", "--output-format", "json", "--model", model)
-	cmd.Stdin = strings.NewReader(prompt)
-	out, err := cmd.Output()
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return "", claudeResponse{}, fmt.Errorf("claude CLI: %s", string(exitErr.Stderr))
+	return anthropic.Model(model)
+}
+
+func estimateCost(model string, in, out, cacheWrite, cacheRead int64) float64 {
+	var inPerM, outPerM float64
+	switch {
+	case strings.Contains(model, "opus"):
+		inPerM, outPerM = 15.0, 75.0
+	case strings.Contains(model, "sonnet"):
+		inPerM, outPerM = 3.0, 15.0
+	case strings.Contains(model, "haiku"):
+		inPerM, outPerM = 0.80, 4.0
+	default:
+		inPerM, outPerM = 15.0, 75.0
+	}
+	cost := float64(in)/1e6*inPerM + float64(out)/1e6*outPerM
+	cost += float64(cacheWrite) / 1e6 * inPerM * 1.25
+	cost += float64(cacheRead) / 1e6 * inPerM * 0.1
+	return cost
+}
+
+func extractResult(content []anthropic.ContentBlockUnion, usage anthropic.Usage, duration time.Duration) (string, claudeResponse) {
+	var text string
+	for _, block := range content {
+		if block.Type == "text" {
+			text += block.Text
 		}
-		return "", claudeResponse{}, err
 	}
+	model := string(getModel())
+	cr := claudeResponse{
+		Result:        text,
+		TotalCostUSD:  estimateCost(model, usage.InputTokens, usage.OutputTokens, usage.CacheCreationInputTokens, usage.CacheReadInputTokens),
+		DurationMS:    duration.Milliseconds(),
+		DurationAPIMS: duration.Milliseconds(),
+		NumTurns:      1,
+	}
+	cr.Usage.InputTokens = usage.InputTokens
+	cr.Usage.OutputTokens = usage.OutputTokens
+	cr.Usage.CacheCreationInputTokens = usage.CacheCreationInputTokens
+	cr.Usage.CacheReadInputTokens = usage.CacheReadInputTokens
+	return strings.TrimSpace(text), cr
+}
 
-	var resp claudeResponse
-	if err := json.Unmarshal(out, &resp); err != nil {
-		return strings.TrimSpace(string(out)), claudeResponse{}, nil
+func runClaude(ctx context.Context, prompt string) (string, claudeResponse, error) {
+	start := time.Now()
+	msg, err := anthropicClient.Messages.New(ctx, anthropic.MessageNewParams{
+		Model:     getModel(),
+		MaxTokens: 16384,
+		Messages: []anthropic.MessageParam{
+			anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)),
+		},
+	})
+	if err != nil {
+		return "", claudeResponse{}, fmt.Errorf("anthropic API: %w", err)
 	}
-	if resp.IsError {
-		return "", claudeResponse{}, fmt.Errorf("claude returned error: %s", resp.Result)
-	}
+	text, cr := extractResult(msg.Content, msg.Usage, time.Since(start))
+	return text, cr, nil
+}
 
-	return strings.TrimSpace(resp.Result), resp, nil
+func runClaudeWithCache(ctx context.Context, cachedContent, prompt string) (string, claudeResponse, error) {
+	start := time.Now()
+	msg, err := anthropicClient.Messages.New(ctx, anthropic.MessageNewParams{
+		Model:     getModel(),
+		MaxTokens: 16384,
+		Messages: []anthropic.MessageParam{
+			{
+				Role: anthropic.MessageParamRoleUser,
+				Content: []anthropic.ContentBlockParamUnion{
+					{OfText: &anthropic.TextBlockParam{
+						Text:         cachedContent,
+						CacheControl: anthropic.NewCacheControlEphemeralParam(),
+					}},
+					anthropic.NewTextBlock(prompt),
+				},
+			},
+		},
+	})
+	if err != nil {
+		return "", claudeResponse{}, fmt.Errorf("anthropic API: %w", err)
+	}
+	text, cr := extractResult(msg.Content, msg.Usage, time.Since(start))
+	return text, cr, nil
 }
 
 func postGitHubComment(owner, repo, prNum, review string) error {
