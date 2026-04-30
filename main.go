@@ -56,6 +56,7 @@ type ReviewRequest struct {
 
 type claudeResponse struct {
 	Result        string  `json:"result"`
+	SessionID     string  `json:"session_id"`
 	TotalCostUSD  float64 `json:"total_cost_usd"`
 	DurationMS    int64   `json:"duration_ms"`
 	DurationAPIMS int64   `json:"duration_api_ms"`
@@ -134,7 +135,8 @@ var (
 	reviewRequestPattern = regexp.MustCompile(`(?i)\breview\b`)
 	ackPattern           = regexp.MustCompile(`(?i)\b(ack(nowledg(ed?|ing))?|won'?t\s*fix|wontfix|intentional|by\s*design|noted|accepted|will\s*(fix|address)\s*later|tracking\s+in|known\s+issue|out\s*of\s*scope|deferred)\b`)
 
-	repoCache *RepoCache
+	repoCache    *RepoCache
+	sessionStore *SessionStore
 
 	activeReviews   = make(map[string]context.CancelFunc)
 	activeReviewsMu sync.Mutex
@@ -308,6 +310,7 @@ func handleReactionReview(api SlackAPI, rev *slackevents.ReactionAddedEvent, cha
 func main() {
 	_ = godotenv.Load()
 	repoCache = NewRepoCache()
+	sessionStore = NewSessionStore()
 
 	botToken := mustEnv("SLACK_BOT_TOKEN")
 	appToken := mustEnv("SLACK_APP_TOKEN")
@@ -542,11 +545,20 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 		}
 	}
 
-	agentCount := 4
-	if mode == ModeQuick {
-		agentCount = 1
+	if mode == ModeReReview {
+		sessionID := sessionStore.Get(prURL)
+		if sessionID != "" {
+			dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Resuming previous session for re-review...", len(diff)))
+		} else {
+			dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Running delta re-review (no previous session)...", len(diff)))
+		}
+	} else {
+		agentCount := 4
+		if mode == ModeQuick {
+			agentCount = 1
+		}
+		dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Launching %d agent(s) in %s mode...", len(diff), agentCount, mode))
 	}
-	dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Launching %d agent(s) in %s mode...", len(diff), agentCount, mode))
 
 	req := ReviewRequest{
 		Diff:               diff,
@@ -711,6 +723,43 @@ func (c *RepoCache) FileContent(ctx context.Context, gitDir, ref, path string) (
 		return "", err
 	}
 	return string(out), nil
+}
+
+// --- Session Store ---
+
+type SessionStore struct {
+	path string
+	mu   sync.Mutex
+	data map[string]string // PR URL → merger session ID
+}
+
+func NewSessionStore() *SessionStore {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Fatalf("session-store: cannot determine home dir: %v", err)
+	}
+	path := filepath.Join(home, ".pr-review-cache", "sessions.json")
+	s := &SessionStore{path: path, data: make(map[string]string)}
+	if raw, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(raw, &s.data)
+	}
+	log.Printf("session-store: %s (%d sessions)", path, len(s.data))
+	return s
+}
+
+func (s *SessionStore) Get(prURL string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.data[prURL]
+}
+
+func (s *SessionStore) Set(prURL, sessionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.data[prURL] = sessionID
+	raw, _ := json.Marshal(s.data)
+	_ = os.WriteFile(s.path, raw, 0o644)
+	log.Printf("session-store: saved %s → %s", prURL, sessionID)
 }
 
 // --- Smart Diff ---
@@ -1159,6 +1208,41 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 		return result, nil, stats, nil
 	}
 
+	if req.Mode == ModeReReview {
+		if sessionID := sessionStore.Get(req.PRURL); sessionID != "" {
+			result, mergeResp, err := runReReview(ctx, api, notifyUserID, req, sessionID, stats)
+			if err == nil {
+				stats.Add(mergeResp)
+				sessionStore.Set(req.PRURL, mergeResp.SessionID)
+				scoreWg.Wait()
+				if scoreErr == nil {
+					result = formatScoreHeader(score, req.PreviousReviews) + "\n\n---\n\n" + result
+					return result, &score, stats, nil
+				}
+				return result, nil, stats, nil
+			}
+			log.Printf("re-review session resume failed for %s: %v — falling back to delta review", req.PRURL, err)
+			dmUser(api, notifyUserID, fmt.Sprintf("Session resume failed, running delta review for <%s>...", req.PRURL))
+		} else {
+			log.Printf("re-review: no stored session for %s — running delta review", req.PRURL)
+			dmUser(api, notifyUserID, fmt.Sprintf("No previous session found for <%s>, running delta review...", req.PRURL))
+		}
+		result, deltaResp, err := runDeltaReReview(ctx, req, contextBlock, questionsStr)
+		if err != nil {
+			return "", nil, stats, err
+		}
+		stats.Add(deltaResp)
+		if deltaResp.SessionID != "" {
+			sessionStore.Set(req.PRURL, deltaResp.SessionID)
+		}
+		scoreWg.Wait()
+		if scoreErr == nil {
+			result = formatScoreHeader(score, req.PreviousReviews) + "\n\n---\n\n" + result
+			return result, &score, stats, nil
+		}
+		return result, nil, stats, nil
+	}
+
 	perspectives := buildPerspectives(req.PRURL, req.Diff, req.Mode, contextBlock, questionsStr)
 
 	reviews := make([]string, len(perspectives))
@@ -1227,6 +1311,10 @@ Be concise. Output a validation report.
 	stats.Add(mergeResp)
 	log.Printf("merger: done for %s ($%.4f)", req.PRURL, mergeResp.TotalCostUSD)
 
+	if mergeResp.SessionID != "" {
+		sessionStore.Set(req.PRURL, mergeResp.SessionID)
+	}
+
 	scoreWg.Wait()
 	if scoreErr == nil {
 		merged = formatScoreHeader(score, req.PreviousReviews) + "\n\n---\n\n" + merged
@@ -1234,6 +1322,67 @@ Be concise. Output a validation report.
 	}
 
 	return merged, nil, stats, nil
+}
+
+func runReReview(ctx context.Context, api SlackAPI, notifyUserID string, req ReviewRequest, sessionID string, stats *UsageStats) (string, claudeResponse, error) {
+	dmUser(api, notifyUserID, fmt.Sprintf("Resuming previous review session for <%s>...", req.PRURL))
+	log.Printf("re-review: resuming session %s for %s", sessionID, req.PRURL)
+
+	var ackNote string
+	if req.AcknowledgedIssues != "" {
+		ackNote = fmt.Sprintf("\n\n## Acknowledged Issues\nThese were explicitly acknowledged by the author — do NOT re-flag or penalize:\n\n%s", req.AcknowledgedIssues)
+	}
+
+	prompt := fmt.Sprintf(`You previously reviewed this PR and produced a merged review. The author has pushed changes. Here is the updated diff.
+
+Your job:
+1. Compare this diff against the issues you raised in your previous review
+2. For each previous issue: state whether it was RESOLVED, PARTIALLY RESOLVED, or STILL PRESENT
+3. Flag any NEW issues introduced in the updated code
+4. Provide an updated merged review in the same format as before (Summary, Critical Issues, Design Concerns, Suggestions, What's Good, Verdict)
+5. If all critical issues are resolved and no new ones appeared, recommend approval
+%s
+## Updated Diff
+`+"```diff\n%s\n```", ackNote, req.Diff)
+
+	text, resp, err := runClaudeWithSession(ctx, prompt, sessionID)
+	if err != nil {
+		return "", claudeResponse{}, err
+	}
+	log.Printf("re-review: session resume done for %s ($%.4f)", req.PRURL, resp.TotalCostUSD)
+	return text, resp, nil
+}
+
+func runDeltaReReview(ctx context.Context, req ReviewRequest, contextBlock, questionsStr string) (string, claudeResponse, error) {
+	var ackNote string
+	if req.AcknowledgedIssues != "" {
+		ackNote = fmt.Sprintf("\n\n## Acknowledged Issues\nThese were explicitly acknowledged by the author — do NOT re-flag or penalize:\n\n%s", req.AcknowledgedIssues)
+	}
+
+	prompt := fmt.Sprintf(`You are a code review assistant performing a RE-REVIEW. This PR was previously reviewed and the author has pushed updates.
+
+Below you have the previous review discussion and the current diff. Your job:
+1. Identify which issues from previous reviews were RESOLVED, PARTIALLY RESOLVED, or STILL PRESENT
+2. Flag any NEW issues in the current diff
+3. Assess how thoroughly the author addressed feedback — this should positively influence your verdict
+4. If all critical issues are resolved and no new critical issues appeared, recommend approval
+5. Output a full review: Summary, Previous Issues Status, New Issues (if any), Verdict
+
+Be specific about what changed. Reference files and lines.
+%s
+%s
+%s
+
+## Current Diff
+`+"```diff\n%s\n```", contextBlock, ackNote, questionsStr, req.Diff)
+
+	log.Printf("delta-re-review: starting for %s", req.PRURL)
+	text, resp, err := runClaude(ctx, prompt)
+	if err != nil {
+		return "", claudeResponse{}, fmt.Errorf("delta re-review failed: %w", err)
+	}
+	log.Printf("delta-re-review: done for %s ($%.4f)", req.PRURL, resp.TotalCostUSD)
+	return text, resp, nil
 }
 
 func buildPerspectives(prURL, diff string, mode ReviewMode, contextBlock, questionsStr string) []perspective {
@@ -1590,11 +1739,19 @@ func questionsBlock(questions string) string {
 }
 
 func runClaude(ctx context.Context, prompt string) (string, claudeResponse, error) {
+	return runClaudeWithSession(ctx, prompt, "")
+}
+
+func runClaudeWithSession(ctx context.Context, prompt, resumeSessionID string) (string, claudeResponse, error) {
 	model := os.Getenv("CLAUDE_MODEL")
 	if model == "" {
 		model = "claude-opus-4-6"
 	}
-	cmd := exec.CommandContext(ctx, "claude", "-p", "Follow the instructions provided on stdin.", "--output-format", "json", "--model", model)
+	args := []string{"-p", "Follow the instructions provided on stdin.", "--output-format", "json", "--model", model}
+	if resumeSessionID != "" {
+		args = append(args, "--resume", resumeSessionID)
+	}
+	cmd := exec.CommandContext(ctx, "claude", args...)
 	cmd.Stdin = strings.NewReader(prompt)
 	out, err := cmd.Output()
 	if err != nil {
