@@ -313,7 +313,7 @@ func main() {
 	_ = godotenv.Load()
 	repoCache = NewRepoCache()
 	if token := os.Getenv("CLAUDE_CODE_OAUTH_TOKEN"); token != "" {
-		anthropicClient = anthropic.NewClient(option.WithAuthToken(token))
+		anthropicClient = anthropic.NewClient(option.WithAPIKey(token))
 		log.Println("using Claude Code OAuth token for API auth")
 	} else {
 		anthropicClient = anthropic.NewClient()
