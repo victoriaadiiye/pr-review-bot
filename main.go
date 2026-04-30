@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
 	"github.com/joho/godotenv"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
@@ -311,7 +312,13 @@ func handleReactionReview(api SlackAPI, rev *slackevents.ReactionAddedEvent, cha
 func main() {
 	_ = godotenv.Load()
 	repoCache = NewRepoCache()
-	anthropicClient = anthropic.NewClient()
+	if token := os.Getenv("CLAUDE_CODE_OAUTH_TOKEN"); token != "" {
+		anthropicClient = anthropic.NewClient(option.WithAuthToken(token))
+		log.Println("using Claude Code OAuth token for API auth")
+	} else {
+		anthropicClient = anthropic.NewClient()
+		log.Println("using ANTHROPIC_API_KEY for API auth")
+	}
 
 	botToken := mustEnv("SLACK_BOT_TOKEN")
 	appToken := mustEnv("SLACK_APP_TOKEN")
