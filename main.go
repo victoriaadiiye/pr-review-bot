@@ -1333,7 +1333,8 @@ func runReReview(ctx context.Context, api SlackAPI, notifyUserID string, req Rev
 		ackNote = fmt.Sprintf("\n\n## Acknowledged Issues\nThese were explicitly acknowledged by the author — do NOT re-flag or penalize:\n\n%s", req.AcknowledgedIssues)
 	}
 
-	prompt := fmt.Sprintf(`You previously reviewed this PR and produced a merged review. The author has pushed changes. Here is the updated diff.
+	prompt := fmt.Sprintf(`You are continuing your previous code review of this PR: %s
+The author has pushed changes since your last review. Below is the COMPLETE CURRENT DIFF of the PR (not just what changed since last review).
 
 Your job:
 1. Compare this diff against the issues you raised in your previous review
@@ -1341,9 +1342,12 @@ Your job:
 3. Flag any NEW issues introduced in the updated code
 4. Provide an updated merged review in the same format as before (Summary, Critical Issues, Design Concerns, Suggestions, What's Good, Verdict)
 5. If all critical issues are resolved and no new ones appeared, recommend approval
+
+IMPORTANT: Do NOT include a Quality Score section or score table — scoring is handled separately.
+Do NOT add meta-commentary about the diff or your process. Go straight into the review.
 %s
 ## Updated Diff
-`+"```diff\n%s\n```", ackNote, req.Diff)
+`+"```diff\n%s\n```", req.PRURL, ackNote, req.Diff)
 
 	text, resp, err := runClaudeWithSession(ctx, prompt, sessionID)
 	if err != nil {
@@ -1359,14 +1363,16 @@ func runDeltaReReview(ctx context.Context, req ReviewRequest, contextBlock, ques
 		ackNote = fmt.Sprintf("\n\n## Acknowledged Issues\nThese were explicitly acknowledged by the author — do NOT re-flag or penalize:\n\n%s", req.AcknowledgedIssues)
 	}
 
-	prompt := fmt.Sprintf(`You are a code review assistant performing a RE-REVIEW. This PR was previously reviewed and the author has pushed updates.
+	prompt := fmt.Sprintf(`You are a code review assistant performing a RE-REVIEW of %s. This PR was previously reviewed and the author has pushed updates.
 
-Below you have the previous review discussion and the current diff. Your job:
+Below you have the previous review discussion and the COMPLETE CURRENT DIFF. Your job:
 1. Identify which issues from previous reviews were RESOLVED, PARTIALLY RESOLVED, or STILL PRESENT
 2. Flag any NEW issues in the current diff
 3. Assess how thoroughly the author addressed feedback — this should positively influence your verdict
 4. If all critical issues are resolved and no new critical issues appeared, recommend approval
 5. Output a full review: Summary, Previous Issues Status, New Issues (if any), Verdict
+
+IMPORTANT: Do NOT include a Quality Score section or score table — scoring is handled separately.
 
 Be specific about what changed. Reference files and lines.
 %s
@@ -1374,7 +1380,7 @@ Be specific about what changed. Reference files and lines.
 %s
 
 ## Current Diff
-`+"```diff\n%s\n```", contextBlock, ackNote, questionsStr, req.Diff)
+`+"```diff\n%s\n```", req.PRURL, contextBlock, ackNote, questionsStr, req.Diff)
 
 	log.Printf("delta-re-review: starting for %s", req.PRURL)
 	text, resp, err := runClaude(ctx, prompt)
@@ -1537,6 +1543,7 @@ Prioritize:
 3. Obvious design issues
 
 Skip: style nits, minor naming suggestions, test coverage gaps for non-critical paths.
+Do NOT include a Quality Score section or score table — scoring is handled separately.
 
 Output format:
 - **Summary** — one sentence on what this PR does
@@ -1718,7 +1725,8 @@ Rules:
 - Drop anything the validator flagged as incorrect
 - Incorporate answers to reviewer questions from the validation
 - Keep it actionable and specific
-- Reference file names and line numbers where relevant%s%s
+- Reference file names and line numbers where relevant
+- Do NOT include a Quality Score section, score table, or numerical scores — scoring is handled separately%s%s
 %s
 ## Reviews
 %s
