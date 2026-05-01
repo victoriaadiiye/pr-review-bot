@@ -219,7 +219,7 @@ End your response with EXACTLY this JSON block on its own line:
 - confidence: 0-100 how confident you are in your assessment (low if diff is unclear or you lack context)
 - rationale: one sentence summary of why you gave this score`
 
-var perspectiveScorePattern = regexp.MustCompile("```\\s*\\n?\\s*({\\s*\"score\"\\s*:.+?})\\s*\\n?\\s*```")
+var perspectiveScorePattern = regexp.MustCompile("```(?:json)?\\s*\\n?\\s*({\\s*\"score\"\\s*:.+?})\\s*\\n?\\s*```")
 
 func extractPerspectiveScore(agentName, text string) (review string, ps PerspectiveScore) {
 	ps.Agent = agentName

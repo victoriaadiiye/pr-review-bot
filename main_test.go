@@ -1109,6 +1109,13 @@ func TestExtractPerspectiveScore(t *testing.T) {
 			wantScore:  72,
 			wantConf:   60,
 		},
+		{
+			name:       "json fence variant",
+			input:      "Review.\n\n```json\n{\"score\":80,\"confidence\":75,\"rationale\":\"good\"}\n```",
+			wantReview: "Review.",
+			wantScore:  80,
+			wantConf:   75,
+		},
 	}
 
 	for _, tt := range tests {
