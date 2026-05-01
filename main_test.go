@@ -639,3 +639,276 @@ func TestSessionStore_MultiplePRs(t *testing.T) {
 		t.Errorf("nonexistent PR = %q, want empty", got)
 	}
 }
+
+func TestLoadAgents_DiscoversFiles(t *testing.T) {
+	dir := t.TempDir()
+	old := agentsDir
+	agentsDir = dir
+	defer func() { agentsDir = old }()
+
+	os.WriteFile(filepath.Join(dir, "alpha.md"), []byte("Review {{.PRURL}}"), 0o644)
+	os.WriteFile(filepath.Join(dir, "beta.md"), []byte("Check {{.Diff}}"), 0o644)
+	os.WriteFile(filepath.Join(dir, "not-an-agent.txt"), []byte("ignored"), 0o644)
+
+	agents, err := loadAgents()
+	if err != nil {
+		t.Fatalf("loadAgents: %v", err)
+	}
+	if len(agents) != 2 {
+		t.Fatalf("got %d agents, want 2", len(agents))
+	}
+	if agents[0].name != "alpha" {
+		t.Errorf("agents[0].name = %q, want alpha", agents[0].name)
+	}
+	if agents[1].name != "beta" {
+		t.Errorf("agents[1].name = %q, want beta", agents[1].name)
+	}
+}
+
+func TestLoadAgents_EmptyDirErrors(t *testing.T) {
+	dir := t.TempDir()
+	old := agentsDir
+	agentsDir = dir
+	defer func() { agentsDir = old }()
+
+	_, err := loadAgents()
+	if err == nil {
+		t.Fatal("loadAgents should error on empty dir")
+	}
+	if !strings.Contains(err.Error(), "no .md agent files") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestLoadAgents_SkipsSubdirs(t *testing.T) {
+	dir := t.TempDir()
+	old := agentsDir
+	agentsDir = dir
+	defer func() { agentsDir = old }()
+
+	os.Mkdir(filepath.Join(dir, "subdir.md"), 0o755)
+	os.WriteFile(filepath.Join(dir, "real.md"), []byte("{{.PRURL}}"), 0o644)
+
+	agents, err := loadAgents()
+	if err != nil {
+		t.Fatalf("loadAgents: %v", err)
+	}
+	if len(agents) != 1 {
+		t.Fatalf("got %d agents, want 1", len(agents))
+	}
+	if agents[0].name != "real" {
+		t.Errorf("name = %q, want real", agents[0].name)
+	}
+}
+
+func TestRenderAgent(t *testing.T) {
+	dir := t.TempDir()
+	old := agentsDir
+	agentsDir = dir
+	defer func() { agentsDir = old }()
+
+	os.WriteFile(filepath.Join(dir, "test.md"), []byte("Review {{.PRURL}} with mode {{.ModePreamble}}diff:\n{{.Diff}}"), 0o644)
+
+	agents, err := loadAgents()
+	if err != nil {
+		t.Fatalf("loadAgents: %v", err)
+	}
+
+	data := promptData{
+		ModePreamble: "FINAL ",
+		PRURL:        "https://github.com/org/repo/pull/42",
+		Diff:         "+added line",
+	}
+
+	result, err := renderAgent(agents[0], data)
+	if err != nil {
+		t.Fatalf("renderAgent: %v", err)
+	}
+	if !strings.Contains(result, "https://github.com/org/repo/pull/42") {
+		t.Error("rendered prompt should contain PR URL")
+	}
+	if !strings.Contains(result, "FINAL ") {
+		t.Error("rendered prompt should contain mode preamble")
+	}
+	if !strings.Contains(result, "+added line") {
+		t.Error("rendered prompt should contain diff")
+	}
+}
+
+func TestLoadAgents_InvalidTemplate(t *testing.T) {
+	dir := t.TempDir()
+	old := agentsDir
+	agentsDir = dir
+	defer func() { agentsDir = old }()
+
+	os.WriteFile(filepath.Join(dir, "bad.md"), []byte("{{.Unclosed"), 0o644)
+
+	_, err := loadAgents()
+	if err == nil {
+		t.Fatal("loadAgents should error on invalid template")
+	}
+	if !strings.Contains(err.Error(), "parse agent template") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestModePreamble(t *testing.T) {
+	if modePreamble(ModeInitial) != "" {
+		t.Error("initial mode should have empty preamble")
+	}
+	if modePreamble(ModeQuick) != "" {
+		t.Error("quick mode should have empty preamble")
+	}
+	if !strings.Contains(modePreamble(ModeReReview), "RE-REVIEW") {
+		t.Error("re-review preamble should contain RE-REVIEW")
+	}
+	if !strings.Contains(modePreamble(ModeFinal), "FINAL REVIEW") {
+		t.Error("final preamble should contain FINAL REVIEW")
+	}
+}
+
+func TestLoadAgents_SortedAlphabetically(t *testing.T) {
+	dir := t.TempDir()
+	old := agentsDir
+	agentsDir = dir
+	defer func() { agentsDir = old }()
+
+	os.WriteFile(filepath.Join(dir, "zebra.md"), []byte("{{.PRURL}}"), 0o644)
+	os.WriteFile(filepath.Join(dir, "alpha.md"), []byte("{{.PRURL}}"), 0o644)
+	os.WriteFile(filepath.Join(dir, "middle.md"), []byte("{{.PRURL}}"), 0o644)
+
+	agents, err := loadAgents()
+	if err != nil {
+		t.Fatalf("loadAgents: %v", err)
+	}
+	if agents[0].name != "alpha" || agents[1].name != "middle" || agents[2].name != "zebra" {
+		t.Errorf("agents not sorted: %s, %s, %s", agents[0].name, agents[1].name, agents[2].name)
+	}
+}
+
+func TestLoadAgents_RealAgentsDir(t *testing.T) {
+	old := agentsDir
+	agentsDir = "agents"
+	defer func() { agentsDir = old }()
+
+	agents, err := loadAgents()
+	if err != nil {
+		t.Fatalf("loadAgents on real agents/ dir: %v", err)
+	}
+	if len(agents) < 1 {
+		t.Fatal("expected at least 1 agent in agents/ dir")
+	}
+
+	wantNames := map[string]bool{
+		"correctness": false,
+		"design":      false,
+		"go-expert":   false,
+		"pragmatic":   false,
+	}
+	for _, a := range agents {
+		if _, ok := wantNames[a.name]; ok {
+			wantNames[a.name] = true
+		}
+	}
+	for name, found := range wantNames {
+		if !found {
+			t.Errorf("expected agent %q not found in agents/ dir", name)
+		}
+	}
+
+	data := promptData{
+		ModePreamble: "TEST ",
+		PRURL:        "https://github.com/org/repo/pull/1",
+		ContextBlock: "context here",
+		QuestionsStr: "questions here",
+		Diff:         "+added\n-removed",
+	}
+	for _, a := range agents {
+		rendered, err := renderAgent(a, data)
+		if err != nil {
+			t.Errorf("renderAgent(%s): %v", a.name, err)
+			continue
+		}
+		if !strings.Contains(rendered, data.PRURL) {
+			t.Errorf("agent %s: rendered output missing PRURL", a.name)
+		}
+		if !strings.Contains(rendered, data.Diff) {
+			t.Errorf("agent %s: rendered output missing Diff", a.name)
+		}
+		if strings.Contains(rendered, "{{") {
+			t.Errorf("agent %s: unrendered template syntax in output", a.name)
+		}
+	}
+}
+
+func TestRenderAgent_AllFields(t *testing.T) {
+	dir := t.TempDir()
+	old := agentsDir
+	agentsDir = dir
+	defer func() { agentsDir = old }()
+
+	tmplContent := "P={{.ModePreamble}} U={{.PRURL}} C={{.ContextBlock}} Q={{.QuestionsStr}} D={{.Diff}}"
+	os.WriteFile(filepath.Join(dir, "full.md"), []byte(tmplContent), 0o644)
+
+	agents, err := loadAgents()
+	if err != nil {
+		t.Fatalf("loadAgents: %v", err)
+	}
+
+	data := promptData{
+		ModePreamble: "MODE",
+		PRURL:        "URL",
+		ContextBlock: "CTX",
+		QuestionsStr: "QST",
+		Diff:         "DIF",
+	}
+	result, err := renderAgent(agents[0], data)
+	if err != nil {
+		t.Fatalf("renderAgent: %v", err)
+	}
+	want := "P=MODE U=URL C=CTX Q=QST D=DIF"
+	if result != want {
+		t.Errorf("got %q, want %q", result, want)
+	}
+}
+
+func TestRenderAgent_EmptyFields(t *testing.T) {
+	dir := t.TempDir()
+	old := agentsDir
+	agentsDir = dir
+	defer func() { agentsDir = old }()
+
+	os.WriteFile(filepath.Join(dir, "empty.md"), []byte("start{{.ModePreamble}}{{.QuestionsStr}}end"), 0o644)
+
+	agents, err := loadAgents()
+	if err != nil {
+		t.Fatalf("loadAgents: %v", err)
+	}
+
+	result, err := renderAgent(agents[0], promptData{})
+	if err != nil {
+		t.Fatalf("renderAgent: %v", err)
+	}
+	if result != "startend" {
+		t.Errorf("got %q, want %q", result, "startend")
+	}
+}
+
+func TestAgentNames(t *testing.T) {
+	agents := []agentFile{
+		{name: "alpha"},
+		{name: "beta"},
+		{name: "gamma"},
+	}
+	got := agentNames(agents)
+	if got != "alpha, beta, gamma" {
+		t.Errorf("agentNames = %q, want %q", got, "alpha, beta, gamma")
+	}
+}
+
+func TestAgentNames_Empty(t *testing.T) {
+	got := agentNames(nil)
+	if got != "" {
+		t.Errorf("agentNames(nil) = %q, want empty", got)
+	}
+}

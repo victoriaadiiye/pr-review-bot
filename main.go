@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"text/template"
 
 	"github.com/joho/godotenv"
 	"github.com/slack-go/slack"
@@ -107,9 +108,67 @@ func formatTokens(n int64) string {
 	return fmt.Sprintf("%.1fk", float64(n)/1000)
 }
 
-type perspective struct {
-	name   string
-	prompt string
+type agentFile struct {
+	name     string
+	template *template.Template
+}
+
+type promptData struct {
+	ModePreamble string
+	PRURL        string
+	ContextBlock string
+	QuestionsStr string
+	Diff         string
+}
+
+var agentsDir = "agents"
+
+func loadAgents() ([]agentFile, error) {
+	entries, err := os.ReadDir(agentsDir)
+	if err != nil {
+		return nil, fmt.Errorf("read agents dir %s: %w", agentsDir, err)
+	}
+	var agents []agentFile
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		path := filepath.Join(agentsDir, e.Name())
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read agent file %s: %w", path, err)
+		}
+		name := strings.TrimSuffix(e.Name(), ".md")
+		tmpl, err := template.New(name).Parse(string(raw))
+		if err != nil {
+			return nil, fmt.Errorf("parse agent template %s: %w", path, err)
+		}
+		agents = append(agents, agentFile{name: name, template: tmpl})
+	}
+	if len(agents) == 0 {
+		return nil, fmt.Errorf("no .md agent files found in %s", agentsDir)
+	}
+	sort.Slice(agents, func(i, j int) bool {
+		return agents[i].name < agents[j].name
+	})
+	log.Printf("loaded %d agent(s) from %s: %s", len(agents), agentsDir, agentNames(agents))
+	return agents, nil
+}
+
+func agentNames(agents []agentFile) string {
+	names := make([]string, len(agents))
+	for i, a := range agents {
+		names[i] = a.name
+	}
+	return strings.Join(names, ", ")
+}
+
+func renderAgent(a agentFile, data promptData) (string, error) {
+	var buf strings.Builder
+	if err := a.template.Execute(&buf, data); err != nil {
+		return "", fmt.Errorf("render agent %s: %w", a.name, err)
+	}
+	return buf.String(), nil
 }
 
 type ScoreResult struct {
@@ -553,11 +612,16 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 			dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Running delta re-review (no previous session)...", len(diff)))
 		}
 	} else {
-		agentCount := 4
 		if mode == ModeQuick {
-			agentCount = 1
+			dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Launching 1 agent in %s mode...", len(diff), mode))
+		} else {
+			agents, agentErr := loadAgents()
+			agentCount := 0
+			if agentErr == nil {
+				agentCount = len(agents)
+			}
+			dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Launching %d agent(s) in %s mode...", len(diff), agentCount, mode))
 		}
-		dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Launching %d agent(s) in %s mode...", len(diff), agentCount, mode))
 	}
 
 	req := ReviewRequest{
@@ -1243,33 +1307,53 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 		return result, nil, stats, nil
 	}
 
-	perspectives := buildPerspectives(req.PRURL, req.Diff, req.Mode, contextBlock, questionsStr)
+	agents, err := loadAgents()
+	if err != nil {
+		return "", nil, stats, fmt.Errorf("load agents: %w", err)
+	}
 
-	reviews := make([]string, len(perspectives))
+	data := promptData{
+		ModePreamble: modePreamble(req.Mode),
+		PRURL:        req.PRURL,
+		ContextBlock: contextBlock,
+		QuestionsStr: questionsStr,
+		Diff:         req.Diff,
+	}
+
+	reviews := make([]string, len(agents))
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	var firstErr error
 
-	for i, p := range perspectives {
+	for i, a := range agents {
 		wg.Add(1)
-		go func(idx int, name, prompt string) {
+		go func(idx int, agent agentFile) {
 			defer wg.Done()
-			log.Printf("agent %s: starting %s review for %s", name, req.Mode, req.PRURL)
+			prompt, renderErr := renderAgent(agent, data)
+			if renderErr != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = renderErr
+				}
+				mu.Unlock()
+				return
+			}
+			log.Printf("agent %s: starting %s review for %s", agent.name, req.Mode, req.PRURL)
 			text, resp, err := runClaude(ctx, prompt)
 			if err != nil {
 				mu.Lock()
 				if firstErr == nil {
-					firstErr = fmt.Errorf("agent %s failed: %w", name, err)
+					firstErr = fmt.Errorf("agent %s failed: %w", agent.name, err)
 				}
 				mu.Unlock()
 				return
 			}
 			stats.Add(resp)
 			mu.Lock()
-			reviews[idx] = fmt.Sprintf("## %s Review\n\n%s", strings.ToUpper(name), text)
+			reviews[idx] = fmt.Sprintf("## %s Review\n\n%s", strings.ToUpper(agent.name), text)
 			mu.Unlock()
-			log.Printf("agent %s: done for %s ($%.4f)", name, req.PRURL, resp.TotalCostUSD)
-		}(i, p.name, p.prompt)
+			log.Printf("agent %s: done for %s ($%.4f)", agent.name, req.PRURL, resp.TotalCostUSD)
+		}(i, a)
 	}
 	wg.Wait()
 
@@ -1277,7 +1361,7 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 		return "", nil, stats, firstErr
 	}
 
-	dmUser(api, notifyUserID, fmt.Sprintf("All %d agents done. Running validator...", len(perspectives)))
+	dmUser(api, notifyUserID, fmt.Sprintf("All %d agents done. Running validator...", len(agents)))
 	allReviews := strings.Join(reviews, "\n\n---\n\n")
 
 	log.Printf("validator: starting for %s", req.PRURL)
@@ -1295,7 +1379,7 @@ Be concise. Output a validation report.
 `+"```diff\n%s\n```"+`
 
 ## Reviews to Validate
-%s`, len(perspectives), req.Diff, allReviews))
+%s`, len(agents), req.Diff, allReviews))
 	if err != nil {
 		return "", nil, stats, fmt.Errorf("validator failed: %w", err)
 	}
@@ -1391,11 +1475,10 @@ Be specific about what changed. Reference files and lines.
 	return text, resp, nil
 }
 
-func buildPerspectives(prURL, diff string, mode ReviewMode, contextBlock, questionsStr string) []perspective {
-	var modePreamble string
+func modePreamble(mode ReviewMode) string {
 	switch mode {
 	case ModeReReview:
-		modePreamble = `NOTE: This is a RE-REVIEW. This PR has been reviewed before by an automated system. Focus on:
+		return `NOTE: This is a RE-REVIEW. This PR has been reviewed before by an automated system. Focus on:
 - Whether previously identified issues have been addressed
 - Any new issues introduced since the last review
 - Remaining concerns that still need attention
@@ -1403,132 +1486,14 @@ Do not repeat feedback that has clearly been addressed.
 
 `
 	case ModeFinal:
-		modePreamble = `NOTE: This is a FINAL REVIEW before merge. Err on the side of approval:
+		return `NOTE: This is a FINAL REVIEW before merge. Err on the side of approval:
 - Only flag truly critical/blocking issues (bugs, security, data loss)
 - Mention nice-to-haves and nit picks as OPTIONAL/non-blocking
 - If the code is generally sound and functional, recommend approval
 
 `
-	}
-
-	return []perspective{
-		{
-			name: "correctness",
-			prompt: fmt.Sprintf(`%sYou are a code review agent focused on CORRECTNESS and SECURITY.
-Review this pull request: %s
-%s
-Focus on:
-- Bugs, logic errors, edge cases
-- Security vulnerabilities (injection, auth issues, data leaks)
-- Race conditions, error handling gaps
-- API contract violations
-
-Be specific. Reference exact lines. No fluff.
-
-%s
-
-`+"```diff\n%s\n```", modePreamble, prURL, contextBlock, questionsStr, diff),
-		},
-		{
-			name: "design",
-			prompt: fmt.Sprintf(`%sYou are a code review agent focused on DESIGN and MAINTAINABILITY.
-Review this pull request: %s
-%s
-Focus on:
-- Architecture and design patterns
-- Code organization, naming, readability
-- Unnecessary complexity or premature abstraction
-- Missing tests or test quality
-- Performance implications
-
-Be specific. Reference exact lines. No fluff.
-
-%s
-
-`+"```diff\n%s\n```", modePreamble, prURL, contextBlock, questionsStr, diff),
-		},
-		{
-			name: "pragmatic",
-			prompt: fmt.Sprintf(`%sYou are a pragmatic senior engineer reviewing this PR.
-Review this pull request: %s
-%s
-Focus on:
-- Does this actually solve the problem it claims to?
-- What could break in production?
-- What would you want changed before approving?
-- Are there simpler approaches?
-
-Be direct and opinionated. Skip obvious things that are fine.
-
-%s
-
-`+"```diff\n%s\n```", modePreamble, prURL, contextBlock, questionsStr, diff),
-		},
-		{
-			name: "go-expert",
-			prompt: fmt.Sprintf(`%sYou are an elite Go code reviewer with deep expertise in Go 1.26, its standard library, and production-grade Go development. You review with the rigor of a senior staff engineer at a top-tier infrastructure company.
-
-Review this pull request: %s
-%s
-## Review Criteria
-
-### Correctness
-- Logic errors, off-by-one mistakes, race conditions
-- Proper error handling: explicit error returns, no swallowed errors, %%w for wrapping
-- No panics outside main()
-- Correct use of concurrency primitives (sync.Mutex, channels, context.Context)
-- context.Context must be the first parameter in non-handler functions
-
-### Go 1.26 Best Practices
-- Use Go 1.26 features: enhanced http.ServeMux with {param} path values, range-over-func iterators
-- Prefer standard library over third-party dependencies
-- Use slog for structured logging
-- Idiomatic Go: receiver names, interface naming (-er suffix), zero-value usefulness
-
-### Style & Formatting
-- gofumpt formatting compliance
-- Exported types and functions must have doc comments
-- Functions should be ≤ ~50 lines; flag functions that are too long
-- No variable shadowing (especially err — use named variants like parseErr, decodeErr)
-- //nolint:lintname // reason format (double-slash before reason)
-
-### Testing (TDD Compliance)
-- Tests exist for new functionality
-- Tests are meaningful, not just happy paths
-- Table-driven tests where appropriate
-- httptest for HTTP handler testing
-- No test pollution (parallel tests, proper cleanup)
-
-### Project-Specific Patterns
-- Module: github.com/Qumulo/qompass
-- Structure: cmd/qompass/, internal/ packages, tests/integration/
-- ClickHouse: clickhouse-go v2 is the only allowed external runtime dependency
-- LowCardinality for <10K unique values, no Nullable columns in ClickHouse schemas
-- *json.RawMessage null gotcha: marshaling null gives nil pointer
-- gzip bodies <10 bytes trigger io.ErrUnexpectedEOF
-
-## Output Format
-
-### Critical Issues 🔴
-Must-fix: bugs, security, data loss, race conditions.
-
-### Suggestions 🟡
-Important improvements: error handling, edge cases, performance.
-
-### Nits 🟢
-Minor style, naming, documentation.
-
-### What Looks Good ✅
-Well-written code worth reinforcing.
-
-For each finding: file and line, what the issue is, why it matters, concrete fix.
-
-Be specific, not vague. Show exactly what and why. Respect existing codebase patterns — don't suggest rewrites outside PR scope.
-
-%s
-
-`+"```diff\n%s\n```", modePreamble, prURL, contextBlock, questionsStr, diff),
-		},
+	default:
+		return ""
 	}
 }
 
