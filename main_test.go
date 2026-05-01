@@ -912,3 +912,170 @@ func TestAgentNames_Empty(t *testing.T) {
 		t.Errorf("agentNames(nil) = %q, want empty", got)
 	}
 }
+
+func TestParseFlags(t *testing.T) {
+	tests := []struct {
+		input string
+		want  map[string]bool
+	}{
+		{"review https://github.com/org/repo/pull/1 --bare-necessities", map[string]bool{"bare-necessities": true}},
+		{"review https://github.com/org/repo/pull/1 --bare-necessities --deep-dive", map[string]bool{"bare-necessities": true, "deep-dive": true}},
+		{"review https://github.com/org/repo/pull/1", map[string]bool{}},
+		{"review https://github.com/org/repo/pull/1 --quick", map[string]bool{}},
+		{"review https://github.com/org/repo/pull/1 --self --quick --bare-necessities", map[string]bool{"bare-necessities": true}},
+		{"review --initial --spec docs/SPEC.md --bare-necessities", map[string]bool{"bare-necessities": true}},
+		{"review --re-review --final", map[string]bool{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := parseFlags(tt.input)
+			if len(got) != len(tt.want) {
+				t.Fatalf("parseFlags(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+			for k := range tt.want {
+				if !got[k] {
+					t.Errorf("parseFlags(%q) missing flag %q", tt.input, k)
+				}
+			}
+		})
+	}
+}
+
+func TestFilterAgents(t *testing.T) {
+	agents := []agentFile{
+		{name: "correctness"},
+		{name: "design"},
+		{name: "necessity", flag: "bare-necessities"},
+		{name: "deep", flag: "deep-dive"},
+	}
+
+	t.Run("no flags — only unflagged agents", func(t *testing.T) {
+		got := filterAgents(agents, map[string]bool{})
+		if len(got) != 2 {
+			t.Fatalf("got %d agents, want 2", len(got))
+		}
+		if got[0].name != "correctness" || got[1].name != "design" {
+			t.Errorf("got %s, %s — want correctness, design", got[0].name, got[1].name)
+		}
+	})
+
+	t.Run("bare-necessities flag — includes necessity", func(t *testing.T) {
+		got := filterAgents(agents, map[string]bool{"bare-necessities": true})
+		if len(got) != 3 {
+			t.Fatalf("got %d agents, want 3", len(got))
+		}
+		names := agentNames(got)
+		if !strings.Contains(names, "necessity") {
+			t.Errorf("expected necessity in %s", names)
+		}
+		if strings.Contains(names, "deep") {
+			t.Errorf("deep should not be included: %s", names)
+		}
+	})
+
+	t.Run("both flags — all agents", func(t *testing.T) {
+		got := filterAgents(agents, map[string]bool{"bare-necessities": true, "deep-dive": true})
+		if len(got) != 4 {
+			t.Fatalf("got %d agents, want 4", len(got))
+		}
+	})
+
+	t.Run("nil flags — only unflagged", func(t *testing.T) {
+		got := filterAgents(agents, nil)
+		if len(got) != 2 {
+			t.Fatalf("got %d agents, want 2", len(got))
+		}
+	})
+}
+
+func TestLoadAgents_ParsesFrontmatter(t *testing.T) {
+	dir := t.TempDir()
+	old := agentsDir
+	agentsDir = dir
+	defer func() { agentsDir = old }()
+
+	os.WriteFile(filepath.Join(dir, "gated.md"), []byte("---\nflag: my-flag\n---\nReview {{.PRURL}}"), 0o644)
+	os.WriteFile(filepath.Join(dir, "normal.md"), []byte("Review {{.PRURL}}"), 0o644)
+
+	agents, err := loadAgents()
+	if err != nil {
+		t.Fatalf("loadAgents: %v", err)
+	}
+	if len(agents) != 2 {
+		t.Fatalf("got %d agents, want 2", len(agents))
+	}
+
+	var gated, normal agentFile
+	for _, a := range agents {
+		if a.name == "gated" {
+			gated = a
+		}
+		if a.name == "normal" {
+			normal = a
+		}
+	}
+
+	if gated.flag != "my-flag" {
+		t.Errorf("gated.flag = %q, want %q", gated.flag, "my-flag")
+	}
+	if normal.flag != "" {
+		t.Errorf("normal.flag = %q, want empty", normal.flag)
+	}
+
+	result, err := renderAgent(gated, promptData{PRURL: "http://test"})
+	if err != nil {
+		t.Fatalf("renderAgent: %v", err)
+	}
+	if strings.Contains(result, "---") {
+		t.Error("frontmatter should be stripped from rendered output")
+	}
+	if !strings.Contains(result, "http://test") {
+		t.Error("rendered output should contain PRURL")
+	}
+}
+
+func TestLoadAgents_RealNecessityAgent(t *testing.T) {
+	old := agentsDir
+	agentsDir = "agents"
+	defer func() { agentsDir = old }()
+
+	agents, err := loadAgents()
+	if err != nil {
+		t.Fatalf("loadAgents: %v", err)
+	}
+
+	var necessity agentFile
+	found := false
+	for _, a := range agents {
+		if a.name == "necessity" {
+			necessity = a
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("necessity agent not found")
+	}
+	if necessity.flag != "bare-necessities" {
+		t.Errorf("necessity.flag = %q, want %q", necessity.flag, "bare-necessities")
+	}
+
+	withFlag := filterAgents(agents, map[string]bool{"bare-necessities": true})
+	withoutFlag := filterAgents(agents, map[string]bool{})
+
+	hasNecessity := func(list []agentFile) bool {
+		for _, a := range list {
+			if a.name == "necessity" {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !hasNecessity(withFlag) {
+		t.Error("necessity should be included with --bare-necessities flag")
+	}
+	if hasNecessity(withoutFlag) {
+		t.Error("necessity should be excluded without --bare-necessities flag")
+	}
+}

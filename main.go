@@ -53,6 +53,7 @@ type ReviewRequest struct {
 	AcknowledgedIssues string
 	SpecContent        string
 	SpecPath           string
+	Flags              map[string]bool
 }
 
 type claudeResponse struct {
@@ -110,6 +111,7 @@ func formatTokens(n int64) string {
 
 type agentFile struct {
 	name     string
+	flag     string
 	template *template.Template
 }
 
@@ -139,11 +141,24 @@ func loadAgents() ([]agentFile, error) {
 			return nil, fmt.Errorf("read agent file %s: %w", path, err)
 		}
 		name := strings.TrimSuffix(e.Name(), ".md")
-		tmpl, err := template.New(name).Parse(string(raw))
+		content := string(raw)
+		var flag string
+		if strings.HasPrefix(content, "---\n") {
+			if end := strings.Index(content[4:], "\n---\n"); end >= 0 {
+				frontmatter := content[4 : 4+end]
+				content = content[4+end+5:]
+				for _, line := range strings.Split(frontmatter, "\n") {
+					if strings.HasPrefix(line, "flag:") {
+						flag = strings.TrimSpace(strings.TrimPrefix(line, "flag:"))
+					}
+				}
+			}
+		}
+		tmpl, err := template.New(name).Parse(content)
 		if err != nil {
 			return nil, fmt.Errorf("parse agent template %s: %w", path, err)
 		}
-		agents = append(agents, agentFile{name: name, template: tmpl})
+		agents = append(agents, agentFile{name: name, flag: flag, template: tmpl})
 	}
 	if len(agents) == 0 {
 		return nil, fmt.Errorf("no .md agent files found in %s", agentsDir)
@@ -189,6 +204,7 @@ var (
 	modePattern          = regexp.MustCompile(`--(initial|re-review|quick|final)\b`)
 	selfPattern          = regexp.MustCompile(`--self\b`)
 	specPattern          = regexp.MustCompile(`--spec\s+(\S+)`)
+	flagPattern          = regexp.MustCompile(`--([a-z][-a-z0-9]*)\b`)
 	previousScorePattern = regexp.MustCompile(`\*\*Quality Score: (\d+)/100\*\*`)
 	previousSpecPattern  = regexp.MustCompile(`<!-- spec: (\S+) -->`)
 	reviewRequestPattern = regexp.MustCompile(`(?i)\breview\b`)
@@ -521,6 +537,30 @@ func parseSpecPath(text string) string {
 	return ""
 }
 
+func parseFlags(text string) map[string]bool {
+	reserved := map[string]bool{
+		"initial": true, "re-review": true, "quick": true, "final": true,
+		"self": true, "spec": true,
+	}
+	flags := make(map[string]bool)
+	for _, m := range flagPattern.FindAllStringSubmatch(text, -1) {
+		if !reserved[m[1]] {
+			flags[m[1]] = true
+		}
+	}
+	return flags
+}
+
+func filterAgents(agents []agentFile, flags map[string]bool) []agentFile {
+	var filtered []agentFile
+	for _, a := range agents {
+		if a.flag == "" || flags[a.flag] {
+			filtered = append(filtered, a)
+		}
+	}
+	return filtered
+}
+
 func parseJiraTicket(text string) string {
 	cleaned := ghPRPattern.ReplaceAllString(text, "")
 	cleaned = modePattern.ReplaceAllString(cleaned, "")
@@ -538,6 +578,7 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 	mode := parseMode(ev.Text)
 	selfReview := selfPattern.MatchString(ev.Text)
 	jiraTicket := parseJiraTicket(ev.Text)
+	flags := parseFlags(ev.Text)
 
 	_ = api.AddReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 
@@ -618,7 +659,7 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 			agents, agentErr := loadAgents()
 			agentCount := 0
 			if agentErr == nil {
-				agentCount = len(agents)
+				agentCount = len(filterAgents(agents, flags))
 			}
 			dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Launching %d agent(s) in %s mode...", len(diff), agentCount, mode))
 		}
@@ -636,6 +677,7 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 		AcknowledgedIssues: acknowledgedIssues,
 		SpecContent:        specContent,
 		SpecPath:           specPath,
+		Flags:              flags,
 	}
 
 	if ctx.Err() != nil {
@@ -1307,10 +1349,11 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 		return result, nil, stats, nil
 	}
 
-	agents, err := loadAgents()
+	allAgents, err := loadAgents()
 	if err != nil {
 		return "", nil, stats, fmt.Errorf("load agents: %w", err)
 	}
+	agents := filterAgents(allAgents, req.Flags)
 
 	data := promptData{
 		ModePreamble: modePreamble(req.Mode),
