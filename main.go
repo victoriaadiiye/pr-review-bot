@@ -198,6 +198,45 @@ type ScoreResult struct {
 	Summary             string `json:"summary"`
 }
 
+type PerspectiveScore struct {
+	Agent      string `json:"agent"`
+	Score      int    `json:"score"`
+	Confidence int    `json:"confidence"`
+	Rationale  string `json:"rationale"`
+}
+
+const scoreSuffix = `
+
+## Perspective Score
+
+After your review, rate this PR's overall quality FROM YOUR PERSPECTIVE on a scale of 0-100 (100 = flawless, 0 = critically broken).
+
+End your response with EXACTLY this JSON block on its own line:
+` + "```" + `
+{"score":N,"confidence":N,"rationale":"one sentence explaining your score"}
+` + "```" + `
+- score: 0-100 overall quality from your review perspective
+- confidence: 0-100 how confident you are in your assessment (low if diff is unclear or you lack context)
+- rationale: one sentence summary of why you gave this score`
+
+var perspectiveScorePattern = regexp.MustCompile("```\\s*\\n?\\s*({\\s*\"score\"\\s*:.+?})\\s*\\n?\\s*```")
+
+func extractPerspectiveScore(agentName, text string) (review string, ps PerspectiveScore) {
+	ps.Agent = agentName
+	loc := perspectiveScorePattern.FindStringSubmatchIndex(text)
+	if loc == nil {
+		return text, ps
+	}
+	jsonStr := text[loc[2]:loc[3]]
+	review = strings.TrimSpace(text[:loc[0]])
+	if err := json.Unmarshal([]byte(jsonStr), &ps); err != nil {
+		log.Printf("agent %s: failed to parse perspective score: %v", agentName, err)
+		return text, PerspectiveScore{Agent: agentName}
+	}
+	ps.Agent = agentName
+	return review, ps
+}
+
 var (
 	ghPRPattern          = regexp.MustCompile(`<?https://github\.com/([^/>\s]+)/([^/>\s]+)/pull/(\d+)[^>\s]*>?`)
 	jiraTicketPattern    = regexp.MustCompile(`\b[A-Z]{2,}-\d+\b`)
@@ -1284,33 +1323,18 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 	contextBlock := extraContext.String()
 	questionsStr := questionsBlock(req.Questions)
 
-	var score ScoreResult
-	var scoreErr error
-	var scoreWg sync.WaitGroup
-	scoreWg.Add(1)
-	go func() {
-		defer scoreWg.Done()
-		log.Printf("scorer: starting for %s", req.PRURL)
-		var resp claudeResponse
-		score, resp, scoreErr = runScorer(ctx, req.Diff, req.SpecContent, req.AcknowledgedIssues)
-		if scoreErr != nil {
-			log.Printf("scorer: failed for %s: %v", req.PRURL, scoreErr)
-		} else {
-			stats.Add(resp)
-			log.Printf("scorer: done for %s (score: %d/100, $%.4f)", req.PRURL, score.Overall, resp.TotalCostUSD)
-		}
-	}()
-
 	if req.Mode == ModeQuick {
 		result, err := runQuickReview(ctx, req.PRURL, req.Diff, contextBlock, questionsStr, stats)
 		if err != nil {
 			return "", nil, stats, err
 		}
-		scoreWg.Wait()
+		score, scoreResp, scoreErr := runScorer(ctx, nil, req.Diff, req.SpecContent, req.AcknowledgedIssues)
 		if scoreErr == nil {
+			stats.Add(scoreResp)
 			result = formatScoreHeader(score, req.PreviousReviews) + "\n\n---\n\n" + result
 			return result, &score, stats, nil
 		}
+		log.Printf("scorer: failed for %s: %v", req.PRURL, scoreErr)
 		return result, nil, stats, nil
 	}
 
@@ -1320,11 +1344,13 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 			if err == nil {
 				stats.Add(mergeResp)
 				sessionStore.Set(req.PRURL, mergeResp.SessionID)
-				scoreWg.Wait()
+				score, scoreResp, scoreErr := runScorer(ctx, nil, req.Diff, req.SpecContent, req.AcknowledgedIssues)
 				if scoreErr == nil {
+					stats.Add(scoreResp)
 					result = formatScoreHeader(score, req.PreviousReviews) + "\n\n---\n\n" + result
 					return result, &score, stats, nil
 				}
+				log.Printf("scorer: failed for %s: %v", req.PRURL, scoreErr)
 				return result, nil, stats, nil
 			}
 			log.Printf("re-review session resume failed for %s: %v — falling back to delta review", req.PRURL, err)
@@ -1341,11 +1367,13 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 		if deltaResp.SessionID != "" {
 			sessionStore.Set(req.PRURL, deltaResp.SessionID)
 		}
-		scoreWg.Wait()
+		score, scoreResp, scoreErr := runScorer(ctx, nil, req.Diff, req.SpecContent, req.AcknowledgedIssues)
 		if scoreErr == nil {
+			stats.Add(scoreResp)
 			result = formatScoreHeader(score, req.PreviousReviews) + "\n\n---\n\n" + result
 			return result, &score, stats, nil
 		}
+		log.Printf("scorer: failed for %s: %v", req.PRURL, scoreErr)
 		return result, nil, stats, nil
 	}
 
@@ -1364,6 +1392,7 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 	}
 
 	reviews := make([]string, len(agents))
+	perspectiveScores := make([]PerspectiveScore, len(agents))
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	var firstErr error
@@ -1381,6 +1410,7 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 				mu.Unlock()
 				return
 			}
+			prompt += scoreSuffix
 			log.Printf("agent %s: starting %s review for %s", agent.name, req.Mode, req.PRURL)
 			text, resp, err := runClaude(ctx, prompt)
 			if err != nil {
@@ -1392,10 +1422,12 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 				return
 			}
 			stats.Add(resp)
+			reviewText, ps := extractPerspectiveScore(agent.name, text)
 			mu.Lock()
-			reviews[idx] = fmt.Sprintf("## %s Review\n\n%s", strings.ToUpper(agent.name), text)
+			reviews[idx] = fmt.Sprintf("## %s Review\n\n%s", strings.ToUpper(agent.name), reviewText)
+			perspectiveScores[idx] = ps
 			mu.Unlock()
-			log.Printf("agent %s: done for %s ($%.4f)", agent.name, req.PRURL, resp.TotalCostUSD)
+			log.Printf("agent %s: done for %s (perspective: %d/100, $%.4f)", agent.name, req.PRURL, ps.Score, resp.TotalCostUSD)
 		}(i, a)
 	}
 	wg.Wait()
@@ -1429,7 +1461,17 @@ Be concise. Output a validation report.
 	stats.Add(valResp)
 	log.Printf("validator: done for %s ($%.4f)", req.PRURL, valResp.TotalCostUSD)
 
-	dmUser(api, notifyUserID, "Validator done. Merging reviews...")
+	dmUser(api, notifyUserID, "Validator done. Scoring...")
+	log.Printf("scorer: starting for %s", req.PRURL)
+	score, scoreResp, scoreErr := runScorer(ctx, perspectiveScores, req.Diff, req.SpecContent, req.AcknowledgedIssues)
+	if scoreErr != nil {
+		log.Printf("scorer: failed for %s: %v", req.PRURL, scoreErr)
+	} else {
+		stats.Add(scoreResp)
+		log.Printf("scorer: done for %s (score: %d/100, $%.4f)", req.PRURL, score.Overall, scoreResp.TotalCostUSD)
+	}
+
+	dmUser(api, notifyUserID, "Merging reviews...")
 	log.Printf("merger: starting for %s", req.PRURL)
 	merged, mergeResp, err := runMerger(ctx, allReviews, validated, req.Mode, req.SpecContent, req.AcknowledgedIssues)
 	if err != nil {
@@ -1442,7 +1484,6 @@ Be concise. Output a validation report.
 		sessionStore.Set(req.PRURL, mergeResp.SessionID)
 	}
 
-	scoreWg.Wait()
 	if scoreErr == nil {
 		merged = formatScoreHeader(score, req.PreviousReviews) + "\n\n---\n\n" + merged
 		return merged, &score, stats, nil
@@ -1574,7 +1615,7 @@ Keep it short. If the code is sound, say so and approve.
 	return text, nil
 }
 
-func runScorer(ctx context.Context, diff, specContent, acknowledgedIssues string) (ScoreResult, claudeResponse, error) {
+func runScorer(ctx context.Context, perspectiveScores []PerspectiveScore, diff, specContent, acknowledgedIssues string) (ScoreResult, claudeResponse, error) {
 	specDimension := ""
 	specBlock := ""
 	specJSON := ""
@@ -1589,8 +1630,21 @@ func runScorer(ctx context.Context, diff, specContent, acknowledgedIssues string
 		ackBlock = fmt.Sprintf("\n## Acknowledged Issues\nThe following issues were explicitly acknowledged by the author (ack, won't fix, intentional, by design, etc.). Do NOT penalize scores for these items — they represent informed decisions, not oversights:\n\n%s\n\n", acknowledgedIssues)
 	}
 
-	prompt := fmt.Sprintf(`You are a code quality scorer. Evaluate this PR diff and rate the code quality.
+	perspectiveBlock := ""
+	if len(perspectiveScores) > 0 {
+		var sb strings.Builder
+		sb.WriteString("\n## Reviewer Perspective Scores\n")
+		sb.WriteString("The following scores were given by independent review agents. Evaluate the merit of each score — consider whether the reviewer's rationale is sound, whether their confidence level is justified, and whether they may have over- or under-weighted certain aspects. Use these as informed inputs, not as votes to average.\n\n")
+		for _, ps := range perspectiveScores {
+			if ps.Score > 0 {
+				fmt.Fprintf(&sb, "- **%s**: %d/100 (confidence: %d/100) — %s\n", ps.Agent, ps.Score, ps.Confidence, ps.Rationale)
+			}
+		}
+		perspectiveBlock = sb.String()
+	}
 
+	prompt := fmt.Sprintf(`You are a code quality scorer. Evaluate this PR diff and produce a comprehensive quality score.
+%s
 Score each dimension 0-10 (10 = excellent, 0 = critical problems):
 - correctness: Logic errors, bugs, edge cases, error handling
 - security: Vulnerabilities, data leaks, auth issues, injection risks
@@ -1600,11 +1654,17 @@ Score each dimension 0-10 (10 = excellent, 0 = critical problems):
 - production_readiness: Logging, monitoring, graceful degradation%s
 
 If a dimension has no relevant code in the diff (e.g., no security-sensitive changes), score 8-9 reflecting no risk introduced.
+
+When reviewer perspective scores are provided, critically evaluate each one:
+- A high-confidence score from a domain-relevant reviewer (e.g., go-expert on Go code) carries more weight
+- A low-confidence score or one from a less relevant perspective should be weighted less
+- If a reviewer's rationale contradicts the actual diff, disregard their score
+- Your dimensional scores should reflect your own analysis informed by — but not averaging — the perspective scores
 %s%s
 Respond with ONLY this JSON object, no markdown fences, no other text:
 {"correctness":N,"security":N,"design":N,"go_quality":N,"testing":N,"production_readiness":N%s,"overall":N,"summary":"one sentence"}
 
-`+"```diff\n%s\n```", specDimension, specBlock, ackBlock, specJSON, diff)
+`+"```diff\n%s\n```", perspectiveBlock, specDimension, specBlock, ackBlock, specJSON, diff)
 
 	text, resp, err := runClaude(ctx, prompt)
 	if err != nil {

@@ -57,8 +57,6 @@ For each finding: file and line, what the issue is, why it matters, concrete fix
 
 Be specific, not vague. Show exactly what and why. Respect existing codebase patterns — don't suggest rewrites outside PR scope.
 
-IMPORTANT: Do NOT include a Quality Score section or score table — scoring is handled separately.
-
 {{.QuestionsStr}}
 
 ```diff

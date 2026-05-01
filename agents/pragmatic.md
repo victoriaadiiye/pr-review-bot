@@ -9,8 +9,6 @@ Focus on:
 
 Be direct and opinionated. Skip obvious things that are fine.
 
-IMPORTANT: Do NOT include a Quality Score section or score table — scoring is handled separately.
-
 {{.QuestionsStr}}
 
 ```diff

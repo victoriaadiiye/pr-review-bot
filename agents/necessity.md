@@ -44,8 +44,6 @@ One sentence: "N of M changed files are directly relevant to the stated goal."
 
 Be harsh. A clean PR touches only what it must. If every change is necessary, say so and move on.
 
-IMPORTANT: Do NOT include a Quality Score section or score table — scoring is handled separately.
-
 {{.QuestionsStr}}
 
 ```diff

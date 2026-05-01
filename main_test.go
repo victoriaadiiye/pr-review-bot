@@ -1079,3 +1079,61 @@ func TestLoadAgents_RealNecessityAgent(t *testing.T) {
 		t.Error("necessity should be excluded without --bare-necessities flag")
 	}
 }
+
+func TestExtractPerspectiveScore(t *testing.T) {
+	tests := []struct {
+		name       string
+		input      string
+		wantReview string
+		wantScore  int
+		wantConf   int
+	}{
+		{
+			name: "valid score block",
+			input: "## Review\nLooks good.\n\n```\n{\"score\":85,\"confidence\":90,\"rationale\":\"solid code\"}\n```",
+			wantReview: "## Review\nLooks good.",
+			wantScore:  85,
+			wantConf:   90,
+		},
+		{
+			name:       "no score block",
+			input:      "## Review\nJust a review with no score.",
+			wantReview: "## Review\nJust a review with no score.",
+			wantScore:  0,
+			wantConf:   0,
+		},
+		{
+			name: "score with extra whitespace",
+			input: "Review text here.\n\n```\n{ \"score\": 72, \"confidence\": 60, \"rationale\": \"missing tests\" }\n```\n",
+			wantReview: "Review text here.",
+			wantScore:  72,
+			wantConf:   60,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			review, ps := extractPerspectiveScore("test-agent", tt.input)
+			if strings.TrimSpace(review) != tt.wantReview {
+				t.Errorf("review = %q, want %q", strings.TrimSpace(review), tt.wantReview)
+			}
+			if ps.Score != tt.wantScore {
+				t.Errorf("score = %d, want %d", ps.Score, tt.wantScore)
+			}
+			if ps.Confidence != tt.wantConf {
+				t.Errorf("confidence = %d, want %d", ps.Confidence, tt.wantConf)
+			}
+			if ps.Agent != "test-agent" {
+				t.Errorf("agent = %q, want test-agent", ps.Agent)
+			}
+		})
+	}
+}
+
+func TestExtractPerspectiveScore_PreservesAgentName(t *testing.T) {
+	input := "review\n```\n{\"score\":50,\"confidence\":50,\"rationale\":\"ok\"}\n```"
+	_, ps := extractPerspectiveScore("go-expert", input)
+	if ps.Agent != "go-expert" {
+		t.Errorf("agent = %q, want go-expert", ps.Agent)
+	}
+}

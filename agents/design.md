@@ -10,8 +10,6 @@ Focus on:
 
 Be specific. Reference exact lines. No fluff.
 
-IMPORTANT: Do NOT include a Quality Score section or score table — scoring is handled separately.
-
 {{.QuestionsStr}}
 
 ```diff
