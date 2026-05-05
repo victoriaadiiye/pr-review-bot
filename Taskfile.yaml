@@ -27,6 +27,13 @@ tasks:
       - tmux kill-session -t {{.TMUX_SESSION}} 2>/dev/null || true
       - tmux new-session -d -s {{.TMUX_SESSION}} -c {{.ROOT_DIR}} "./{{.BINARY}}"
 
+  redeploy:
+    desc: Rebuild from local code and restart the bot (no git pull)
+    cmds:
+      - "{{.GO}} build -o {{.BINARY}} ."
+      - tmux kill-session -t {{.TMUX_SESSION}} 2>/dev/null || true
+      - tmux new-session -d -s {{.TMUX_SESSION}} -c {{.ROOT_DIR}} "./{{.BINARY}}"
+
   logs:
     desc: Tail live bot output from tmux
     cmds:
