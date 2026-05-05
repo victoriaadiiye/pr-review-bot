@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"text/template"
 
 	"github.com/joho/godotenv"
 	"github.com/slack-go/slack"
@@ -52,6 +53,7 @@ type ReviewRequest struct {
 	AcknowledgedIssues string
 	SpecContent        string
 	SpecPath           string
+	Flags              map[string]bool
 }
 
 type claudeResponse struct {
@@ -107,9 +109,81 @@ func formatTokens(n int64) string {
 	return fmt.Sprintf("%.1fk", float64(n)/1000)
 }
 
-type perspective struct {
-	name   string
-	prompt string
+type agentFile struct {
+	name     string
+	flag     string
+	template *template.Template
+}
+
+type promptData struct {
+	ModePreamble string
+	PRURL        string
+	ContextBlock string
+	QuestionsStr string
+	Diff         string
+}
+
+var agentsDir = "agents"
+
+func loadAgents() ([]agentFile, error) {
+	entries, err := os.ReadDir(agentsDir)
+	if err != nil {
+		return nil, fmt.Errorf("read agents dir %s: %w", agentsDir, err)
+	}
+	var agents []agentFile
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		path := filepath.Join(agentsDir, e.Name())
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read agent file %s: %w", path, err)
+		}
+		name := strings.TrimSuffix(e.Name(), ".md")
+		content := string(raw)
+		var flag string
+		if strings.HasPrefix(content, "---\n") {
+			if end := strings.Index(content[4:], "\n---\n"); end >= 0 {
+				frontmatter := content[4 : 4+end]
+				content = content[4+end+5:]
+				for _, line := range strings.Split(frontmatter, "\n") {
+					if strings.HasPrefix(line, "flag:") {
+						flag = strings.TrimSpace(strings.TrimPrefix(line, "flag:"))
+					}
+				}
+			}
+		}
+		tmpl, err := template.New(name).Parse(content)
+		if err != nil {
+			return nil, fmt.Errorf("parse agent template %s: %w", path, err)
+		}
+		agents = append(agents, agentFile{name: name, flag: flag, template: tmpl})
+	}
+	if len(agents) == 0 {
+		return nil, fmt.Errorf("no .md agent files found in %s", agentsDir)
+	}
+	sort.Slice(agents, func(i, j int) bool {
+		return agents[i].name < agents[j].name
+	})
+	log.Printf("loaded %d agent(s) from %s: %s", len(agents), agentsDir, agentNames(agents))
+	return agents, nil
+}
+
+func agentNames(agents []agentFile) string {
+	names := make([]string, len(agents))
+	for i, a := range agents {
+		names[i] = a.name
+	}
+	return strings.Join(names, ", ")
+}
+
+func renderAgent(a agentFile, data promptData) (string, error) {
+	var buf strings.Builder
+	if err := a.template.Execute(&buf, data); err != nil {
+		return "", fmt.Errorf("render agent %s: %w", a.name, err)
+	}
+	return buf.String(), nil
 }
 
 type ScoreResult struct {
@@ -124,12 +198,52 @@ type ScoreResult struct {
 	Summary             string `json:"summary"`
 }
 
+type PerspectiveScore struct {
+	Agent      string `json:"agent"`
+	Score      int    `json:"score"`
+	Confidence int    `json:"confidence"`
+	Rationale  string `json:"rationale"`
+}
+
+const scoreSuffix = `
+
+## Perspective Score
+
+After your review, rate this PR's overall quality FROM YOUR PERSPECTIVE on a scale of 0-100 (100 = flawless, 0 = critically broken).
+
+End your response with EXACTLY this JSON block on its own line:
+` + "```" + `
+{"score":N,"confidence":N,"rationale":"one sentence explaining your score"}
+` + "```" + `
+- score: 0-100 overall quality from your review perspective
+- confidence: 0-100 how confident you are in your assessment (low if diff is unclear or you lack context)
+- rationale: one sentence summary of why you gave this score`
+
+var perspectiveScorePattern = regexp.MustCompile("```(?:json)?\\s*\\n?\\s*({\\s*\"score\"\\s*:.+?})\\s*\\n?\\s*```")
+
+func extractPerspectiveScore(agentName, text string) (review string, ps PerspectiveScore) {
+	ps.Agent = agentName
+	loc := perspectiveScorePattern.FindStringSubmatchIndex(text)
+	if loc == nil {
+		return text, ps
+	}
+	jsonStr := text[loc[2]:loc[3]]
+	review = strings.TrimSpace(text[:loc[0]])
+	if err := json.Unmarshal([]byte(jsonStr), &ps); err != nil {
+		log.Printf("agent %s: failed to parse perspective score: %v", agentName, err)
+		return text, PerspectiveScore{Agent: agentName}
+	}
+	ps.Agent = agentName
+	return review, ps
+}
+
 var (
 	ghPRPattern          = regexp.MustCompile(`<?https://github\.com/([^/>\s]+)/([^/>\s]+)/pull/(\d+)[^>\s]*>?`)
 	jiraTicketPattern    = regexp.MustCompile(`\b[A-Z]{2,}-\d+\b`)
 	modePattern          = regexp.MustCompile(`--(initial|re-review|quick|final)\b`)
 	selfPattern          = regexp.MustCompile(`--self\b`)
 	specPattern          = regexp.MustCompile(`--spec\s+(\S+)`)
+	flagPattern          = regexp.MustCompile(`--([a-z][-a-z0-9]*)\b`)
 	previousScorePattern = regexp.MustCompile(`\*\*Quality Score: (\d+)/100\*\*`)
 	previousSpecPattern  = regexp.MustCompile(`<!-- spec: (\S+) -->`)
 	reviewRequestPattern = regexp.MustCompile(`(?i)\breview\b`)
@@ -462,6 +576,30 @@ func parseSpecPath(text string) string {
 	return ""
 }
 
+func parseFlags(text string) map[string]bool {
+	reserved := map[string]bool{
+		"initial": true, "re-review": true, "quick": true, "final": true,
+		"self": true, "spec": true,
+	}
+	flags := make(map[string]bool)
+	for _, m := range flagPattern.FindAllStringSubmatch(text, -1) {
+		if !reserved[m[1]] {
+			flags[m[1]] = true
+		}
+	}
+	return flags
+}
+
+func filterAgents(agents []agentFile, flags map[string]bool) []agentFile {
+	var filtered []agentFile
+	for _, a := range agents {
+		if a.flag == "" || flags[a.flag] {
+			filtered = append(filtered, a)
+		}
+	}
+	return filtered
+}
+
 func parseJiraTicket(text string) string {
 	cleaned := ghPRPattern.ReplaceAllString(text, "")
 	cleaned = modePattern.ReplaceAllString(cleaned, "")
@@ -479,6 +617,7 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 	mode := parseMode(ev.Text)
 	selfReview := selfPattern.MatchString(ev.Text)
 	jiraTicket := parseJiraTicket(ev.Text)
+	flags := parseFlags(ev.Text)
 
 	_ = api.AddReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 
@@ -553,11 +692,16 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 			dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Running delta re-review (no previous session)...", len(diff)))
 		}
 	} else {
-		agentCount := 4
 		if mode == ModeQuick {
-			agentCount = 1
+			dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Launching 1 agent in %s mode...", len(diff), mode))
+		} else {
+			agents, agentErr := loadAgents()
+			agentCount := 0
+			if agentErr == nil {
+				agentCount = len(filterAgents(agents, flags))
+			}
+			dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Launching %d agent(s) in %s mode...", len(diff), agentCount, mode))
 		}
-		dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Launching %d agent(s) in %s mode...", len(diff), agentCount, mode))
 	}
 
 	req := ReviewRequest{
@@ -572,6 +716,7 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 		AcknowledgedIssues: acknowledgedIssues,
 		SpecContent:        specContent,
 		SpecPath:           specPath,
+		Flags:              flags,
 	}
 
 	if ctx.Err() != nil {
@@ -1178,33 +1323,18 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 	contextBlock := extraContext.String()
 	questionsStr := questionsBlock(req.Questions)
 
-	var score ScoreResult
-	var scoreErr error
-	var scoreWg sync.WaitGroup
-	scoreWg.Add(1)
-	go func() {
-		defer scoreWg.Done()
-		log.Printf("scorer: starting for %s", req.PRURL)
-		var resp claudeResponse
-		score, resp, scoreErr = runScorer(ctx, req.Diff, req.SpecContent, req.AcknowledgedIssues)
-		if scoreErr != nil {
-			log.Printf("scorer: failed for %s: %v", req.PRURL, scoreErr)
-		} else {
-			stats.Add(resp)
-			log.Printf("scorer: done for %s (score: %d/100, $%.4f)", req.PRURL, score.Overall, resp.TotalCostUSD)
-		}
-	}()
-
 	if req.Mode == ModeQuick {
 		result, err := runQuickReview(ctx, req.PRURL, req.Diff, contextBlock, questionsStr, stats)
 		if err != nil {
 			return "", nil, stats, err
 		}
-		scoreWg.Wait()
+		score, scoreResp, scoreErr := runScorer(ctx, nil, req.Diff, req.SpecContent, req.AcknowledgedIssues)
 		if scoreErr == nil {
+			stats.Add(scoreResp)
 			result = formatScoreHeader(score, req.PreviousReviews) + "\n\n---\n\n" + result
 			return result, &score, stats, nil
 		}
+		log.Printf("scorer: failed for %s: %v", req.PRURL, scoreErr)
 		return result, nil, stats, nil
 	}
 
@@ -1214,11 +1344,13 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 			if err == nil {
 				stats.Add(mergeResp)
 				sessionStore.Set(req.PRURL, mergeResp.SessionID)
-				scoreWg.Wait()
+				score, scoreResp, scoreErr := runScorer(ctx, nil, req.Diff, req.SpecContent, req.AcknowledgedIssues)
 				if scoreErr == nil {
+					stats.Add(scoreResp)
 					result = formatScoreHeader(score, req.PreviousReviews) + "\n\n---\n\n" + result
 					return result, &score, stats, nil
 				}
+				log.Printf("scorer: failed for %s: %v", req.PRURL, scoreErr)
 				return result, nil, stats, nil
 			}
 			log.Printf("re-review session resume failed for %s: %v — falling back to delta review", req.PRURL, err)
@@ -1235,41 +1367,68 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 		if deltaResp.SessionID != "" {
 			sessionStore.Set(req.PRURL, deltaResp.SessionID)
 		}
-		scoreWg.Wait()
+		score, scoreResp, scoreErr := runScorer(ctx, nil, req.Diff, req.SpecContent, req.AcknowledgedIssues)
 		if scoreErr == nil {
+			stats.Add(scoreResp)
 			result = formatScoreHeader(score, req.PreviousReviews) + "\n\n---\n\n" + result
 			return result, &score, stats, nil
 		}
+		log.Printf("scorer: failed for %s: %v", req.PRURL, scoreErr)
 		return result, nil, stats, nil
 	}
 
-	perspectives := buildPerspectives(req.PRURL, req.Diff, req.Mode, contextBlock, questionsStr)
+	allAgents, err := loadAgents()
+	if err != nil {
+		return "", nil, stats, fmt.Errorf("load agents: %w", err)
+	}
+	agents := filterAgents(allAgents, req.Flags)
 
-	reviews := make([]string, len(perspectives))
+	data := promptData{
+		ModePreamble: modePreamble(req.Mode),
+		PRURL:        req.PRURL,
+		ContextBlock: contextBlock,
+		QuestionsStr: questionsStr,
+		Diff:         req.Diff,
+	}
+
+	reviews := make([]string, len(agents))
+	perspectiveScores := make([]PerspectiveScore, len(agents))
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	var firstErr error
 
-	for i, p := range perspectives {
+	for i, a := range agents {
 		wg.Add(1)
-		go func(idx int, name, prompt string) {
+		go func(idx int, agent agentFile) {
 			defer wg.Done()
-			log.Printf("agent %s: starting %s review for %s", name, req.Mode, req.PRURL)
+			prompt, renderErr := renderAgent(agent, data)
+			if renderErr != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = renderErr
+				}
+				mu.Unlock()
+				return
+			}
+			prompt += scoreSuffix
+			log.Printf("agent %s: starting %s review for %s", agent.name, req.Mode, req.PRURL)
 			text, resp, err := runClaude(ctx, prompt)
 			if err != nil {
 				mu.Lock()
 				if firstErr == nil {
-					firstErr = fmt.Errorf("agent %s failed: %w", name, err)
+					firstErr = fmt.Errorf("agent %s failed: %w", agent.name, err)
 				}
 				mu.Unlock()
 				return
 			}
 			stats.Add(resp)
+			reviewText, ps := extractPerspectiveScore(agent.name, text)
 			mu.Lock()
-			reviews[idx] = fmt.Sprintf("## %s Review\n\n%s", strings.ToUpper(name), text)
+			reviews[idx] = fmt.Sprintf("## %s Review\n\n%s", strings.ToUpper(agent.name), reviewText)
+			perspectiveScores[idx] = ps
 			mu.Unlock()
-			log.Printf("agent %s: done for %s ($%.4f)", name, req.PRURL, resp.TotalCostUSD)
-		}(i, p.name, p.prompt)
+			log.Printf("agent %s: done for %s (perspective: %d/100, $%.4f)", agent.name, req.PRURL, ps.Score, resp.TotalCostUSD)
+		}(i, a)
 	}
 	wg.Wait()
 
@@ -1277,7 +1436,7 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 		return "", nil, stats, firstErr
 	}
 
-	dmUser(api, notifyUserID, fmt.Sprintf("All %d agents done. Running validator...", len(perspectives)))
+	dmUser(api, notifyUserID, fmt.Sprintf("All %d agents done. Running validator...", len(agents)))
 	allReviews := strings.Join(reviews, "\n\n---\n\n")
 
 	log.Printf("validator: starting for %s", req.PRURL)
@@ -1295,14 +1454,24 @@ Be concise. Output a validation report.
 `+"```diff\n%s\n```"+`
 
 ## Reviews to Validate
-%s`, len(perspectives), req.Diff, allReviews))
+%s`, len(agents), req.Diff, allReviews))
 	if err != nil {
 		return "", nil, stats, fmt.Errorf("validator failed: %w", err)
 	}
 	stats.Add(valResp)
 	log.Printf("validator: done for %s ($%.4f)", req.PRURL, valResp.TotalCostUSD)
 
-	dmUser(api, notifyUserID, "Validator done. Merging reviews...")
+	dmUser(api, notifyUserID, "Validator done. Scoring...")
+	log.Printf("scorer: starting for %s", req.PRURL)
+	score, scoreResp, scoreErr := runScorer(ctx, perspectiveScores, req.Diff, req.SpecContent, req.AcknowledgedIssues)
+	if scoreErr != nil {
+		log.Printf("scorer: failed for %s: %v", req.PRURL, scoreErr)
+	} else {
+		stats.Add(scoreResp)
+		log.Printf("scorer: done for %s (score: %d/100, $%.4f)", req.PRURL, score.Overall, scoreResp.TotalCostUSD)
+	}
+
+	dmUser(api, notifyUserID, "Merging reviews...")
 	log.Printf("merger: starting for %s", req.PRURL)
 	merged, mergeResp, err := runMerger(ctx, allReviews, validated, req.Mode, req.SpecContent, req.AcknowledgedIssues)
 	if err != nil {
@@ -1315,7 +1484,6 @@ Be concise. Output a validation report.
 		sessionStore.Set(req.PRURL, mergeResp.SessionID)
 	}
 
-	scoreWg.Wait()
 	if scoreErr == nil {
 		merged = formatScoreHeader(score, req.PreviousReviews) + "\n\n---\n\n" + merged
 		return merged, &score, stats, nil
@@ -1391,11 +1559,10 @@ Be specific about what changed. Reference files and lines.
 	return text, resp, nil
 }
 
-func buildPerspectives(prURL, diff string, mode ReviewMode, contextBlock, questionsStr string) []perspective {
-	var modePreamble string
+func modePreamble(mode ReviewMode) string {
 	switch mode {
 	case ModeReReview:
-		modePreamble = `NOTE: This is a RE-REVIEW. This PR has been reviewed before by an automated system. Focus on:
+		return `NOTE: This is a RE-REVIEW. This PR has been reviewed before by an automated system. Focus on:
 - Whether previously identified issues have been addressed
 - Any new issues introduced since the last review
 - Remaining concerns that still need attention
@@ -1403,132 +1570,14 @@ Do not repeat feedback that has clearly been addressed.
 
 `
 	case ModeFinal:
-		modePreamble = `NOTE: This is a FINAL REVIEW before merge. Err on the side of approval:
+		return `NOTE: This is a FINAL REVIEW before merge. Err on the side of approval:
 - Only flag truly critical/blocking issues (bugs, security, data loss)
 - Mention nice-to-haves and nit picks as OPTIONAL/non-blocking
 - If the code is generally sound and functional, recommend approval
 
 `
-	}
-
-	return []perspective{
-		{
-			name: "correctness",
-			prompt: fmt.Sprintf(`%sYou are a code review agent focused on CORRECTNESS and SECURITY.
-Review this pull request: %s
-%s
-Focus on:
-- Bugs, logic errors, edge cases
-- Security vulnerabilities (injection, auth issues, data leaks)
-- Race conditions, error handling gaps
-- API contract violations
-
-Be specific. Reference exact lines. No fluff.
-
-%s
-
-`+"```diff\n%s\n```", modePreamble, prURL, contextBlock, questionsStr, diff),
-		},
-		{
-			name: "design",
-			prompt: fmt.Sprintf(`%sYou are a code review agent focused on DESIGN and MAINTAINABILITY.
-Review this pull request: %s
-%s
-Focus on:
-- Architecture and design patterns
-- Code organization, naming, readability
-- Unnecessary complexity or premature abstraction
-- Missing tests or test quality
-- Performance implications
-
-Be specific. Reference exact lines. No fluff.
-
-%s
-
-`+"```diff\n%s\n```", modePreamble, prURL, contextBlock, questionsStr, diff),
-		},
-		{
-			name: "pragmatic",
-			prompt: fmt.Sprintf(`%sYou are a pragmatic senior engineer reviewing this PR.
-Review this pull request: %s
-%s
-Focus on:
-- Does this actually solve the problem it claims to?
-- What could break in production?
-- What would you want changed before approving?
-- Are there simpler approaches?
-
-Be direct and opinionated. Skip obvious things that are fine.
-
-%s
-
-`+"```diff\n%s\n```", modePreamble, prURL, contextBlock, questionsStr, diff),
-		},
-		{
-			name: "go-expert",
-			prompt: fmt.Sprintf(`%sYou are an elite Go code reviewer with deep expertise in Go 1.26, its standard library, and production-grade Go development. You review with the rigor of a senior staff engineer at a top-tier infrastructure company.
-
-Review this pull request: %s
-%s
-## Review Criteria
-
-### Correctness
-- Logic errors, off-by-one mistakes, race conditions
-- Proper error handling: explicit error returns, no swallowed errors, %%w for wrapping
-- No panics outside main()
-- Correct use of concurrency primitives (sync.Mutex, channels, context.Context)
-- context.Context must be the first parameter in non-handler functions
-
-### Go 1.26 Best Practices
-- Use Go 1.26 features: enhanced http.ServeMux with {param} path values, range-over-func iterators
-- Prefer standard library over third-party dependencies
-- Use slog for structured logging
-- Idiomatic Go: receiver names, interface naming (-er suffix), zero-value usefulness
-
-### Style & Formatting
-- gofumpt formatting compliance
-- Exported types and functions must have doc comments
-- Functions should be ≤ ~50 lines; flag functions that are too long
-- No variable shadowing (especially err — use named variants like parseErr, decodeErr)
-- //nolint:lintname // reason format (double-slash before reason)
-
-### Testing (TDD Compliance)
-- Tests exist for new functionality
-- Tests are meaningful, not just happy paths
-- Table-driven tests where appropriate
-- httptest for HTTP handler testing
-- No test pollution (parallel tests, proper cleanup)
-
-### Project-Specific Patterns
-- Module: github.com/Qumulo/qompass
-- Structure: cmd/qompass/, internal/ packages, tests/integration/
-- ClickHouse: clickhouse-go v2 is the only allowed external runtime dependency
-- LowCardinality for <10K unique values, no Nullable columns in ClickHouse schemas
-- *json.RawMessage null gotcha: marshaling null gives nil pointer
-- gzip bodies <10 bytes trigger io.ErrUnexpectedEOF
-
-## Output Format
-
-### Critical Issues 🔴
-Must-fix: bugs, security, data loss, race conditions.
-
-### Suggestions 🟡
-Important improvements: error handling, edge cases, performance.
-
-### Nits 🟢
-Minor style, naming, documentation.
-
-### What Looks Good ✅
-Well-written code worth reinforcing.
-
-For each finding: file and line, what the issue is, why it matters, concrete fix.
-
-Be specific, not vague. Show exactly what and why. Respect existing codebase patterns — don't suggest rewrites outside PR scope.
-
-%s
-
-`+"```diff\n%s\n```", modePreamble, prURL, contextBlock, questionsStr, diff),
-		},
+	default:
+		return ""
 	}
 }
 
@@ -1566,7 +1615,7 @@ Keep it short. If the code is sound, say so and approve.
 	return text, nil
 }
 
-func runScorer(ctx context.Context, diff, specContent, acknowledgedIssues string) (ScoreResult, claudeResponse, error) {
+func runScorer(ctx context.Context, perspectiveScores []PerspectiveScore, diff, specContent, acknowledgedIssues string) (ScoreResult, claudeResponse, error) {
 	specDimension := ""
 	specBlock := ""
 	specJSON := ""
@@ -1581,8 +1630,21 @@ func runScorer(ctx context.Context, diff, specContent, acknowledgedIssues string
 		ackBlock = fmt.Sprintf("\n## Acknowledged Issues\nThe following issues were explicitly acknowledged by the author (ack, won't fix, intentional, by design, etc.). Do NOT penalize scores for these items — they represent informed decisions, not oversights:\n\n%s\n\n", acknowledgedIssues)
 	}
 
-	prompt := fmt.Sprintf(`You are a code quality scorer. Evaluate this PR diff and rate the code quality.
+	perspectiveBlock := ""
+	if len(perspectiveScores) > 0 {
+		var sb strings.Builder
+		sb.WriteString("\n## Reviewer Perspective Scores\n")
+		sb.WriteString("The following scores were given by independent review agents. Evaluate the merit of each score — consider whether the reviewer's rationale is sound, whether their confidence level is justified, and whether they may have over- or under-weighted certain aspects. Use these as informed inputs, not as votes to average.\n\n")
+		for _, ps := range perspectiveScores {
+			if ps.Score > 0 {
+				fmt.Fprintf(&sb, "- **%s**: %d/100 (confidence: %d/100) — %s\n", ps.Agent, ps.Score, ps.Confidence, ps.Rationale)
+			}
+		}
+		perspectiveBlock = sb.String()
+	}
 
+	prompt := fmt.Sprintf(`You are a code quality scorer. Evaluate this PR diff and produce a comprehensive quality score.
+%s
 Score each dimension 0-10 (10 = excellent, 0 = critical problems):
 - correctness: Logic errors, bugs, edge cases, error handling
 - security: Vulnerabilities, data leaks, auth issues, injection risks
@@ -1592,11 +1654,17 @@ Score each dimension 0-10 (10 = excellent, 0 = critical problems):
 - production_readiness: Logging, monitoring, graceful degradation%s
 
 If a dimension has no relevant code in the diff (e.g., no security-sensitive changes), score 8-9 reflecting no risk introduced.
+
+When reviewer perspective scores are provided, critically evaluate each one:
+- A high-confidence score from a domain-relevant reviewer (e.g., go-expert on Go code) carries more weight
+- A low-confidence score or one from a less relevant perspective should be weighted less
+- If a reviewer's rationale contradicts the actual diff, disregard their score
+- Your dimensional scores should reflect your own analysis informed by — but not averaging — the perspective scores
 %s%s
 Respond with ONLY this JSON object, no markdown fences, no other text:
 {"correctness":N,"security":N,"design":N,"go_quality":N,"testing":N,"production_readiness":N%s,"overall":N,"summary":"one sentence"}
 
-`+"```diff\n%s\n```", specDimension, specBlock, ackBlock, specJSON, diff)
+`+"```diff\n%s\n```", perspectiveBlock, specDimension, specBlock, ackBlock, specJSON, diff)
 
 	text, resp, err := runClaude(ctx, prompt)
 	if err != nil {
