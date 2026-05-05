@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"text/template"
+	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/slack-go/slack"
@@ -72,6 +73,12 @@ type claudeResponse struct {
 	} `json:"usage"`
 }
 
+type AgentMetric struct {
+	Name     string
+	CostUSD  float64
+	Duration time.Duration
+}
+
 type UsageStats struct {
 	mu                sync.Mutex
 	TotalCostUSD      float64
@@ -80,6 +87,7 @@ type UsageStats struct {
 	TotalOutputTokens int64
 	TotalCacheRead    int64
 	AgentCalls        int
+	AgentMetrics      []AgentMetric
 }
 
 func (u *UsageStats) Add(resp claudeResponse) {
@@ -93,6 +101,12 @@ func (u *UsageStats) Add(resp claudeResponse) {
 	u.AgentCalls++
 }
 
+func (u *UsageStats) AddAgent(name string, cost float64, dur time.Duration) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.AgentMetrics = append(u.AgentMetrics, AgentMetric{Name: name, CostUSD: cost, Duration: dur})
+}
+
 func (u *UsageStats) String() string {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -102,11 +116,30 @@ func (u *UsageStats) String() string {
 		u.TotalDurationMS/1000)
 }
 
+func (u *UsageStats) MetricsSummary(model, triggerUser, channelID string) string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	var b strings.Builder
+	b.WriteString("*Review Metrics*\n")
+	b.WriteString(fmt.Sprintf("> *Model:* `%s`\n", model))
+	b.WriteString(fmt.Sprintf("> *Triggered by:* <@%s> in <#%s>\n", triggerUser, channelID))
+	b.WriteString(fmt.Sprintf("> *Total cost:* $%.4f\n", u.TotalCostUSD))
+	b.WriteString("> *Agent breakdown:*\n")
+	for _, m := range u.AgentMetrics {
+		b.WriteString(fmt.Sprintf(">   • `%s` — $%.4f, %s\n", m.Name, m.CostUSD, m.Duration.Round(time.Second)))
+	}
+	return b.String()
+}
+
 func formatTokens(n int64) string {
 	if n < 1000 {
 		return fmt.Sprintf("%d", n)
 	}
 	return fmt.Sprintf("%.1fk", float64(n)/1000)
+}
+
+func diffLines(diff string) int {
+	return strings.Count(diff, "\n")
 }
 
 type agentFile struct {
@@ -579,7 +612,7 @@ func parseSpecPath(text string) string {
 func parseFlags(text string) map[string]bool {
 	reserved := map[string]bool{
 		"initial": true, "re-review": true, "quick": true, "final": true,
-		"self": true, "spec": true,
+		"self": true, "spec": true, "test": true,
 	}
 	flags := make(map[string]bool)
 	for _, m := range flagPattern.FindAllStringSubmatch(text, -1) {
@@ -637,6 +670,67 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 		} else {
 			postError(api, ev, prURL, channelID, notifyUserID, err)
 		}
+		return
+	}
+
+	if flags["test"] {
+		model := os.Getenv("CLAUDE_MODEL")
+		if model == "" {
+			model = "claude-opus-4-6"
+		}
+		agents, _ := loadAgents()
+		filtered := filterAgents(agents, flags)
+		var agentNames []string
+		for _, a := range filtered {
+			agentNames = append(agentNames, a.name)
+		}
+		lines := diffLines(diff)
+
+		claudeStatus := "ok"
+		claudeStart := time.Now()
+		claudeCmd := exec.CommandContext(ctx, "claude", "--version")
+		claudeOut, claudeErr := claudeCmd.Output()
+		claudeLatency := time.Since(claudeStart).Round(time.Millisecond)
+		claudeVersion := strings.TrimSpace(string(claudeOut))
+		if claudeErr != nil {
+			claudeStatus = fmt.Sprintf("FAILED: %v", claudeErr)
+			claudeVersion = "unknown"
+		}
+
+		ghStatus := "ok"
+		ghStart := time.Now()
+		ghCmd := exec.CommandContext(ctx, "gh", "auth", "status")
+		if ghErr := ghCmd.Run(); ghErr != nil {
+			ghStatus = fmt.Sprintf("FAILED: %v", ghErr)
+		}
+		ghLatency := time.Since(ghStart).Round(time.Millisecond)
+
+		msg := fmt.Sprintf("*Test run for <%s>*\n"+
+			"> *Diff:* %d chars, %d lines\n"+
+			"> *Model:* `%s`\n"+
+			"> *Mode:* %s\n"+
+			"> *Agents:* %s\n"+
+			"> *Triggered by:* <@%s> in <#%s>\n"+
+			"> *Pipeline:* agents → validator → scorer → merger\n"+
+			">\n"+
+			"> *Preflight checks:*\n"+
+			">   • `claude` CLI: %s (v%s, %s)\n"+
+			">   • `gh` CLI: %s (%s)\n"+
+			">   • git diff: fetched (%s)\n"+
+			">\n"+
+			"> No agents were run. Use without `--test` to run a full review.",
+			prURL, len(diff), lines, model, mode,
+			strings.Join(agentNames, ", "), ev.User, ev.Channel,
+			claudeStatus, claudeVersion, claudeLatency,
+			ghStatus, ghLatency,
+			time.Duration(0)) // diff already fetched above
+		_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+		_ = api.AddReaction("white_check_mark", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+		_, _, _ = api.PostMessage(channelID,
+			slack.MsgOptionText(msg, false),
+			slack.MsgOptionTS(ev.TimeStamp))
+		dmUser(api, notifyUserID, msg)
+		log.Printf("test run: completed for %s (claude=%s, gh=%s, diff=%d lines)", prURL, claudeStatus, ghStatus, lines)
 		return
 	}
 
@@ -748,11 +842,17 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 		scoreMsg = fmt.Sprintf(" | Score: %d/100", score.Overall)
 	}
 
+	model := os.Getenv("CLAUDE_MODEL")
+	if model == "" {
+		model = "claude-opus-4-6"
+	}
+	metrics := stats.MetricsSummary(model, ev.User, ev.Channel)
+
 	if selfReview {
 		dmUser(api, notifyUserID, fmt.Sprintf("*%s review for <%s>:*\n\n%s", modeLabel, prURL, review))
 		_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 		_ = api.AddReaction("white_check_mark", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
-		dmUser(api, notifyUserID, fmt.Sprintf("Done! %s review for <%s> sent via DM only.%s\nUsage: %s", modeLabel, prURL, scoreMsg, stats))
+		dmUser(api, notifyUserID, fmt.Sprintf("Done! %s review for <%s> sent via DM only.%s\nUsage: %s\n\n%s", modeLabel, prURL, scoreMsg, stats, metrics))
 		return
 	}
 
@@ -774,7 +874,7 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 	_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 	_ = api.AddReaction("white_check_mark", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 
-	dmUser(api, notifyUserID, fmt.Sprintf("Done! %s review for <%s> posted on GitHub and in <#%s>.%s\nUsage: %s", modeLabel, prURL, channelID, scoreMsg, stats))
+	dmUser(api, notifyUserID, fmt.Sprintf("Done! %s review for <%s> posted on GitHub and in <#%s>.%s\nUsage: %s\n\n%s", modeLabel, prURL, channelID, scoreMsg, stats, metrics))
 }
 
 // --- Repo Cache ---
@@ -1412,7 +1512,9 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 			}
 			prompt += scoreSuffix
 			log.Printf("agent %s: starting %s review for %s", agent.name, req.Mode, req.PRURL)
+			agentStart := time.Now()
 			text, resp, err := runClaude(ctx, prompt)
+			agentDur := time.Since(agentStart)
 			if err != nil {
 				mu.Lock()
 				if firstErr == nil {
@@ -1422,6 +1524,7 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 				return
 			}
 			stats.Add(resp)
+			stats.AddAgent(agent.name, resp.TotalCostUSD, agentDur)
 			reviewText, ps := extractPerspectiveScore(agent.name, text)
 			mu.Lock()
 			reviews[idx] = fmt.Sprintf("## %s Review\n\n%s", strings.ToUpper(agent.name), reviewText)
@@ -1440,6 +1543,7 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 	allReviews := strings.Join(reviews, "\n\n---\n\n")
 
 	log.Printf("validator: starting for %s", req.PRURL)
+	valStart := time.Now()
 	validated, valResp, err := runClaude(ctx, fmt.Sprintf(`You are a review validator. You have %d independent code reviews of a PR and the original diff.
 
 Your job:
@@ -1459,25 +1563,30 @@ Be concise. Output a validation report.
 		return "", nil, stats, fmt.Errorf("validator failed: %w", err)
 	}
 	stats.Add(valResp)
+	stats.AddAgent("validator", valResp.TotalCostUSD, time.Since(valStart))
 	log.Printf("validator: done for %s ($%.4f)", req.PRURL, valResp.TotalCostUSD)
 
 	dmUser(api, notifyUserID, "Validator done. Scoring...")
 	log.Printf("scorer: starting for %s", req.PRURL)
+	scorerStart := time.Now()
 	score, scoreResp, scoreErr := runScorer(ctx, perspectiveScores, req.Diff, req.SpecContent, req.AcknowledgedIssues)
 	if scoreErr != nil {
 		log.Printf("scorer: failed for %s: %v", req.PRURL, scoreErr)
 	} else {
 		stats.Add(scoreResp)
+		stats.AddAgent("scorer", scoreResp.TotalCostUSD, time.Since(scorerStart))
 		log.Printf("scorer: done for %s (score: %d/100, $%.4f)", req.PRURL, score.Overall, scoreResp.TotalCostUSD)
 	}
 
 	dmUser(api, notifyUserID, "Merging reviews...")
 	log.Printf("merger: starting for %s", req.PRURL)
+	mergerStart := time.Now()
 	merged, mergeResp, err := runMerger(ctx, allReviews, validated, req.Mode, req.SpecContent, req.AcknowledgedIssues)
 	if err != nil {
 		return "", nil, stats, err
 	}
 	stats.Add(mergeResp)
+	stats.AddAgent("merger", mergeResp.TotalCostUSD, time.Since(mergerStart))
 	log.Printf("merger: done for %s ($%.4f)", req.PRURL, mergeResp.TotalCostUSD)
 
 	if mergeResp.SessionID != "" {
