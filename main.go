@@ -41,7 +41,7 @@ const (
 	ModeQuick    ReviewMode = "quick"
 	ModeFinal    ReviewMode = "final"
 
-	agentMaxTurns = 6
+	agentMaxTurns = 10
 )
 
 type ReviewRequest struct {
