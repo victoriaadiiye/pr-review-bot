@@ -275,6 +275,7 @@ var (
 	jiraTicketPattern    = regexp.MustCompile(`\b[A-Z]{2,}-\d+\b`)
 	modePattern          = regexp.MustCompile(`--(initial|re-review|quick|final)\b`)
 	selfPattern          = regexp.MustCompile(`--self\b`)
+	testPattern          = regexp.MustCompile(`--test\b`)
 	specPattern          = regexp.MustCompile(`--spec\s+(\S+)`)
 	flagPattern          = regexp.MustCompile(`--([a-z][-a-z0-9]*)\b`)
 	previousScorePattern = regexp.MustCompile(`\*\*Quality Score: (\d+)/100\*\*`)
@@ -486,7 +487,7 @@ func runCLI(args []string) {
 	}
 	log.Printf("cli: diff fetched (%d chars, %d lines)", len(diff), diffLines(diff))
 
-	if flags["test"] {
+	if testPattern.MatchString(input) {
 		agents, _ := loadAgents()
 		filtered := filterAgents(agents, flags)
 		var names []string
@@ -822,7 +823,7 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 		return
 	}
 
-	if flags["test"] {
+	if testPattern.MatchString(ev.Text) {
 		model := os.Getenv("CLAUDE_MODEL")
 		if model == "" {
 			model = "claude-opus-4-6"
