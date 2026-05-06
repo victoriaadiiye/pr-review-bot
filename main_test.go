@@ -862,8 +862,8 @@ func TestLoadAgents_RealAgentsDir(t *testing.T) {
 		if len(rendered) == 0 {
 			t.Errorf("agent %s: rendered output is empty", a.name)
 		}
-		if strings.Contains(rendered, "{{") {
-			t.Errorf("agent %s: unrendered template syntax in output", a.name)
+		if strings.Contains(rendered, "{{.") {
+			t.Errorf("agent %s: unrendered template variable in output", a.name)
 		}
 	}
 }

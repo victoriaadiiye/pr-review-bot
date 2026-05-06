@@ -4,7 +4,7 @@
       "agents": ["correctness", "design", "go-expert", "og-qompass-pr-reviewer", "pragmatic", "qompass-pr-reviewer"]
     },
     "Qumulo/qatalyst": {
-      "agents": ["correctness", "go-expert", "pragmatic"]
+      "agents": ["architecture-reviewer", "cli-ux-reviewer", "correctness", "docs-keeper", "go-expert", "golang-pr-reviewer", "linux-hardware", "pragmatic", "qatalyst-qa-engineer"]
     }
   },
   "default": {
