@@ -47,6 +47,7 @@ type ReviewRequest struct {
 	PRURL              string
 	Owner              string
 	Repo               string
+	PRNum              string
 	Questions          string
 	Mode               ReviewMode
 	SelfReview         bool
@@ -607,6 +608,7 @@ func runCLI(args []string) {
 		PRURL:              prURL,
 		Owner:              owner,
 		Repo:               repo,
+		PRNum:              prNum,
 		Questions:          reviewQuestions,
 		Mode:               mode,
 		Flags:              flags,
@@ -1032,6 +1034,7 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 		PRURL:              prURL,
 		Owner:              owner,
 		Repo:               repo,
+		PRNum:              prNum,
 		Questions:          reviewQuestions,
 		Mode:               mode,
 		SelfReview:         selfReview,
@@ -1199,6 +1202,29 @@ func (c *RepoCache) FileContent(ctx context.Context, gitDir, ref, path string) (
 		return "", err
 	}
 	return string(out), nil
+}
+
+func (c *RepoCache) CreateWorktree(ctx context.Context, owner, repo, prNum string) (string, error) {
+	gd := c.gitDir(owner, repo)
+	tmpDir, err := os.MkdirTemp("", "pr-review-wt-*")
+	if err != nil {
+		return "", fmt.Errorf("create temp dir: %w", err)
+	}
+	ref := "refs/prs/" + prNum
+	cmd := exec.CommandContext(ctx, "git", "--git-dir", gd, "worktree", "add", "--detach", tmpDir, ref)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		os.RemoveAll(tmpDir)
+		return "", fmt.Errorf("create worktree: %s", string(out))
+	}
+	log.Printf("repo-cache: created worktree at %s for %s/%s#%s", tmpDir, owner, repo, prNum)
+	return tmpDir, nil
+}
+
+func (c *RepoCache) RemoveWorktree(ctx context.Context, owner, repo, wtDir string) {
+	gd := c.gitDir(owner, repo)
+	_ = exec.CommandContext(ctx, "git", "--git-dir", gd, "worktree", "remove", "--force", wtDir).Run()
+	os.RemoveAll(wtDir)
+	log.Printf("repo-cache: removed worktree %s", wtDir)
 }
 
 // --- Session Store ---
@@ -1750,6 +1776,17 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 	agents := filterAgentsByProject(allAgents, projCfg.agentsForRepo(req.Owner, req.Repo))
 	agents = filterAgents(agents, req.Flags)
 
+	agentWorkDir := ""
+	if req.PRNum != "" {
+		wt, wtErr := repoCache.CreateWorktree(ctx, req.Owner, req.Repo, req.PRNum)
+		if wtErr != nil {
+			log.Printf("worktree: failed, agents run without repo context: %v", wtErr)
+		} else {
+			agentWorkDir = wt
+			defer repoCache.RemoveWorktree(ctx, req.Owner, req.Repo, wt)
+		}
+	}
+
 	data := promptData{
 		ModePreamble: modePreamble(req.Mode),
 		PRURL:        req.PRURL,
@@ -1780,7 +1817,7 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 			prompt += scoreSuffix
 			log.Printf("agent %s: starting %s review for %s", agent.name, req.Mode, req.PRURL)
 			agentStart := time.Now()
-			text, resp, err := runClaude(ctx, prompt)
+			text, resp, err := runClaudeInDir(ctx, prompt, agentWorkDir)
 			agentDur := time.Since(agentStart)
 			if err != nil {
 				mu.Lock()
@@ -2217,10 +2254,21 @@ func questionsBlock(questions string) string {
 }
 
 func runClaude(ctx context.Context, prompt string) (string, claudeResponse, error) {
-	return runClaudeWithSession(ctx, prompt, "")
+	return runClaudeOpts(ctx, prompt, "", "")
+}
+
+func runClaudeInDir(ctx context.Context, prompt, workDir string) (string, claudeResponse, error) {
+	return runClaudeOpts(ctx, prompt, "", workDir)
 }
 
 func runClaudeWithSession(ctx context.Context, prompt, resumeSessionID string) (string, claudeResponse, error) {
+	return runClaudeOpts(ctx, prompt, resumeSessionID, "")
+}
+
+func runClaudeOpts(ctx context.Context, prompt, resumeSessionID, workDir string) (string, claudeResponse, error) {
+	if workDir == "" {
+		workDir = os.TempDir()
+	}
 	model := os.Getenv("CLAUDE_MODEL")
 	if model == "" {
 		model = "claude-opus-4-6"
@@ -2230,7 +2278,7 @@ func runClaudeWithSession(ctx context.Context, prompt, resumeSessionID string) (
 		args = append(args, "--resume", resumeSessionID)
 	}
 	cmd := exec.CommandContext(ctx, "claude", args...)
-	cmd.Dir = os.TempDir()
+	cmd.Dir = workDir
 	cmd.Stdin = strings.NewReader(prompt)
 	out, err := cmd.Output()
 	if err != nil {
