@@ -831,7 +831,6 @@ func TestLoadAgents_RealAgentsDir(t *testing.T) {
 
 	wantNames := map[string]bool{
 		"correctness": false,
-		"design":      false,
 		"go-expert":   false,
 		"pragmatic":   false,
 	}
