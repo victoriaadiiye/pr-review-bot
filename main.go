@@ -2328,28 +2328,29 @@ func runClaudeOpts(ctx context.Context, prompt, resumeSessionID, workDir string,
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	err := cmd.Run()
+	runErr := cmd.Run()
 	out := []byte(stdout.String())
-	if err != nil {
+
+	var resp claudeResponse
+	if jsonErr := json.Unmarshal(out, &resp); jsonErr == nil {
+		if resp.IsError && resp.Result == "" {
+			return "", resp, fmt.Errorf("claude returned error: %s", resp.Result)
+		}
+		return strings.TrimSpace(resp.Result), resp, nil
+	}
+
+	if runErr != nil {
 		errMsg := strings.TrimSpace(stderr.String())
 		if errMsg == "" {
 			errMsg = strings.TrimSpace(stdout.String())
 		}
 		if errMsg == "" {
-			errMsg = err.Error()
+			errMsg = runErr.Error()
 		}
 		return "", claudeResponse{}, fmt.Errorf("claude CLI: %s", errMsg)
 	}
 
-	var resp claudeResponse
-	if err := json.Unmarshal(out, &resp); err != nil {
-		return strings.TrimSpace(string(out)), claudeResponse{}, nil
-	}
-	if resp.IsError {
-		return "", claudeResponse{}, fmt.Errorf("claude returned error: %s", resp.Result)
-	}
-
-	return strings.TrimSpace(resp.Result), resp, nil
+	return strings.TrimSpace(string(out)), claudeResponse{}, nil
 }
 
 func postGitHubComment(owner, repo, prNum, review string) error {
