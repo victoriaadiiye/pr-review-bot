@@ -1,0 +1,13 @@
+{
+  "projects": {
+    "Qumulo/qompass": {
+      "agents": ["correctness", "design", "go-expert", "pragmatic"]
+    },
+    "Qumulo/qatalyst": {
+      "agents": ["correctness", "go-expert", "pragmatic"]
+    }
+  },
+  "default": {
+    "agents": ["correctness", "design", "go-expert", "pragmatic"]
+  }
+}

@@ -1302,3 +1302,254 @@ func TestParseFlags_NoGitHubNotInFlags(t *testing.T) {
 		t.Error("--no-github should not appear in agent flags")
 	}
 }
+
+func TestLoadProjectsConfig_ValidFile(t *testing.T) {
+	dir := t.TempDir()
+	old := projectsConfigPath
+	projectsConfigPath = filepath.Join(dir, "projects.json")
+	defer func() { projectsConfigPath = old }()
+
+	os.WriteFile(projectsConfigPath, []byte(`{
+		"projects": {
+			"Qumulo/qompass": {"agents": ["correctness", "go-expert"]},
+			"Qumulo/qatalyst": {"agents": ["correctness"]}
+		},
+		"default": {"agents": ["correctness", "design"]}
+	}`), 0o644)
+
+	cfg, err := loadProjectsConfig()
+	if err != nil {
+		t.Fatalf("loadProjectsConfig: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected non-nil config")
+	}
+	if len(cfg.Projects) != 2 {
+		t.Errorf("got %d projects, want 2", len(cfg.Projects))
+	}
+	if len(cfg.Default.Agents) != 2 {
+		t.Errorf("got %d default agents, want 2", len(cfg.Default.Agents))
+	}
+}
+
+func TestLoadProjectsConfig_MissingFile(t *testing.T) {
+	old := projectsConfigPath
+	projectsConfigPath = "/nonexistent/projects.json"
+	defer func() { projectsConfigPath = old }()
+
+	cfg, err := loadProjectsConfig()
+	if err != nil {
+		t.Fatalf("expected nil error for missing file, got: %v", err)
+	}
+	if cfg != nil {
+		t.Error("expected nil config for missing file")
+	}
+}
+
+func TestLoadProjectsConfig_InvalidJSON(t *testing.T) {
+	dir := t.TempDir()
+	old := projectsConfigPath
+	projectsConfigPath = filepath.Join(dir, "projects.json")
+	defer func() { projectsConfigPath = old }()
+
+	os.WriteFile(projectsConfigPath, []byte(`{not valid json`), 0o644)
+
+	_, err := loadProjectsConfig()
+	if err == nil {
+		t.Fatal("expected error for invalid JSON")
+	}
+	if !strings.Contains(err.Error(), "parse projects config") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestAgentsForRepo_ExactMatch(t *testing.T) {
+	cfg := &ProjectsConfig{
+		Projects: map[string]ProjectAgentConfig{
+			"Qumulo/qompass":   {Agents: []string{"correctness", "go-expert"}},
+			"Qumulo/qatalyst":  {Agents: []string{"correctness"}},
+		},
+		Default: ProjectAgentConfig{Agents: []string{"correctness", "design"}},
+	}
+
+	got := cfg.agentsForRepo("Qumulo", "qompass")
+	if len(got) != 2 || got[0] != "correctness" || got[1] != "go-expert" {
+		t.Errorf("qompass agents = %v, want [correctness go-expert]", got)
+	}
+
+	got = cfg.agentsForRepo("Qumulo", "qatalyst")
+	if len(got) != 1 || got[0] != "correctness" {
+		t.Errorf("qatalyst agents = %v, want [correctness]", got)
+	}
+}
+
+func TestAgentsForRepo_CaseInsensitive(t *testing.T) {
+	cfg := &ProjectsConfig{
+		Projects: map[string]ProjectAgentConfig{
+			"Qumulo/qompass": {Agents: []string{"correctness", "go-expert"}},
+		},
+		Default: ProjectAgentConfig{Agents: []string{"design"}},
+	}
+
+	got := cfg.agentsForRepo("qumulo", "QOMPASS")
+	if len(got) != 2 {
+		t.Errorf("case-insensitive match failed: got %v", got)
+	}
+}
+
+func TestAgentsForRepo_FallsBackToDefault(t *testing.T) {
+	cfg := &ProjectsConfig{
+		Projects: map[string]ProjectAgentConfig{
+			"Qumulo/qompass": {Agents: []string{"correctness"}},
+		},
+		Default: ProjectAgentConfig{Agents: []string{"design", "pragmatic"}},
+	}
+
+	got := cfg.agentsForRepo("SomeOrg", "some-repo")
+	if len(got) != 2 || got[0] != "design" || got[1] != "pragmatic" {
+		t.Errorf("default fallback = %v, want [design pragmatic]", got)
+	}
+}
+
+func TestAgentsForRepo_NilConfig(t *testing.T) {
+	var cfg *ProjectsConfig
+	got := cfg.agentsForRepo("Qumulo", "qompass")
+	if got != nil {
+		t.Errorf("nil config should return nil, got %v", got)
+	}
+}
+
+func TestAgentsForRepo_NoDefaultNoMatch(t *testing.T) {
+	cfg := &ProjectsConfig{
+		Projects: map[string]ProjectAgentConfig{
+			"Qumulo/qompass": {Agents: []string{"correctness"}},
+		},
+	}
+
+	got := cfg.agentsForRepo("Other", "repo")
+	if got != nil {
+		t.Errorf("no default + no match should return nil, got %v", got)
+	}
+}
+
+func TestFilterAgentsByProject(t *testing.T) {
+	agents := []agentFile{
+		{name: "correctness"},
+		{name: "design"},
+		{name: "go-expert"},
+		{name: "pragmatic"},
+		{name: "necessity", flag: "bare-necessities"},
+	}
+
+	t.Run("nil allowed — returns all", func(t *testing.T) {
+		got := filterAgentsByProject(agents, nil)
+		if len(got) != 5 {
+			t.Errorf("got %d agents, want 5", len(got))
+		}
+	})
+
+	t.Run("empty allowed — returns all", func(t *testing.T) {
+		got := filterAgentsByProject(agents, []string{})
+		if len(got) != 5 {
+			t.Errorf("got %d agents, want 5", len(got))
+		}
+	})
+
+	t.Run("subset — filters correctly", func(t *testing.T) {
+		got := filterAgentsByProject(agents, []string{"correctness", "go-expert"})
+		if len(got) != 2 {
+			t.Fatalf("got %d agents, want 2", len(got))
+		}
+		if got[0].name != "correctness" || got[1].name != "go-expert" {
+			t.Errorf("got %s, %s — want correctness, go-expert", got[0].name, got[1].name)
+		}
+	})
+
+	t.Run("includes flagged agent if in allowed list", func(t *testing.T) {
+		got := filterAgentsByProject(agents, []string{"correctness", "necessity"})
+		if len(got) != 2 {
+			t.Fatalf("got %d agents, want 2", len(got))
+		}
+		if got[1].name != "necessity" {
+			t.Errorf("got %s, want necessity", got[1].name)
+		}
+	})
+
+	t.Run("nonexistent agent in allowed — ignored", func(t *testing.T) {
+		got := filterAgentsByProject(agents, []string{"correctness", "nonexistent"})
+		if len(got) != 1 {
+			t.Fatalf("got %d agents, want 1", len(got))
+		}
+	})
+}
+
+func TestFilterAgentsByProject_ThenFilterAgents(t *testing.T) {
+	agents := []agentFile{
+		{name: "correctness"},
+		{name: "design"},
+		{name: "go-expert"},
+		{name: "necessity", flag: "bare-necessities"},
+	}
+
+	projected := filterAgentsByProject(agents, []string{"correctness", "go-expert", "necessity"})
+	if len(projected) != 3 {
+		t.Fatalf("project filter: got %d, want 3", len(projected))
+	}
+
+	withoutFlag := filterAgents(projected, map[string]bool{})
+	if len(withoutFlag) != 2 {
+		t.Fatalf("flag filter (no flag): got %d, want 2", len(withoutFlag))
+	}
+	for _, a := range withoutFlag {
+		if a.name == "necessity" {
+			t.Error("necessity should be excluded without flag")
+		}
+	}
+
+	withFlag := filterAgents(projected, map[string]bool{"bare-necessities": true})
+	if len(withFlag) != 3 {
+		t.Fatalf("flag filter (with flag): got %d, want 3", len(withFlag))
+	}
+}
+
+func TestLoadProjectsConfig_RealFile(t *testing.T) {
+	old := projectsConfigPath
+	projectsConfigPath = "projects.json"
+	defer func() { projectsConfigPath = old }()
+
+	cfg, err := loadProjectsConfig()
+	if err != nil {
+		t.Fatalf("loadProjectsConfig on real file: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected non-nil config from projects.json")
+	}
+
+	qompass := cfg.agentsForRepo("Qumulo", "qompass")
+	if len(qompass) == 0 {
+		t.Error("expected agents for Qumulo/qompass")
+	}
+
+	qatalyst := cfg.agentsForRepo("Qumulo", "qatalyst")
+	if len(qatalyst) == 0 {
+		t.Error("expected agents for Qumulo/qatalyst")
+	}
+
+	dflt := cfg.agentsForRepo("unknown", "repo")
+	if len(dflt) == 0 {
+		t.Error("expected default agents for unknown repo")
+	}
+
+	if len(qompass) == len(qatalyst) {
+		allSame := true
+		for i := range qompass {
+			if qompass[i] != qatalyst[i] {
+				allSame = false
+				break
+			}
+		}
+		if allSame {
+			t.Error("qompass and qatalyst should have different agent configs")
+		}
+	}
+}

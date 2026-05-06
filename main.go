@@ -45,6 +45,8 @@ const (
 type ReviewRequest struct {
 	Diff               string
 	PRURL              string
+	Owner              string
+	Repo               string
 	Questions          string
 	Mode               ReviewMode
 	SelfReview         bool
@@ -157,6 +159,65 @@ type promptData struct {
 }
 
 var agentsDir = "agents"
+
+type ProjectAgentConfig struct {
+	Agents []string `json:"agents"`
+}
+
+type ProjectsConfig struct {
+	Projects map[string]ProjectAgentConfig `json:"projects"`
+	Default  ProjectAgentConfig            `json:"default"`
+}
+
+var projectsConfigPath = "projects.json"
+
+func loadProjectsConfig() (*ProjectsConfig, error) {
+	data, err := os.ReadFile(projectsConfigPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read projects config: %w", err)
+	}
+	var cfg ProjectsConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parse projects config: %w", err)
+	}
+	return &cfg, nil
+}
+
+func (cfg *ProjectsConfig) agentsForRepo(owner, repo string) []string {
+	if cfg == nil {
+		return nil
+	}
+	key := owner + "/" + repo
+	for pattern, pc := range cfg.Projects {
+		if strings.EqualFold(pattern, key) {
+			return pc.Agents
+		}
+	}
+	if len(cfg.Default.Agents) > 0 {
+		return cfg.Default.Agents
+	}
+	return nil
+}
+
+func filterAgentsByProject(agents []agentFile, allowed []string) []agentFile {
+	if len(allowed) == 0 {
+		return agents
+	}
+	set := make(map[string]bool, len(allowed))
+	for _, name := range allowed {
+		set[name] = true
+	}
+	var filtered []agentFile
+	for _, a := range agents {
+		if set[a.name] {
+			filtered = append(filtered, a)
+		}
+	}
+	return filtered
+}
 
 func loadAgents() ([]agentFile, error) {
 	entries, err := os.ReadDir(agentsDir)
@@ -494,7 +555,9 @@ func runCLI(args []string) {
 
 	if testPattern.MatchString(input) {
 		agents, _ := loadAgents()
-		filtered := filterAgents(agents, flags)
+		projCfg, _ := loadProjectsConfig()
+		filtered := filterAgentsByProject(agents, projCfg.agentsForRepo(owner, repo))
+		filtered = filterAgents(filtered, flags)
 		var names []string
 		for _, a := range filtered {
 			names = append(names, a.name)
@@ -542,6 +605,8 @@ func runCLI(args []string) {
 	req := ReviewRequest{
 		Diff:               diff,
 		PRURL:              prURL,
+		Owner:              owner,
+		Repo:               repo,
 		Questions:          reviewQuestions,
 		Mode:               mode,
 		Flags:              flags,
@@ -839,7 +904,9 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 			model = "claude-opus-4-6"
 		}
 		agents, _ := loadAgents()
-		filtered := filterAgents(agents, flags)
+		projCfg, _ := loadProjectsConfig()
+		filtered := filterAgentsByProject(agents, projCfg.agentsForRepo(owner, repo))
+		filtered = filterAgents(filtered, flags)
 		var agentNames []string
 		for _, a := range filtered {
 			agentNames = append(agentNames, a.name)
@@ -952,7 +1019,9 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 			agents, agentErr := loadAgents()
 			agentCount := 0
 			if agentErr == nil {
-				agentCount = len(filterAgents(agents, flags))
+				projCfg, _ := loadProjectsConfig()
+				filtered := filterAgentsByProject(agents, projCfg.agentsForRepo(owner, repo))
+				agentCount = len(filterAgents(filtered, flags))
 			}
 			dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Launching %d agent(s) in %s mode...", len(diff), agentCount, mode))
 		}
@@ -961,6 +1030,8 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 	req := ReviewRequest{
 		Diff:               diff,
 		PRURL:              prURL,
+		Owner:              owner,
+		Repo:               repo,
 		Questions:          reviewQuestions,
 		Mode:               mode,
 		SelfReview:         selfReview,
@@ -1641,7 +1712,12 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 	if err != nil {
 		return "", nil, stats, fmt.Errorf("load agents: %w", err)
 	}
-	agents := filterAgents(allAgents, req.Flags)
+	projCfg, cfgErr := loadProjectsConfig()
+	if cfgErr != nil {
+		log.Printf("warning: %v — using all agents", cfgErr)
+	}
+	agents := filterAgentsByProject(allAgents, projCfg.agentsForRepo(req.Owner, req.Repo))
+	agents = filterAgents(agents, req.Flags)
 
 	data := promptData{
 		ModePreamble: modePreamble(req.Mode),
