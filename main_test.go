@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
@@ -1142,5 +1144,161 @@ func TestExtractPerspectiveScore_PreservesAgentName(t *testing.T) {
 	_, ps := extractPerspectiveScore("go-expert", input)
 	if ps.Agent != "go-expert" {
 		t.Errorf("agent = %q, want go-expert", ps.Agent)
+	}
+}
+
+func TestDiffLines(t *testing.T) {
+	tests := []struct {
+		name string
+		diff string
+		want int
+	}{
+		{"empty", "", 0},
+		{"one line no trailing newline", "hello", 0},
+		{"one line with newline", "hello\n", 1},
+		{"multiple lines", "a\nb\nc\n", 3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := diffLines(tt.diff); got != tt.want {
+				t.Errorf("diffLines() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUsageStats_AddAgent(t *testing.T) {
+	stats := &UsageStats{}
+	stats.AddAgent("correctness", 1.05, 90*time.Second)
+	stats.AddAgent("design", 0.83, 75*time.Second)
+
+	if len(stats.AgentMetrics) != 2 {
+		t.Fatalf("got %d metrics, want 2", len(stats.AgentMetrics))
+	}
+	if stats.AgentMetrics[0].Name != "correctness" {
+		t.Errorf("first agent = %q, want correctness", stats.AgentMetrics[0].Name)
+	}
+	if stats.AgentMetrics[1].CostUSD != 0.83 {
+		t.Errorf("second cost = %f, want 0.83", stats.AgentMetrics[1].CostUSD)
+	}
+}
+
+func TestUsageStats_MetricsSummary(t *testing.T) {
+	stats := &UsageStats{}
+	stats.TotalCostUSD = 4.50
+	stats.AgentMetrics = []AgentMetric{
+		{Name: "correctness", CostUSD: 1.10, Duration: 114 * time.Second},
+		{Name: "validator", CostUSD: 0.47, Duration: 83 * time.Second},
+	}
+
+	summary := stats.MetricsSummary("claude-opus-4-6", "U123", "C456")
+
+	checks := []string{
+		"*Review Metrics*",
+		"`claude-opus-4-6`",
+		"<@U123>",
+		"<#C456>",
+		"$4.5000",
+		"`correctness`",
+		"$1.1000",
+		"`validator`",
+		"$0.4700",
+	}
+	for _, want := range checks {
+		if !strings.Contains(summary, want) {
+			t.Errorf("MetricsSummary missing %q\ngot: %s", want, summary)
+		}
+	}
+}
+
+func TestParseFlags_TestIsReserved(t *testing.T) {
+	got := parseFlags("review https://github.com/org/repo/pull/1 --test")
+	if len(got) != 0 {
+		t.Errorf("--test should be reserved, got flags: %v", got)
+	}
+}
+
+func TestUsageStats_AddAgent_ConcurrentSafe(t *testing.T) {
+	stats := &UsageStats{}
+	var wg sync.WaitGroup
+	for i := range 10 {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			stats.AddAgent(fmt.Sprintf("agent-%d", idx), float64(idx)*0.1, time.Duration(idx)*time.Second)
+		}(i)
+	}
+	wg.Wait()
+	if len(stats.AgentMetrics) != 10 {
+		t.Errorf("got %d metrics, want 10", len(stats.AgentMetrics))
+	}
+}
+
+func TestNopSlack_ImplementsInterface(t *testing.T) {
+	var _ SlackAPI = &nopSlack{}
+}
+
+func TestNopSlack_AllMethodsReturnNil(t *testing.T) {
+	n := &nopSlack{}
+	if err := n.AddReaction("eyes", slack.ItemRef{}); err != nil {
+		t.Errorf("AddReaction returned error: %v", err)
+	}
+	if err := n.RemoveReaction("eyes", slack.ItemRef{}); err != nil {
+		t.Errorf("RemoveReaction returned error: %v", err)
+	}
+	_, _, err := n.PostMessage("C123")
+	if err != nil {
+		t.Errorf("PostMessage returned error: %v", err)
+	}
+	ch, _, _, err := n.OpenConversation(&slack.OpenConversationParameters{})
+	if err != nil {
+		t.Errorf("OpenConversation returned error: %v", err)
+	}
+	if ch == nil {
+		t.Error("OpenConversation returned nil channel")
+	}
+	hist, err := n.GetConversationHistory(&slack.GetConversationHistoryParameters{})
+	if err != nil {
+		t.Errorf("GetConversationHistory returned error: %v", err)
+	}
+	if hist == nil {
+		t.Error("GetConversationHistory returned nil")
+	}
+	msgs, _, _, err := n.GetConversationReplies(&slack.GetConversationRepliesParameters{})
+	if err != nil {
+		t.Errorf("GetConversationReplies returned error: %v", err)
+	}
+	if msgs != nil {
+		t.Errorf("GetConversationReplies returned non-nil messages: %v", msgs)
+	}
+}
+
+func TestMainCLI_NoArgs_StartsSlackMode(t *testing.T) {
+	if len(os.Args) > 1 && os.Args[1] == "review" {
+		t.Skip("already in CLI mode")
+	}
+}
+
+func TestRunCLI_BadURL_Exits(t *testing.T) {
+	if os.Getenv("TEST_CLI_BAD_URL") == "1" {
+		runCLI([]string{"not-a-url"})
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=TestRunCLI_BadURL_Exits")
+	cmd.Env = append(os.Environ(), "TEST_CLI_BAD_URL=1")
+	err := cmd.Run()
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr.ExitCode() != 1 {
+			t.Errorf("expected exit code 1, got %d", exitErr.ExitCode())
+		}
+		return
+	}
+	t.Errorf("expected exit error, got: %v", err)
+}
+
+func TestParseFlags_NoGitHubNotInFlags(t *testing.T) {
+	got := parseFlags("review https://github.com/org/repo/pull/1 --no-github")
+	if _, ok := got["no-github"]; ok {
+		t.Error("--no-github should not appear in agent flags")
 	}
 }

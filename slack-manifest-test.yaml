@@ -2,28 +2,24 @@ _metadata:
   major_version: 1
 
 display_information:
-  name: PR Review Bot
-  description: Reviews PRs posted in channels
+  name: PR Review Bot (Test)
+  description: Test instance — single channel only
 
 features:
   bot_user:
-    display_name: pr-review-bot
+    display_name: pr-review-bot-test
     always_online: true
 
 oauth_config:
   scopes:
     bot:
       - app_mentions:read
-      - channels:history
-      - channels:read
       - groups:history
-      - groups:read
       - chat:write
-      - im:write
       - reactions:read
       - reactions:write
+      - im:write
     user:
-      - channels:history
       - groups:history
       - reactions:read
 
@@ -32,11 +28,8 @@ settings:
     bot_events:
       - app_mention
     user_events:
-      - message.channels
       - message.groups
       - reaction_added
-  interactivity:
-    is_enabled: true
-  org_deploy_enabled: false
   socket_mode_enabled: true
+  org_deploy_enabled: false
   token_rotation_enabled: false
