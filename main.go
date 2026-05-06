@@ -1805,7 +1805,7 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 	perspectiveScores := make([]PerspectiveScore, len(agents))
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	var firstErr error
+	var agentFailures int
 
 	for i, a := range agents {
 		wg.Add(1)
@@ -1813,10 +1813,9 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 			defer wg.Done()
 			prompt, renderErr := renderAgent(agent, data)
 			if renderErr != nil {
+				log.Printf("agent %s: render failed: %v", agent.name, renderErr)
 				mu.Lock()
-				if firstErr == nil {
-					firstErr = renderErr
-				}
+				agentFailures++
 				mu.Unlock()
 				return
 			}
@@ -1830,12 +1829,14 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 			text, resp, err := runClaudeInDir(ctx, prompt, agentWorkDir, agent.model, agentMaxTurns)
 			agentDur := time.Since(agentStart)
 			if err != nil {
+				log.Printf("agent %s: failed for %s: %v", agent.name, req.PRURL, err)
 				mu.Lock()
-				if firstErr == nil {
-					firstErr = fmt.Errorf("agent %s failed: %w", agent.name, err)
-				}
+				agentFailures++
 				mu.Unlock()
 				return
+			}
+			if resp.NumTurns >= agentMaxTurns {
+				log.Printf("agent %s: hit max turns (%d) for %s — output may be truncated", agent.name, agentMaxTurns, req.PRURL)
 			}
 			stats.Add(resp)
 			stats.AddAgent(agent.name, resp.TotalCostUSD, agentDur)
@@ -1849,12 +1850,25 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 	}
 	wg.Wait()
 
-	if firstErr != nil {
-		return "", nil, stats, firstErr
+	successfulReviews := 0
+	var filteredReviews []string
+	var filteredScores []PerspectiveScore
+	for i := range agents {
+		if reviews[i] != "" {
+			filteredReviews = append(filteredReviews, reviews[i])
+			filteredScores = append(filteredScores, perspectiveScores[i])
+			successfulReviews++
+		}
+	}
+	if successfulReviews == 0 {
+		return "", nil, stats, fmt.Errorf("all %d agents failed", len(agents))
+	}
+	if agentFailures > 0 {
+		log.Printf("warning: %d/%d agents failed, continuing with %d", agentFailures, len(agents), successfulReviews)
 	}
 
-	dmUser(api, notifyUserID, fmt.Sprintf("All %d agents done. Running validator...", len(agents)))
-	allReviews := strings.Join(reviews, "\n\n---\n\n")
+	dmUser(api, notifyUserID, fmt.Sprintf("%d/%d agents done. Running validator...", successfulReviews, len(agents)))
+	allReviews := strings.Join(filteredReviews, "\n\n---\n\n")
 
 	log.Printf("validator: starting for %s", req.PRURL)
 	valStart := time.Now()
@@ -1897,7 +1911,7 @@ Be concise. Output a validation report.
 		defer scoreMerge.Done()
 		log.Printf("scorer: starting for %s", req.PRURL)
 		scorerStart := time.Now()
-		score, scoreResp, scoreErr = runScorer(ctx, perspectiveScores, req.Diff, req.SpecContent, req.AcknowledgedIssues)
+		score, scoreResp, scoreErr = runScorer(ctx, filteredScores, req.Diff, req.SpecContent, req.AcknowledgedIssues)
 		if scoreErr != nil {
 			log.Printf("scorer: failed for %s: %v", req.PRURL, scoreErr)
 		} else {
