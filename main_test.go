@@ -783,17 +783,22 @@ func TestParseMode(t *testing.T) {
 }
 
 func TestModePreamble(t *testing.T) {
-	if modePreamble(ModeInitial) != "" {
-		t.Error("initial mode should have empty preamble")
+	if !strings.Contains(modePreamble(ModeInitial), "Only raise issues") {
+		t.Error("initial mode should contain diff scope rule")
 	}
-	if modePreamble(ModeQuick) != "" {
-		t.Error("quick mode should have empty preamble")
+	if !strings.Contains(modePreamble(ModeQuick), "Only raise issues") {
+		t.Error("quick mode should contain diff scope rule")
 	}
 	if !strings.Contains(modePreamble(ModeReReview), "RE-REVIEW") {
 		t.Error("re-review preamble should contain RE-REVIEW")
 	}
 	if !strings.Contains(modePreamble(ModeFinal), "FINAL REVIEW") {
 		t.Error("final preamble should contain FINAL REVIEW")
+	}
+	for _, mode := range []ReviewMode{ModeInitial, ModeQuick, ModeReReview, ModeFinal} {
+		if !strings.Contains(modePreamble(mode), "Only raise issues") {
+			t.Errorf("mode %q missing diff scope rule", mode)
+		}
 	}
 }
 

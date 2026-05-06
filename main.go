@@ -1302,10 +1302,41 @@ func splitDiffByFile(fullDiff string) map[string]string {
 	return result
 }
 
+func nonMergeFiles(ctx context.Context, gitDir, mergeBase, prRef string) ([]string, error) {
+	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir,
+		"log", "--no-merges", "--name-only", "--format=",
+		mergeBase+".."+prRef)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("non-merge files: %w", err)
+	}
+	seen := make(map[string]bool)
+	var files []string
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" && !seen[line] {
+			seen[line] = true
+			files = append(files, line)
+		}
+	}
+	return files, nil
+}
+
 func buildSmartDiff(ctx context.Context, gitDir, mergeBase, prRef string) (string, error) {
 	const maxChars = 120_000
 
-	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "diff", mergeBase, prRef)
+	files, filesErr := nonMergeFiles(ctx, gitDir, mergeBase, prRef)
+	if filesErr != nil {
+		log.Printf("repo-cache: non-merge files failed, falling back to full diff: %v", filesErr)
+	}
+
+	args := []string{"--git-dir", gitDir, "diff", mergeBase, prRef}
+	if filesErr == nil && len(files) > 0 {
+		args = append(args, "--")
+		args = append(args, files...)
+		log.Printf("repo-cache: scoping diff to %d file(s) from non-merge commits", len(files))
+	}
+	cmd := exec.CommandContext(ctx, "git", args...)
 	out, err := cmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -1925,10 +1956,15 @@ Be specific about what changed. Reference files and lines.
 	return text, resp, nil
 }
 
+const diffScopeRule = `IMPORTANT: Only raise issues about code that appears in the diff below. Do not speculate about code outside the diff, do not flag pre-existing issues in unchanged code, and do not hallucinate file contents you cannot see. Every finding must quote the exact code from the diff. If the diff is clean, say so.
+
+`
+
 func modePreamble(mode ReviewMode) string {
+	base := diffScopeRule
 	switch mode {
 	case ModeReReview:
-		return `NOTE: This is a RE-REVIEW. This PR has been reviewed before by an automated system. Focus on:
+		return base + `NOTE: This is a RE-REVIEW. This PR has been reviewed before by an automated system. Focus on:
 - Whether previously identified issues have been addressed
 - Any new issues introduced since the last review
 - Remaining concerns that still need attention
@@ -1936,14 +1972,14 @@ Do not repeat feedback that has clearly been addressed.
 
 `
 	case ModeFinal:
-		return `NOTE: This is a FINAL REVIEW before merge. Err on the side of approval:
+		return base + `NOTE: This is a FINAL REVIEW before merge. Err on the side of approval:
 - Only flag truly critical/blocking issues (bugs, security, data loss)
 - Mention nice-to-haves and nit picks as OPTIONAL/non-blocking
 - If the code is generally sound and functional, recommend approval
 
 `
 	default:
-		return ""
+		return base
 	}
 }
 
@@ -2194,6 +2230,7 @@ func runClaudeWithSession(ctx context.Context, prompt, resumeSessionID string) (
 		args = append(args, "--resume", resumeSessionID)
 	}
 	cmd := exec.CommandContext(ctx, "claude", args...)
+	cmd.Dir = os.TempDir()
 	cmd.Stdin = strings.NewReader(prompt)
 	out, err := cmd.Output()
 	if err != nil {
