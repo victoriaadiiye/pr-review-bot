@@ -93,6 +93,13 @@ type UsageStats struct {
 	TotalCacheRead    int64
 	AgentCalls        int
 	AgentMetrics      []AgentMetric
+	Warnings          []string
+}
+
+func (u *UsageStats) AddWarning(msg string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.Warnings = append(u.Warnings, msg)
 }
 
 func (u *UsageStats) Add(resp claudeResponse) {
@@ -132,6 +139,9 @@ func (u *UsageStats) MetricsSummary(model, triggerUser, channelID string) string
 	b.WriteString("> *Agent breakdown:*\n")
 	for _, m := range u.AgentMetrics {
 		b.WriteString(fmt.Sprintf(">   • `%s` — $%.4f, %s\n", m.Name, m.CostUSD, m.Duration.Round(time.Second)))
+	}
+	for _, w := range u.Warnings {
+		b.WriteString(fmt.Sprintf("> :warning: %s\n", w))
 	}
 	return b.String()
 }
@@ -1830,6 +1840,7 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 			agentDur := time.Since(agentStart)
 			if err != nil {
 				log.Printf("agent %s: failed for %s: %v", agent.name, req.PRURL, err)
+				stats.AddWarning(fmt.Sprintf("`%s` failed: %v", agent.name, err))
 				mu.Lock()
 				agentFailures++
 				mu.Unlock()
@@ -1837,6 +1848,7 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 			}
 			if resp.NumTurns >= agentMaxTurns {
 				log.Printf("agent %s: hit max turns (%d) for %s — output may be truncated", agent.name, agentMaxTurns, req.PRURL)
+				stats.AddWarning(fmt.Sprintf("`%s` hit max turns (%d) — output may be incomplete", agent.name, agentMaxTurns))
 			}
 			stats.Add(resp)
 			stats.AddAgent(agent.name, resp.TotalCostUSD, agentDur)
@@ -2313,12 +2325,20 @@ func runClaudeOpts(ctx context.Context, prompt, resumeSessionID, workDir string,
 	cmd := exec.CommandContext(ctx, "claude", args...)
 	cmd.Dir = workDir
 	cmd.Stdin = strings.NewReader(prompt)
-	out, err := cmd.Output()
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	out := []byte(stdout.String())
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return "", claudeResponse{}, fmt.Errorf("claude CLI: %s", string(exitErr.Stderr))
+		errMsg := strings.TrimSpace(stderr.String())
+		if errMsg == "" {
+			errMsg = strings.TrimSpace(stdout.String())
 		}
-		return "", claudeResponse{}, err
+		if errMsg == "" {
+			errMsg = err.Error()
+		}
+		return "", claudeResponse{}, fmt.Errorf("claude CLI: %s", errMsg)
 	}
 
 	var resp claudeResponse
