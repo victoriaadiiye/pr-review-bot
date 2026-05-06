@@ -473,6 +473,11 @@ func runCLI(args []string) {
 	flags := parseFlags(input)
 	noGitHub := strings.Contains(input, "--no-github")
 
+	if mode == ModeInitial && sessionStore.Get(prURL) != "" {
+		mode = ModeReReview
+		log.Printf("auto-re-review: found existing session for %s, upgrading to re-review", prURL)
+	}
+
 	model := os.Getenv("CLAUDE_MODEL")
 	if model == "" {
 		model = "claude-opus-4-6"
@@ -801,6 +806,11 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 	selfReview := selfPattern.MatchString(ev.Text)
 	jiraTicket := parseJiraTicket(ev.Text)
 	flags := parseFlags(ev.Text)
+
+	if mode == ModeInitial && sessionStore.Get(prURL) != "" {
+		mode = ModeReReview
+		log.Printf("auto-re-review: found existing session for %s, upgrading to re-review", prURL)
+	}
 
 	_ = api.AddReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 
