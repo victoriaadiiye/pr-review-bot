@@ -454,7 +454,156 @@ func handleReactionReview(api SlackAPI, rev *slackevents.ReactionAddedEvent, cha
 	}
 }
 
+func runCLI(args []string) {
+	_ = godotenv.Load()
+	repoCache = NewRepoCache()
+	sessionStore = NewSessionStore()
+
+	input := strings.Join(args, " ")
+	m := ghPRPattern.FindStringSubmatch(input)
+	if m == nil {
+		fmt.Fprintf(os.Stderr, "Usage: pr-review-bot review <github-pr-url> [--initial|--quick|--re-review|--final] [--test] [--bare-necessities] [--no-github]\n")
+		os.Exit(1)
+	}
+	owner, repo, prNum := m[1], m[2], m[3]
+	prURL := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, prNum)
+
+	mode := parseMode(input)
+	flags := parseFlags(input)
+	noGitHub := strings.Contains(input, "--no-github")
+
+	model := os.Getenv("CLAUDE_MODEL")
+	if model == "" {
+		model = "claude-opus-4-6"
+	}
+
+	ctx := context.Background()
+
+	log.Printf("cli: fetching diff for %s", prURL)
+	diff, err := fetchDiff(ctx, owner, repo, prNum)
+	if err != nil {
+		log.Fatalf("cli: failed to fetch diff: %v", err)
+	}
+	log.Printf("cli: diff fetched (%d chars, %d lines)", len(diff), diffLines(diff))
+
+	if flags["test"] {
+		agents, _ := loadAgents()
+		filtered := filterAgents(agents, flags)
+		var names []string
+		for _, a := range filtered {
+			names = append(names, a.name)
+		}
+
+		claudeStatus := "ok"
+		claudeStart := time.Now()
+		claudeCmd := exec.CommandContext(ctx, "claude", "--version")
+		claudeOut, claudeErr := claudeCmd.Output()
+		claudeLatency := time.Since(claudeStart).Round(time.Millisecond)
+		claudeVersion := strings.TrimSpace(string(claudeOut))
+		if claudeErr != nil {
+			claudeStatus = fmt.Sprintf("FAILED: %v", claudeErr)
+			claudeVersion = "unknown"
+		}
+
+		ghStatus := "ok"
+		ghStart := time.Now()
+		ghCmd := exec.CommandContext(ctx, "gh", "auth", "status")
+		if ghErr := ghCmd.Run(); ghErr != nil {
+			ghStatus = fmt.Sprintf("FAILED: %v", ghErr)
+		}
+		ghLatency := time.Since(ghStart).Round(time.Millisecond)
+
+		fmt.Printf("Test run for %s\n", prURL)
+		fmt.Printf("  Diff:       %d chars, %d lines\n", len(diff), diffLines(diff))
+		fmt.Printf("  Model:      %s\n", model)
+		fmt.Printf("  Mode:       %s\n", mode)
+		fmt.Printf("  Agents:     %s\n", strings.Join(names, ", "))
+		fmt.Printf("  Pipeline:   agents → validator → scorer → merger\n")
+		fmt.Printf("  Preflight:\n")
+		fmt.Printf("    claude:   %s (v%s, %s)\n", claudeStatus, claudeVersion, claudeLatency)
+		fmt.Printf("    gh:       %s (%s)\n", ghStatus, ghLatency)
+		fmt.Printf("    diff:     ok\n")
+		fmt.Printf("\nNo agents were run. Remove --test to run a full review.\n")
+		return
+	}
+
+	nopAPI := &nopSlack{}
+	reviewQuestions := os.Getenv("REVIEW_QUESTIONS")
+
+	previousReviews := fetchPRContext(ctx, owner, repo, prNum)
+	acknowledgedIssues := fetchAcknowledgedIssues(ctx, owner, repo, prNum)
+
+	req := ReviewRequest{
+		Diff:               diff,
+		PRURL:              prURL,
+		Questions:          reviewQuestions,
+		Mode:               mode,
+		Flags:              flags,
+		PreviousReviews:    previousReviews,
+		AcknowledgedIssues: acknowledgedIssues,
+	}
+
+	jiraTicket := parseJiraTicket(input)
+	if jiraTicket == "" {
+		if title := fetchPRTitle(ctx, owner, repo, prNum); title != "" {
+			if jm := jiraTicketPattern.FindString(title); jm != "" {
+				jiraTicket = jm
+			}
+		}
+	}
+	if jiraTicket != "" {
+		req.JiraTicket = jiraTicket
+		req.JiraContext = fetchJiraContext(jiraTicket)
+	}
+
+	log.Printf("cli: starting %s review of %s", mode, prURL)
+	review, score, stats, err := reviewWithClaude(ctx, nopAPI, "", req)
+	if err != nil {
+		log.Fatalf("cli: review failed: %v", err)
+	}
+
+	fmt.Println(review)
+	fmt.Fprintln(os.Stderr)
+	if score != nil {
+		fmt.Fprintf(os.Stderr, "Score: %d/100\n", score.Overall)
+	}
+	fmt.Fprintf(os.Stderr, "Usage: %s\n", stats)
+	fmt.Fprintf(os.Stderr, "%s", stats.MetricsSummary(model, "cli", "cli"))
+
+	if !noGitHub {
+		log.Printf("cli: posting review to GitHub %s", prURL)
+		if err := postGitHubComment(owner, repo, prNum, review); err != nil {
+			log.Fatalf("cli: failed to post to GitHub: %v", err)
+		}
+		log.Printf("cli: review posted to GitHub")
+	} else {
+		log.Printf("cli: --no-github flag set, skipping GitHub post")
+	}
+}
+
+type nopSlack struct{}
+
+func (n *nopSlack) AddReaction(string, slack.ItemRef) error                { return nil }
+func (n *nopSlack) RemoveReaction(string, slack.ItemRef) error             { return nil }
+func (n *nopSlack) PostMessage(string, ...slack.MsgOption) (string, string, error) {
+	return "", "", nil
+}
+func (n *nopSlack) OpenConversation(*slack.OpenConversationParameters) (*slack.Channel, bool, bool, error) {
+	return &slack.Channel{}, false, false, nil
+}
+func (n *nopSlack) GetConversationHistory(*slack.GetConversationHistoryParameters) (*slack.GetConversationHistoryResponse, error) {
+	return &slack.GetConversationHistoryResponse{}, nil
+}
+func (n *nopSlack) GetConversationReplies(*slack.GetConversationRepliesParameters) ([]slack.Message, bool, string, error) {
+	return nil, false, "", nil
+}
+
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "review" {
+		runCLI(os.Args[2:])
+		return
+	}
+
 	_ = godotenv.Load()
 	repoCache = NewRepoCache()
 	sessionStore = NewSessionStore()
@@ -612,7 +761,7 @@ func parseSpecPath(text string) string {
 func parseFlags(text string) map[string]bool {
 	reserved := map[string]bool{
 		"initial": true, "re-review": true, "quick": true, "final": true,
-		"self": true, "spec": true, "test": true,
+		"self": true, "spec": true, "test": true, "no-github": true,
 	}
 	flags := make(map[string]bool)
 	for _, m := range flagPattern.FindAllStringSubmatch(text, -1) {

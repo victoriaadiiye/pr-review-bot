@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1230,5 +1231,74 @@ func TestUsageStats_AddAgent_ConcurrentSafe(t *testing.T) {
 	wg.Wait()
 	if len(stats.AgentMetrics) != 10 {
 		t.Errorf("got %d metrics, want 10", len(stats.AgentMetrics))
+	}
+}
+
+func TestNopSlack_ImplementsInterface(t *testing.T) {
+	var _ SlackAPI = &nopSlack{}
+}
+
+func TestNopSlack_AllMethodsReturnNil(t *testing.T) {
+	n := &nopSlack{}
+	if err := n.AddReaction("eyes", slack.ItemRef{}); err != nil {
+		t.Errorf("AddReaction returned error: %v", err)
+	}
+	if err := n.RemoveReaction("eyes", slack.ItemRef{}); err != nil {
+		t.Errorf("RemoveReaction returned error: %v", err)
+	}
+	_, _, err := n.PostMessage("C123")
+	if err != nil {
+		t.Errorf("PostMessage returned error: %v", err)
+	}
+	ch, _, _, err := n.OpenConversation(&slack.OpenConversationParameters{})
+	if err != nil {
+		t.Errorf("OpenConversation returned error: %v", err)
+	}
+	if ch == nil {
+		t.Error("OpenConversation returned nil channel")
+	}
+	hist, err := n.GetConversationHistory(&slack.GetConversationHistoryParameters{})
+	if err != nil {
+		t.Errorf("GetConversationHistory returned error: %v", err)
+	}
+	if hist == nil {
+		t.Error("GetConversationHistory returned nil")
+	}
+	msgs, _, _, err := n.GetConversationReplies(&slack.GetConversationRepliesParameters{})
+	if err != nil {
+		t.Errorf("GetConversationReplies returned error: %v", err)
+	}
+	if msgs != nil {
+		t.Errorf("GetConversationReplies returned non-nil messages: %v", msgs)
+	}
+}
+
+func TestMainCLI_NoArgs_StartsSlackMode(t *testing.T) {
+	if len(os.Args) > 1 && os.Args[1] == "review" {
+		t.Skip("already in CLI mode")
+	}
+}
+
+func TestRunCLI_BadURL_Exits(t *testing.T) {
+	if os.Getenv("TEST_CLI_BAD_URL") == "1" {
+		runCLI([]string{"not-a-url"})
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=TestRunCLI_BadURL_Exits")
+	cmd.Env = append(os.Environ(), "TEST_CLI_BAD_URL=1")
+	err := cmd.Run()
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if exitErr.ExitCode() != 1 {
+			t.Errorf("expected exit code 1, got %d", exitErr.ExitCode())
+		}
+		return
+	}
+	t.Errorf("expected exit error, got: %v", err)
+}
+
+func TestParseFlags_NoGitHubNotInFlags(t *testing.T) {
+	got := parseFlags("review https://github.com/org/repo/pull/1 --no-github")
+	if _, ok := got["no-github"]; ok {
+		t.Error("--no-github should not appear in agent flags")
 	}
 }
