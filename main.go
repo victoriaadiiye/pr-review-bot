@@ -40,6 +40,8 @@ const (
 	ModeReReview ReviewMode = "re-review"
 	ModeQuick    ReviewMode = "quick"
 	ModeFinal    ReviewMode = "final"
+
+	agentMaxTurns = 6
 )
 
 type ReviewRequest struct {
@@ -148,6 +150,7 @@ func diffLines(diff string) int {
 type agentFile struct {
 	name     string
 	flag     string
+	model    string
 	template *template.Template
 }
 
@@ -237,7 +240,7 @@ func loadAgents() ([]agentFile, error) {
 		}
 		name := strings.TrimSuffix(e.Name(), ".md")
 		content := string(raw)
-		var flag string
+		var flag, model string
 		if strings.HasPrefix(content, "---\n") {
 			if end := strings.Index(content[4:], "\n---\n"); end >= 0 {
 				frontmatter := content[4 : 4+end]
@@ -246,6 +249,9 @@ func loadAgents() ([]agentFile, error) {
 					if strings.HasPrefix(line, "flag:") {
 						flag = strings.TrimSpace(strings.TrimPrefix(line, "flag:"))
 					}
+					if strings.HasPrefix(line, "model:") {
+						model = strings.TrimSpace(strings.TrimPrefix(line, "model:"))
+					}
 				}
 			}
 		}
@@ -253,7 +259,7 @@ func loadAgents() ([]agentFile, error) {
 		if err != nil {
 			return nil, fmt.Errorf("parse agent template %s: %w", path, err)
 		}
-		agents = append(agents, agentFile{name: name, flag: flag, template: tmpl})
+		agents = append(agents, agentFile{name: name, flag: flag, model: model, template: tmpl})
 	}
 	if len(agents) == 0 {
 		return nil, fmt.Errorf("no .md agent files found in %s", agentsDir)
@@ -1815,9 +1821,13 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 				return
 			}
 			prompt += scoreSuffix
-			log.Printf("agent %s: starting %s review for %s", agent.name, req.Mode, req.PRURL)
+			agentModel := agent.model
+			if agentModel == "" {
+				agentModel = "default"
+			}
+			log.Printf("agent %s: starting %s review for %s (model=%s, max-turns=%d)", agent.name, req.Mode, req.PRURL, agentModel, agentMaxTurns)
 			agentStart := time.Now()
-			text, resp, err := runClaudeInDir(ctx, prompt, agentWorkDir)
+			text, resp, err := runClaudeInDir(ctx, prompt, agentWorkDir, agent.model, agentMaxTurns)
 			agentDur := time.Since(agentStart)
 			if err != nil {
 				mu.Lock()
@@ -2254,26 +2264,35 @@ func questionsBlock(questions string) string {
 }
 
 func runClaude(ctx context.Context, prompt string) (string, claudeResponse, error) {
-	return runClaudeOpts(ctx, prompt, "", "")
+	return runClaudeOpts(ctx, prompt, "", "", 0)
 }
 
-func runClaudeInDir(ctx context.Context, prompt, workDir string) (string, claudeResponse, error) {
-	return runClaudeOpts(ctx, prompt, "", workDir)
+func runClaudeInDir(ctx context.Context, prompt, workDir, modelOverride string, maxTurns int) (string, claudeResponse, error) {
+	return runClaudeOpts(ctx, prompt, "", workDir, maxTurns, modelOverride)
 }
 
 func runClaudeWithSession(ctx context.Context, prompt, resumeSessionID string) (string, claudeResponse, error) {
-	return runClaudeOpts(ctx, prompt, resumeSessionID, "")
+	return runClaudeOpts(ctx, prompt, resumeSessionID, "", 0)
 }
 
-func runClaudeOpts(ctx context.Context, prompt, resumeSessionID, workDir string) (string, claudeResponse, error) {
+func runClaudeOpts(ctx context.Context, prompt, resumeSessionID, workDir string, maxTurns int, modelOverride ...string) (string, claudeResponse, error) {
 	if workDir == "" {
 		workDir = os.TempDir()
 	}
-	model := os.Getenv("CLAUDE_MODEL")
+	model := ""
+	if len(modelOverride) > 0 && modelOverride[0] != "" {
+		model = resolveModel(modelOverride[0])
+	}
+	if model == "" {
+		model = os.Getenv("CLAUDE_MODEL")
+	}
 	if model == "" {
 		model = "claude-opus-4-6"
 	}
 	args := []string{"-p", "Follow the instructions provided on stdin.", "--output-format", "json", "--model", model}
+	if maxTurns > 0 {
+		args = append(args, "--max-turns", strconv.Itoa(maxTurns))
+	}
 	if resumeSessionID != "" {
 		args = append(args, "--resume", resumeSessionID)
 	}
@@ -2360,4 +2379,17 @@ func capitalize(s string) string {
 		return s
 	}
 	return strings.ToUpper(s[:1]) + s[1:]
+}
+
+var modelAliases = map[string]string{
+	"opus":   "claude-opus-4-6",
+	"sonnet": "claude-sonnet-4-6",
+	"haiku":  "claude-haiku-4-5-20251001",
+}
+
+func resolveModel(name string) string {
+	if full, ok := modelAliases[name]; ok {
+		return full
+	}
+	return name
 }
