@@ -1,7 +1,7 @@
 {
   "projects": {
     "Qumulo/qompass": {
-      "agents": ["correctness", "design", "go-expert", "pragmatic"]
+      "agents": ["correctness", "design", "go-expert", "og-qompass-pr-reviewer", "pragmatic", "qompass-pr-reviewer"]
     },
     "Qumulo/qatalyst": {
       "agents": ["correctness", "go-expert", "pragmatic"]
