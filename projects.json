@@ -1,10 +1,10 @@
 {
   "projects": {
     "Qumulo/qompass": {
-      "agents": ["correctness", "go-expert", "pragmatic", "qompass-architecture-reviewer", "qompass-clickhouse-data-reviewer", "qompass-docs-keeper", "qompass-observability-domain", "qompass-pr-reviewer", "qompass-qa-engineer", "test-quality-reviewer"]
+      "agents": ["qompass-pr-reviewer", "qompass-architecture-reviewer", "qompass-clickhouse-data-reviewer", "qompass-observability-domain", "qompass-docs-keeper"]
     },
     "Qumulo/qatalyst": {
-      "agents": ["correctness", "go-expert", "pragmatic", "qatalyst-architecture-reviewer", "qatalyst-cli-ux-reviewer", "qatalyst-docs-keeper", "qatalyst-golang-pr-reviewer", "qatalyst-linux-hardware", "qatalyst-qa-engineer", "qatalyst-security-hardener", "test-quality-reviewer"]
+      "agents": ["qatalyst-golang-pr-reviewer", "qatalyst-architecture-reviewer", "qatalyst-cli-ux-reviewer", "qatalyst-linux-hardware", "qatalyst-security-hardener", "qatalyst-docs-keeper"]
     }
   },
   "default": {

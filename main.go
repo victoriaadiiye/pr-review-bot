@@ -1802,28 +1802,49 @@ Be concise. Output a validation report.
 	stats.AddAgent("validator", valResp.TotalCostUSD, time.Since(valStart))
 	log.Printf("validator: done for %s ($%.4f)", req.PRURL, valResp.TotalCostUSD)
 
-	dmUser(api, notifyUserID, "Validator done. Scoring...")
-	log.Printf("scorer: starting for %s", req.PRURL)
-	scorerStart := time.Now()
-	score, scoreResp, scoreErr := runScorer(ctx, perspectiveScores, req.Diff, req.SpecContent, req.AcknowledgedIssues)
-	if scoreErr != nil {
-		log.Printf("scorer: failed for %s: %v", req.PRURL, scoreErr)
-	} else {
-		stats.Add(scoreResp)
-		stats.AddAgent("scorer", scoreResp.TotalCostUSD, time.Since(scorerStart))
-		log.Printf("scorer: done for %s (score: %d/100, $%.4f)", req.PRURL, score.Overall, scoreResp.TotalCostUSD)
-	}
+	dmUser(api, notifyUserID, "Validator done. Scoring + merging...")
 
-	dmUser(api, notifyUserID, "Merging reviews...")
-	log.Printf("merger: starting for %s", req.PRURL)
-	mergerStart := time.Now()
-	merged, mergeResp, err := runMerger(ctx, allReviews, validated, req.Mode, req.SpecContent, req.AcknowledgedIssues)
-	if err != nil {
-		return "", nil, stats, err
+	var (
+		score      ScoreResult
+		scoreResp  claudeResponse
+		scoreErr   error
+		merged     string
+		mergeResp  claudeResponse
+		mergeErr   error
+		scoreMerge sync.WaitGroup
+	)
+
+	scoreMerge.Add(2)
+	go func() {
+		defer scoreMerge.Done()
+		log.Printf("scorer: starting for %s", req.PRURL)
+		scorerStart := time.Now()
+		score, scoreResp, scoreErr = runScorer(ctx, perspectiveScores, req.Diff, req.SpecContent, req.AcknowledgedIssues)
+		if scoreErr != nil {
+			log.Printf("scorer: failed for %s: %v", req.PRURL, scoreErr)
+		} else {
+			stats.Add(scoreResp)
+			stats.AddAgent("scorer", scoreResp.TotalCostUSD, time.Since(scorerStart))
+			log.Printf("scorer: done for %s (score: %d/100, $%.4f)", req.PRURL, score.Overall, scoreResp.TotalCostUSD)
+		}
+	}()
+	go func() {
+		defer scoreMerge.Done()
+		log.Printf("merger: starting for %s", req.PRURL)
+		mergerStart := time.Now()
+		merged, mergeResp, mergeErr = runMerger(ctx, allReviews, validated, req.Mode, req.SpecContent, req.AcknowledgedIssues)
+		if mergeErr != nil {
+			return
+		}
+		stats.Add(mergeResp)
+		stats.AddAgent("merger", mergeResp.TotalCostUSD, time.Since(mergerStart))
+		log.Printf("merger: done for %s ($%.4f)", req.PRURL, mergeResp.TotalCostUSD)
+	}()
+	scoreMerge.Wait()
+
+	if mergeErr != nil {
+		return "", nil, stats, mergeErr
 	}
-	stats.Add(mergeResp)
-	stats.AddAgent("merger", mergeResp.TotalCostUSD, time.Since(mergerStart))
-	log.Printf("merger: done for %s ($%.4f)", req.PRURL, mergeResp.TotalCostUSD)
 
 	if mergeResp.SessionID != "" {
 		sessionStore.Set(req.PRURL, mergeResp.SessionID)
