@@ -530,11 +530,11 @@ func runCLI(args []string) {
 	owner, repo, prNum := m[1], m[2], m[3]
 	prURL := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, prNum)
 
-	mode := parseMode(input)
+	mode, modeExplicit := parseMode(input)
 	flags := parseFlags(input)
 	noGitHub := strings.Contains(input, "--no-github")
 
-	if mode == ModeInitial && sessionStore.Get(prURL) != "" {
+	if mode == ModeInitial && !modeExplicit && sessionStore.Get(prURL) != "" {
 		mode = ModeReReview
 		log.Printf("auto-re-review: found existing session for %s, upgrading to re-review", prURL)
 	}
@@ -756,7 +756,7 @@ func main() {
 							continue
 						}
 						text := ev.Text
-						if parseMode(text) == ModeInitial {
+						if mode, explicit := parseMode(text); mode == ModeInitial && !explicit {
 							text += " --re-review"
 						}
 						if specPath := parseSpecPath(parentText); specPath != "" && parseSpecPath(text) == "" {
@@ -815,11 +815,11 @@ func main() {
 	}
 }
 
-func parseMode(text string) ReviewMode {
+func parseMode(text string) (ReviewMode, bool) {
 	if m := modePattern.FindStringSubmatch(text); m != nil {
-		return ReviewMode(m[1])
+		return ReviewMode(m[1]), true
 	}
-	return ModeInitial
+	return ModeInitial, false
 }
 
 func parseSpecPath(text string) string {
@@ -867,12 +867,12 @@ func parseJiraTicket(text string) string {
 func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, prURL, owner, repo, prNum, channelID, notifyUserID, reviewQuestions string) {
 	defer untrackReview(ev.TimeStamp, prURL)
 
-	mode := parseMode(ev.Text)
+	mode, modeExplicit := parseMode(ev.Text)
 	selfReview := selfPattern.MatchString(ev.Text)
 	jiraTicket := parseJiraTicket(ev.Text)
 	flags := parseFlags(ev.Text)
 
-	if mode == ModeInitial && sessionStore.Get(prURL) != "" {
+	if mode == ModeInitial && !modeExplicit && sessionStore.Get(prURL) != "" {
 		mode = ModeReReview
 		log.Printf("auto-re-review: found existing session for %s, upgrading to re-review", prURL)
 	}

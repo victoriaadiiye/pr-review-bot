@@ -754,6 +754,34 @@ func TestLoadAgents_InvalidTemplate(t *testing.T) {
 	}
 }
 
+func TestParseMode(t *testing.T) {
+	tests := []struct {
+		input        string
+		wantMode     ReviewMode
+		wantExplicit bool
+	}{
+		{"https://github.com/org/repo/pull/1", ModeInitial, false},
+		{"https://github.com/org/repo/pull/1 --initial", ModeInitial, true},
+		{"https://github.com/org/repo/pull/1 --quick", ModeQuick, true},
+		{"https://github.com/org/repo/pull/1 --re-review", ModeReReview, true},
+		{"https://github.com/org/repo/pull/1 --final", ModeFinal, true},
+		{"review --initial --bare-necessities", ModeInitial, true},
+		{"just some text", ModeInitial, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			mode, explicit := parseMode(tt.input)
+			if mode != tt.wantMode {
+				t.Errorf("mode = %q, want %q", mode, tt.wantMode)
+			}
+			if explicit != tt.wantExplicit {
+				t.Errorf("explicit = %v, want %v", explicit, tt.wantExplicit)
+			}
+		})
+	}
+}
+
 func TestModePreamble(t *testing.T) {
 	if modePreamble(ModeInitial) != "" {
 		t.Error("initial mode should have empty preamble")
