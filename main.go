@@ -41,7 +41,8 @@ const (
 	ModeQuick    ReviewMode = "quick"
 	ModeFinal    ReviewMode = "final"
 
-	agentMaxTurns = 50
+	agentMaxTurnsDefault = 25
+	agentMaxTurnsThorough = 50
 )
 
 type ReviewRequest struct {
@@ -82,6 +83,8 @@ type AgentMetric struct {
 	Name     string
 	CostUSD  float64
 	Duration time.Duration
+	Turns    int
+	MaxTurns int
 }
 
 type UsageStats struct {
@@ -113,10 +116,10 @@ func (u *UsageStats) Add(resp claudeResponse) {
 	u.AgentCalls++
 }
 
-func (u *UsageStats) AddAgent(name string, cost float64, dur time.Duration) {
+func (u *UsageStats) AddAgent(name string, cost float64, dur time.Duration, turns, maxTurns int) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	u.AgentMetrics = append(u.AgentMetrics, AgentMetric{Name: name, CostUSD: cost, Duration: dur})
+	u.AgentMetrics = append(u.AgentMetrics, AgentMetric{Name: name, CostUSD: cost, Duration: dur, Turns: turns, MaxTurns: maxTurns})
 }
 
 func (u *UsageStats) String() string {
@@ -138,7 +141,7 @@ func (u *UsageStats) MetricsSummary(model, triggerUser, channelID string) string
 	b.WriteString(fmt.Sprintf("> *Total cost:* $%.4f\n", u.TotalCostUSD))
 	b.WriteString("> *Agent breakdown:*\n")
 	for _, m := range u.AgentMetrics {
-		b.WriteString(fmt.Sprintf(">   • `%s` — $%.4f, %s\n", m.Name, m.CostUSD, m.Duration.Round(time.Second)))
+		b.WriteString(fmt.Sprintf(">   • `%s` — $%.4f, %s, %d/%d turns\n", m.Name, m.CostUSD, m.Duration.Round(time.Second), m.Turns, m.MaxTurns))
 	}
 	for _, w := range u.Warnings {
 		b.WriteString(fmt.Sprintf("> :warning: %s\n", w))
@@ -161,6 +164,7 @@ type agentFile struct {
 	name     string
 	flag     string
 	model    string
+	maxTurns int
 	template *template.Template
 }
 
@@ -170,6 +174,215 @@ type promptData struct {
 	ContextBlock string
 	QuestionsStr string
 	Diff         string
+	PriorContext string
+}
+
+// ReviewMemory persists structured context across reviews of the same PR.
+type ReviewMemory struct {
+	PRURL          string             `json:"pr_url"`
+	LastReviewed   time.Time          `json:"last_reviewed"`
+	ReviewCount    int                `json:"review_count"`
+	Mode           string             `json:"mode"`
+	Score          int                `json:"score"`
+	Verdict        string             `json:"verdict"`
+	AgentSummaries []AgentSummary     `json:"agent_summaries"`
+	CriticalIssues []string           `json:"critical_issues"`
+	ResolvedIssues []string           `json:"resolved_issues"`
+	FilesReviewed  []string           `json:"files_reviewed"`
+	DiffStats      ReviewMemoryDiffSt `json:"diff_stats"`
+}
+
+type AgentSummary struct {
+	Agent       string `json:"agent"`
+	KeyFindings string `json:"key_findings"`
+	Score       int    `json:"score"`
+}
+
+type ReviewMemoryDiffSt struct {
+	Files     int `json:"files"`
+	Additions int `json:"additions"`
+	Deletions int `json:"deletions"`
+}
+
+func reviewMemoryPath(owner, repo, prNum string) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot determine home dir: %w", err)
+	}
+	return filepath.Join(home, ".pr-review-cache", owner, repo, "pr-"+prNum, "review-memory.json"), nil
+}
+
+func loadReviewMemory(owner, repo, prNum string) (*ReviewMemory, error) {
+	path, err := reviewMemoryPath(owner, repo, prNum)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read review memory: %w", err)
+	}
+	var mem ReviewMemory
+	if err := json.Unmarshal(data, &mem); err != nil {
+		return nil, fmt.Errorf("parse review memory: %w", err)
+	}
+	return &mem, nil
+}
+
+func saveReviewMemory(owner, repo, prNum string, mem *ReviewMemory) error {
+	path, err := reviewMemoryPath(owner, repo, prNum)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create review memory dir: %w", err)
+	}
+	data, err := json.MarshalIndent(mem, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal review memory: %w", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return fmt.Errorf("write review memory: %w", err)
+	}
+	return nil
+}
+
+func formatPriorContext(mem *ReviewMemory) string {
+	if mem == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("## Prior Review Context\n")
+	b.WriteString(fmt.Sprintf("This PR was previously reviewed %d time(s). Last review: %s\n\n",
+		mem.ReviewCount, mem.LastReviewed.Format("2006-01-02 15:04 UTC")))
+	b.WriteString(fmt.Sprintf("**Previous score:** %d/100 | **Verdict:** %s\n\n", mem.Score, mem.Verdict))
+
+	if len(mem.CriticalIssues) > 0 {
+		b.WriteString("**Critical issues from prior review:**\n")
+		for _, issue := range mem.CriticalIssues {
+			b.WriteString(fmt.Sprintf("- %s\n", issue))
+		}
+		b.WriteString("\n")
+	}
+
+	if len(mem.ResolvedIssues) > 0 {
+		b.WriteString("**Resolved issues:**\n")
+		for _, issue := range mem.ResolvedIssues {
+			b.WriteString(fmt.Sprintf("- %s\n", issue))
+		}
+		b.WriteString("\n")
+	}
+
+	if len(mem.AgentSummaries) > 0 {
+		b.WriteString("**Agent findings summary:**\n")
+		for _, as := range mem.AgentSummaries {
+			b.WriteString(fmt.Sprintf("- **%s** (score: %d): %s\n", as.Agent, as.Score, as.KeyFindings))
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString(fmt.Sprintf("**Files reviewed:** %d | **Diff:** +%d/-%d across %d files\n",
+		len(mem.FilesReviewed), mem.DiffStats.Additions, mem.DiffStats.Deletions, mem.DiffStats.Files))
+
+	return b.String()
+}
+
+func extractVerdict(mergedText string) string {
+	lower := strings.ToLower(mergedText)
+	if strings.Contains(lower, "request changes") {
+		return "Request Changes"
+	}
+	if strings.Contains(lower, "approve") {
+		return "Approve"
+	}
+	return "Unknown"
+}
+
+func extractCriticalIssues(mergedText string) []string {
+	var issues []string
+	lines := strings.Split(mergedText, "\n")
+	inCritical := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		lower := strings.ToLower(trimmed)
+		if strings.HasPrefix(lower, "## critical") || strings.HasPrefix(lower, "### critical") {
+			inCritical = true
+			continue
+		}
+		if inCritical && (strings.HasPrefix(trimmed, "## ") || strings.HasPrefix(trimmed, "### ")) {
+			break
+		}
+		if inCritical && strings.HasPrefix(trimmed, "- ") {
+			issues = append(issues, strings.TrimPrefix(trimmed, "- "))
+		}
+	}
+	return issues
+}
+
+func computeDiffStats(diff string) ReviewMemoryDiffSt {
+	var additions, deletions int
+	for _, line := range strings.Split(diff, "\n") {
+		if strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++") {
+			additions++
+		} else if strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---") {
+			deletions++
+		}
+	}
+	files := splitDiffByFile(diff)
+	return ReviewMemoryDiffSt{
+		Files:     len(files),
+		Additions: additions,
+		Deletions: deletions,
+	}
+}
+
+func buildReviewMemory(req ReviewRequest, mergedText string, score *ScoreResult, perspectiveScores []PerspectiveScore) *ReviewMemory {
+	existing, _ := loadReviewMemory(req.Owner, req.Repo, req.PRNum)
+	reviewCount := 1
+	var resolvedIssues []string
+	if existing != nil {
+		reviewCount = existing.ReviewCount + 1
+		resolvedIssues = existing.ResolvedIssues
+	}
+
+	overall := 0
+	if score != nil {
+		overall = score.Overall
+	}
+
+	var agentSummaries []AgentSummary
+	for _, ps := range perspectiveScores {
+		if ps.Agent != "" {
+			agentSummaries = append(agentSummaries, AgentSummary{
+				Agent:       ps.Agent,
+				KeyFindings: ps.Rationale,
+				Score:       ps.Score,
+			})
+		}
+	}
+
+	fileMap := splitDiffByFile(req.Diff)
+	var filesReviewed []string
+	for f := range fileMap {
+		filesReviewed = append(filesReviewed, f)
+	}
+	sort.Strings(filesReviewed)
+
+	return &ReviewMemory{
+		PRURL:          req.PRURL,
+		LastReviewed:   time.Now(),
+		ReviewCount:    reviewCount,
+		Mode:           string(req.Mode),
+		Score:          overall,
+		Verdict:        extractVerdict(mergedText),
+		AgentSummaries: agentSummaries,
+		CriticalIssues: extractCriticalIssues(mergedText),
+		ResolvedIssues: resolvedIssues,
+		FilesReviewed:  filesReviewed,
+		DiffStats:      computeDiffStats(req.Diff),
+	}
 }
 
 var agentsDir = "agents"
@@ -251,6 +464,7 @@ func loadAgents() ([]agentFile, error) {
 		name := strings.TrimSuffix(e.Name(), ".md")
 		content := string(raw)
 		var flag, model string
+		var maxTurns int
 		if strings.HasPrefix(content, "---\n") {
 			if end := strings.Index(content[4:], "\n---\n"); end >= 0 {
 				frontmatter := content[4 : 4+end]
@@ -262,6 +476,11 @@ func loadAgents() ([]agentFile, error) {
 					if strings.HasPrefix(line, "model:") {
 						model = strings.TrimSpace(strings.TrimPrefix(line, "model:"))
 					}
+					if strings.HasPrefix(line, "max_turns:") {
+						if v, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "max_turns:"))); err == nil && v > 0 {
+							maxTurns = v
+						}
+					}
 				}
 			}
 		}
@@ -269,7 +488,7 @@ func loadAgents() ([]agentFile, error) {
 		if err != nil {
 			return nil, fmt.Errorf("parse agent template %s: %w", path, err)
 		}
-		agents = append(agents, agentFile{name: name, flag: flag, model: model, template: tmpl})
+		agents = append(agents, agentFile{name: name, flag: flag, model: model, maxTurns: maxTurns, template: tmpl})
 	}
 	if len(agents) == 0 {
 		return nil, fmt.Errorf("no .md agent files found in %s", agentsDir)
@@ -869,6 +1088,16 @@ func filterAgents(agents []agentFile, flags map[string]bool) []agentFile {
 		}
 	}
 	return filtered
+}
+
+func resolveMaxTurns(agent agentFile, thorough bool) int {
+	if thorough {
+		return agentMaxTurnsThorough
+	}
+	if agent.maxTurns > 0 {
+		return agent.maxTurns
+	}
+	return agentMaxTurnsDefault
 }
 
 func parseJiraTicket(text string) string {
@@ -1803,12 +2032,24 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 		}
 	}
 
+	var priorContext string
+	if req.Owner != "" && req.Repo != "" && req.PRNum != "" {
+		mem, memErr := loadReviewMemory(req.Owner, req.Repo, req.PRNum)
+		if memErr != nil {
+			log.Printf("review-memory: load failed for %s: %v", req.PRURL, memErr)
+		} else if mem != nil {
+			priorContext = formatPriorContext(mem)
+			log.Printf("review-memory: loaded prior context for %s (review #%d, score %d)", req.PRURL, mem.ReviewCount, mem.Score)
+		}
+	}
+
 	data := promptData{
 		ModePreamble: modePreamble(req.Mode),
 		PRURL:        req.PRURL,
 		ContextBlock: contextBlock,
 		QuestionsStr: questionsStr,
 		Diff:         req.Diff,
+		PriorContext: priorContext,
 	}
 
 	reviews := make([]string, len(agents))
@@ -1834,9 +2075,9 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 			if agentModel == "" {
 				agentModel = "default"
 			}
-			log.Printf("agent %s: starting %s review for %s (model=%s, max-turns=%d)", agent.name, req.Mode, req.PRURL, agentModel, agentMaxTurns)
+			log.Printf("agent %s: starting %s review for %s (model=%s, max-turns=%d)", agent.name, req.Mode, req.PRURL, agentModel, agentMaxTurnsDefault)
 			agentStart := time.Now()
-			text, resp, err := runClaudeInDir(ctx, prompt, agentWorkDir, agent.model, agentMaxTurns)
+			text, resp, err := runClaudeInDir(ctx, prompt, agentWorkDir, agent.model, agentMaxTurnsDefault)
 			agentDur := time.Since(agentStart)
 			if err != nil {
 				log.Printf("agent %s: failed for %s: %v", agent.name, req.PRURL, err)
@@ -1846,18 +2087,18 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 				mu.Unlock()
 				return
 			}
-			if resp.NumTurns >= agentMaxTurns {
-				log.Printf("agent %s: hit max turns (%d) for %s — output may be truncated", agent.name, agentMaxTurns, req.PRURL)
-				stats.AddWarning(fmt.Sprintf("`%s` hit max turns (%d) — output may be incomplete", agent.name, agentMaxTurns))
+			if resp.NumTurns >= agentMaxTurnsDefault {
+				log.Printf("agent %s: hit max turns (%d) for %s — output may be truncated", agent.name, agentMaxTurnsDefault, req.PRURL)
+				stats.AddWarning(fmt.Sprintf("`%s` hit max turns (%d) — output may be incomplete", agent.name, agentMaxTurnsDefault))
 			}
 			stats.Add(resp)
-			stats.AddAgent(agent.name, resp.TotalCostUSD, agentDur)
+			stats.AddAgent(agent.name, resp.TotalCostUSD, agentDur, resp.NumTurns, agentMaxTurnsDefault)
 			reviewText, ps := extractPerspectiveScore(agent.name, text)
 			mu.Lock()
 			reviews[idx] = fmt.Sprintf("## %s Review\n\n%s", strings.ToUpper(agent.name), reviewText)
 			perspectiveScores[idx] = ps
 			mu.Unlock()
-			log.Printf("agent %s: done for %s (perspective: %d/100, $%.4f)", agent.name, req.PRURL, ps.Score, resp.TotalCostUSD)
+			log.Printf("agent %s: done for %s (perspective: %d/100, $%.4f, %d/%d turns)", agent.name, req.PRURL, ps.Score, resp.TotalCostUSD, resp.NumTurns, agentMaxTurnsDefault)
 		}(i, a)
 	}
 	wg.Wait()
@@ -1903,7 +2144,7 @@ Be concise. Output a validation report.
 		return "", nil, stats, fmt.Errorf("validator failed: %w", err)
 	}
 	stats.Add(valResp)
-	stats.AddAgent("validator", valResp.TotalCostUSD, time.Since(valStart))
+	stats.AddAgent("validator", valResp.TotalCostUSD, time.Since(valStart), valResp.NumTurns, 0)
 	log.Printf("validator: done for %s ($%.4f)", req.PRURL, valResp.TotalCostUSD)
 
 	dmUser(api, notifyUserID, "Validator done. Scoring + merging...")
@@ -1928,7 +2169,7 @@ Be concise. Output a validation report.
 			log.Printf("scorer: failed for %s: %v", req.PRURL, scoreErr)
 		} else {
 			stats.Add(scoreResp)
-			stats.AddAgent("scorer", scoreResp.TotalCostUSD, time.Since(scorerStart))
+			stats.AddAgent("scorer", scoreResp.TotalCostUSD, time.Since(scorerStart), scoreResp.NumTurns, 0)
 			log.Printf("scorer: done for %s (score: %d/100, $%.4f)", req.PRURL, score.Overall, scoreResp.TotalCostUSD)
 		}
 	}()
@@ -1941,7 +2182,7 @@ Be concise. Output a validation report.
 			return
 		}
 		stats.Add(mergeResp)
-		stats.AddAgent("merger", mergeResp.TotalCostUSD, time.Since(mergerStart))
+		stats.AddAgent("merger", mergeResp.TotalCostUSD, time.Since(mergerStart), mergeResp.NumTurns, 0)
 		log.Printf("merger: done for %s ($%.4f)", req.PRURL, mergeResp.TotalCostUSD)
 	}()
 	scoreMerge.Wait()
@@ -1952,6 +2193,20 @@ Be concise. Output a validation report.
 
 	if mergeResp.SessionID != "" {
 		sessionStore.Set(req.PRURL, mergeResp.SessionID)
+	}
+
+	// Save review memory for subsequent runs
+	if req.Owner != "" && req.Repo != "" && req.PRNum != "" {
+		var scorePtr *ScoreResult
+		if scoreErr == nil {
+			scorePtr = &score
+		}
+		mem := buildReviewMemory(req, merged, scorePtr, filteredScores)
+		if err := saveReviewMemory(req.Owner, req.Repo, req.PRNum, mem); err != nil {
+			log.Printf("review-memory: save failed for %s: %v", req.PRURL, err)
+		} else {
+			log.Printf("review-memory: saved for %s (review #%d, score %d)", req.PRURL, mem.ReviewCount, mem.Score)
+		}
 	}
 
 	if scoreErr == nil {

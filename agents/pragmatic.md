@@ -2,6 +2,7 @@
 
 Review this pull request: {{.PRURL}}
 {{.ContextBlock}}
+{{.PriorContext}}
 
 ## Your Three Questions
 

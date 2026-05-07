@@ -1198,8 +1198,8 @@ func TestDiffLines(t *testing.T) {
 
 func TestUsageStats_AddAgent(t *testing.T) {
 	stats := &UsageStats{}
-	stats.AddAgent("correctness", 1.05, 90*time.Second)
-	stats.AddAgent("design", 0.83, 75*time.Second)
+	stats.AddAgent("correctness", 1.05, 90*time.Second, 12, 50)
+	stats.AddAgent("design", 0.83, 75*time.Second, 8, 50)
 
 	if len(stats.AgentMetrics) != 2 {
 		t.Fatalf("got %d metrics, want 2", len(stats.AgentMetrics))
@@ -1216,8 +1216,8 @@ func TestUsageStats_MetricsSummary(t *testing.T) {
 	stats := &UsageStats{}
 	stats.TotalCostUSD = 4.50
 	stats.AgentMetrics = []AgentMetric{
-		{Name: "correctness", CostUSD: 1.10, Duration: 114 * time.Second},
-		{Name: "validator", CostUSD: 0.47, Duration: 83 * time.Second},
+		{Name: "correctness", CostUSD: 1.10, Duration: 114 * time.Second, Turns: 15, MaxTurns: 50},
+		{Name: "validator", CostUSD: 0.47, Duration: 83 * time.Second, Turns: 3, MaxTurns: 0},
 	}
 
 	summary := stats.MetricsSummary("claude-opus-4-6", "U123", "C456")
@@ -1230,8 +1230,10 @@ func TestUsageStats_MetricsSummary(t *testing.T) {
 		"$4.5000",
 		"`correctness`",
 		"$1.1000",
+		"15/50 turns",
 		"`validator`",
 		"$0.4700",
+		"3/0 turns",
 	}
 	for _, want := range checks {
 		if !strings.Contains(summary, want) {
@@ -1254,7 +1256,7 @@ func TestUsageStats_AddAgent_ConcurrentSafe(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			stats.AddAgent(fmt.Sprintf("agent-%d", idx), float64(idx)*0.1, time.Duration(idx)*time.Second)
+			stats.AddAgent(fmt.Sprintf("agent-%d", idx), float64(idx)*0.1, time.Duration(idx)*time.Second, idx, 50)
 		}(i)
 	}
 	wg.Wait()
@@ -1580,5 +1582,386 @@ func TestLoadProjectsConfig_RealFile(t *testing.T) {
 		if allSame {
 			t.Error("qompass and qatalyst should have different agent configs")
 		}
+	}
+}
+
+func TestSaveAndLoadReviewMemory_RoundTrip(t *testing.T) {
+	tmpDir := t.TempDir()
+	owner := "testowner"
+	repo := "testrepo"
+	prNum := "42"
+
+	memDir := filepath.Join(tmpDir, owner, repo, "pr-"+prNum)
+	if err := os.MkdirAll(memDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Override reviewMemoryPath by writing/reading directly via the path logic
+	// Instead, we test save+load by using a temp HOME
+	origHome := os.Getenv("HOME")
+	fakeCacheDir := filepath.Join(tmpDir, "fakehome")
+	os.Setenv("HOME", fakeCacheDir)
+	defer os.Setenv("HOME", origHome)
+
+	mem := &ReviewMemory{
+		PRURL:        "https://github.com/testowner/testrepo/pull/42",
+		LastReviewed: time.Date(2026, 5, 7, 10, 30, 0, 0, time.UTC),
+		ReviewCount:  2,
+		Mode:         "initial",
+		Score:        72,
+		Verdict:      "Request Changes",
+		AgentSummaries: []AgentSummary{
+			{Agent: "go-expert", KeyFindings: "missing error check", Score: 85},
+			{Agent: "correctness", KeyFindings: "race condition in handler", Score: 60},
+		},
+		CriticalIssues: []string{"race condition in handleReq", "missing auth check"},
+		ResolvedIssues: []string{},
+		FilesReviewed:  []string{"handler.go", "main.go"},
+		DiffStats:      ReviewMemoryDiffSt{Files: 5, Additions: 120, Deletions: 30},
+	}
+
+	if err := saveReviewMemory(owner, repo, prNum, mem); err != nil {
+		t.Fatalf("saveReviewMemory: %v", err)
+	}
+
+	loaded, err := loadReviewMemory(owner, repo, prNum)
+	if err != nil {
+		t.Fatalf("loadReviewMemory: %v", err)
+	}
+	if loaded == nil {
+		t.Fatal("loadReviewMemory returned nil")
+	}
+
+	if loaded.PRURL != mem.PRURL {
+		t.Errorf("PRURL = %q, want %q", loaded.PRURL, mem.PRURL)
+	}
+	if loaded.ReviewCount != mem.ReviewCount {
+		t.Errorf("ReviewCount = %d, want %d", loaded.ReviewCount, mem.ReviewCount)
+	}
+	if loaded.Score != mem.Score {
+		t.Errorf("Score = %d, want %d", loaded.Score, mem.Score)
+	}
+	if loaded.Verdict != mem.Verdict {
+		t.Errorf("Verdict = %q, want %q", loaded.Verdict, mem.Verdict)
+	}
+	if len(loaded.AgentSummaries) != 2 {
+		t.Fatalf("AgentSummaries len = %d, want 2", len(loaded.AgentSummaries))
+	}
+	if loaded.AgentSummaries[0].Agent != "go-expert" {
+		t.Errorf("AgentSummaries[0].Agent = %q, want %q", loaded.AgentSummaries[0].Agent, "go-expert")
+	}
+	if len(loaded.CriticalIssues) != 2 {
+		t.Errorf("CriticalIssues len = %d, want 2", len(loaded.CriticalIssues))
+	}
+	if len(loaded.FilesReviewed) != 2 {
+		t.Errorf("FilesReviewed len = %d, want 2", len(loaded.FilesReviewed))
+	}
+	if loaded.DiffStats.Additions != 120 {
+		t.Errorf("DiffStats.Additions = %d, want 120", loaded.DiffStats.Additions)
+	}
+}
+
+func TestLoadReviewMemory_NonexistentReturnsNil(t *testing.T) {
+	tmpDir := t.TempDir()
+	origHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", origHome)
+
+	mem, err := loadReviewMemory("noowner", "norepo", "999")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mem != nil {
+		t.Errorf("expected nil for nonexistent memory, got %+v", mem)
+	}
+}
+
+func TestFormatPriorContext_Nil(t *testing.T) {
+	result := formatPriorContext(nil)
+	if result != "" {
+		t.Errorf("expected empty string for nil memory, got %q", result)
+	}
+}
+
+func TestFormatPriorContext_FullMemory(t *testing.T) {
+	mem := &ReviewMemory{
+		PRURL:        "https://github.com/owner/repo/pull/1",
+		LastReviewed: time.Date(2026, 5, 7, 10, 30, 0, 0, time.UTC),
+		ReviewCount:  3,
+		Mode:         "initial",
+		Score:        72,
+		Verdict:      "Request Changes",
+		AgentSummaries: []AgentSummary{
+			{Agent: "go-expert", KeyFindings: "missing error check", Score: 85},
+		},
+		CriticalIssues: []string{"race condition in handleReq"},
+		ResolvedIssues: []string{"fixed nil pointer"},
+		FilesReviewed:  []string{"main.go", "handler.go"},
+		DiffStats:      ReviewMemoryDiffSt{Files: 2, Additions: 50, Deletions: 10},
+	}
+
+	result := formatPriorContext(mem)
+
+	checks := []struct {
+		desc string
+		want string
+	}{
+		{"header", "## Prior Review Context"},
+		{"review count", "reviewed 3 time(s)"},
+		{"score", "**Previous score:** 72/100"},
+		{"verdict", "**Verdict:** Request Changes"},
+		{"critical issue", "race condition in handleReq"},
+		{"resolved issue", "fixed nil pointer"},
+		{"agent summary", "**go-expert** (score: 85)"},
+		{"files reviewed count", "**Files reviewed:** 2"},
+		{"diff additions", "+50/-10"},
+	}
+
+	for _, c := range checks {
+		if !strings.Contains(result, c.want) {
+			t.Errorf("%s: result does not contain %q\nfull result:\n%s", c.desc, c.want, result)
+		}
+	}
+}
+
+func TestFormatPriorContext_NoOptionalSections(t *testing.T) {
+	mem := &ReviewMemory{
+		PRURL:        "https://github.com/owner/repo/pull/1",
+		LastReviewed: time.Date(2026, 5, 7, 10, 0, 0, 0, time.UTC),
+		ReviewCount:  1,
+		Score:        90,
+		Verdict:      "Approve",
+		DiffStats:    ReviewMemoryDiffSt{Files: 1, Additions: 5, Deletions: 0},
+	}
+
+	result := formatPriorContext(mem)
+
+	if strings.Contains(result, "Critical issues") {
+		t.Error("should not contain critical issues section when empty")
+	}
+	if strings.Contains(result, "Resolved issues") {
+		t.Error("should not contain resolved issues section when empty")
+	}
+	if strings.Contains(result, "Agent findings") {
+		t.Error("should not contain agent findings section when empty")
+	}
+	if !strings.Contains(result, "**Verdict:** Approve") {
+		t.Error("should contain verdict")
+	}
+}
+
+func TestPriorContext_RendersInAgentTemplate(t *testing.T) {
+	old := agentsDir
+	dir := t.TempDir()
+	agentsDir = dir
+	defer func() { agentsDir = old }()
+
+	content := `You are a reviewer. {{.PRURL}}
+{{if .PriorContext}}
+{{.PriorContext}}
+{{end}}
+` + "```diff\n{{.Diff}}\n```"
+	if err := os.WriteFile(filepath.Join(dir, "test-agent.md"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	agents, err := loadAgents()
+	if err != nil {
+		t.Fatalf("loadAgents: %v", err)
+	}
+	if len(agents) != 1 {
+		t.Fatalf("expected 1 agent, got %d", len(agents))
+	}
+
+	t.Run("with prior context", func(t *testing.T) {
+		data := promptData{
+			PRURL:        "https://github.com/o/r/pull/1",
+			Diff:         "+added line",
+			PriorContext: "## Prior Review Context\nPreviously reviewed 2 time(s).",
+		}
+		result, err := renderAgent(agents[0], data)
+		if err != nil {
+			t.Fatalf("renderAgent: %v", err)
+		}
+		if !strings.Contains(result, "Prior Review Context") {
+			t.Error("prior context not rendered in template output")
+		}
+		if !strings.Contains(result, "Previously reviewed 2 time(s).") {
+			t.Error("prior context details not rendered")
+		}
+	})
+
+	t.Run("without prior context", func(t *testing.T) {
+		data := promptData{
+			PRURL: "https://github.com/o/r/pull/1",
+			Diff:  "+added line",
+		}
+		result, err := renderAgent(agents[0], data)
+		if err != nil {
+			t.Fatalf("renderAgent: %v", err)
+		}
+		if strings.Contains(result, "Prior Review Context") {
+			t.Error("prior context should not appear when PriorContext is empty")
+		}
+	})
+}
+
+func TestExtractVerdict(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"request changes", "## Verdict\n\n**Request Changes** — several issues need attention", "Request Changes"},
+		{"approve", "## Verdict: Approve\nAll looks good.", "Approve"},
+		{"approve lowercase", "I'd recommend we approve this PR.", "Approve"},
+		{"request changes lowercase", "Verdict: request changes", "Request Changes"},
+		{"unknown", "## Summary\nThis PR adds a feature.", "Unknown"},
+		{"empty", "", "Unknown"},
+		{"both prefers request changes", "We could approve but request changes on auth", "Request Changes"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractVerdict(tt.input)
+			if got != tt.want {
+				t.Errorf("extractVerdict = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExtractCriticalIssues(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{
+			"h2 critical section",
+			"## Summary\nok\n\n## Critical Issues\n- race condition in handleReq\n- missing auth check\n\n## Design\nfine",
+			[]string{"race condition in handleReq", "missing auth check"},
+		},
+		{
+			"h3 critical section",
+			"### Critical Issues\n- nil pointer\n\n### Suggestions\n- add tests",
+			[]string{"nil pointer"},
+		},
+		{
+			"no critical section",
+			"## Summary\nLooks good.\n## Suggestions\n- minor naming",
+			nil,
+		},
+		{
+			"empty critical section",
+			"## Critical Issues\n\n## Design",
+			nil,
+		},
+		{
+			"critical at end of doc",
+			"## Summary\nok\n## Critical Issues\n- last issue",
+			[]string{"last issue"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractCriticalIssues(tt.input)
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %d issues %v, want %d %v", len(got), got, len(tt.want), tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("issue[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestComputeDiffStats(t *testing.T) {
+	diff := `diff --git a/main.go b/main.go
+--- a/main.go
++++ b/main.go
+@@ -10,3 +10,5 @@
+ unchanged
+-removed line 1
+-removed line 2
++added line 1
++added line 2
++added line 3
+diff --git a/handler.go b/handler.go
+--- a/handler.go
++++ b/handler.go
+@@ -1,2 +1,3 @@
+ unchanged
++new line
+`
+	stats := computeDiffStats(diff)
+
+	if stats.Files != 2 {
+		t.Errorf("Files = %d, want 2", stats.Files)
+	}
+	if stats.Additions != 4 {
+		t.Errorf("Additions = %d, want 4", stats.Additions)
+	}
+	if stats.Deletions != 2 {
+		t.Errorf("Deletions = %d, want 2", stats.Deletions)
+	}
+}
+
+func TestBuildReviewMemory(t *testing.T) {
+	tmpDir := t.TempDir()
+	origHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", origHome)
+
+	req := ReviewRequest{
+		PRURL: "https://github.com/owner/repo/pull/5",
+		Owner: "owner",
+		Repo:  "repo",
+		PRNum: "5",
+		Mode:  ModeInitial,
+		Diff: `diff --git a/main.go b/main.go
+--- a/main.go
++++ b/main.go
+@@ -1,2 +1,3 @@
+ existing
++new line
+`,
+	}
+
+	mergedText := "## Summary\nLooks okay.\n\n## Critical Issues\n- missing nil check\n\n## Verdict\nRequest Changes"
+	score := &ScoreResult{Overall: 65}
+	perspectives := []PerspectiveScore{
+		{Agent: "correctness", Score: 60, Rationale: "found nil issue"},
+		{Agent: "design", Score: 70, Rationale: "clean structure"},
+	}
+
+	mem := buildReviewMemory(req, mergedText, score, perspectives)
+
+	if mem.PRURL != req.PRURL {
+		t.Errorf("PRURL = %q, want %q", mem.PRURL, req.PRURL)
+	}
+	if mem.ReviewCount != 1 {
+		t.Errorf("ReviewCount = %d, want 1", mem.ReviewCount)
+	}
+	if mem.Score != 65 {
+		t.Errorf("Score = %d, want 65", mem.Score)
+	}
+	if mem.Verdict != "Request Changes" {
+		t.Errorf("Verdict = %q, want %q", mem.Verdict, "Request Changes")
+	}
+	if len(mem.CriticalIssues) != 1 || mem.CriticalIssues[0] != "missing nil check" {
+		t.Errorf("CriticalIssues = %v, want [missing nil check]", mem.CriticalIssues)
+	}
+	if len(mem.AgentSummaries) != 2 {
+		t.Fatalf("AgentSummaries len = %d, want 2", len(mem.AgentSummaries))
+	}
+	if mem.AgentSummaries[0].Agent != "correctness" {
+		t.Errorf("AgentSummaries[0].Agent = %q, want %q", mem.AgentSummaries[0].Agent, "correctness")
+	}
+	if len(mem.FilesReviewed) != 1 || mem.FilesReviewed[0] != "main.go" {
+		t.Errorf("FilesReviewed = %v, want [main.go]", mem.FilesReviewed)
 	}
 }
