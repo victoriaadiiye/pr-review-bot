@@ -1233,7 +1233,7 @@ func TestUsageStats_MetricsSummary(t *testing.T) {
 		"15/50 turns",
 		"`validator`",
 		"$0.4700",
-		"3/0 turns",
+		"3 turns",
 	}
 	for _, want := range checks {
 		if !strings.Contains(summary, want) {

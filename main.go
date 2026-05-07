@@ -141,7 +141,11 @@ func (u *UsageStats) MetricsSummary(model, triggerUser, channelID string) string
 	b.WriteString(fmt.Sprintf("> *Total cost:* $%.4f\n", u.TotalCostUSD))
 	b.WriteString("> *Agent breakdown:*\n")
 	for _, m := range u.AgentMetrics {
-		b.WriteString(fmt.Sprintf(">   • `%s` — $%.4f, %s, %d/%d turns\n", m.Name, m.CostUSD, m.Duration.Round(time.Second), m.Turns, m.MaxTurns))
+		turnStr := fmt.Sprintf("%d/%d turns", m.Turns, m.MaxTurns)
+		if m.MaxTurns <= 0 {
+			turnStr = fmt.Sprintf("%d turns", m.Turns)
+		}
+		b.WriteString(fmt.Sprintf(">   • `%s` — $%.4f, %s, %s\n", m.Name, m.CostUSD, m.Duration.Round(time.Second), turnStr))
 	}
 	for _, w := range u.Warnings {
 		b.WriteString(fmt.Sprintf("> :warning: %s\n", w))
