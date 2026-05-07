@@ -2590,8 +2590,15 @@ func runClaudeOpts(ctx context.Context, prompt, resumeSessionID, workDir string,
 
 	var resp claudeResponse
 	if jsonErr := json.Unmarshal(out, &resp); jsonErr == nil {
-		if resp.IsError && resp.Result == "" {
-			return "", resp, fmt.Errorf("claude returned error: %s", resp.Result)
+		if resp.IsError {
+			errDetail := resp.Result
+			if errDetail == "" {
+				errDetail = strings.TrimSpace(stderr.String())
+			}
+			if errDetail == "" {
+				errDetail = "(no detail from claude CLI)"
+			}
+			return "", resp, fmt.Errorf("claude returned error: %s", errDetail)
 		}
 		return strings.TrimSpace(resp.Result), resp, nil
 	}
