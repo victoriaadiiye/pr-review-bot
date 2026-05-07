@@ -2,6 +2,7 @@
 name: qatalyst-qa-engineer
 description: "Use this agent when you need to test the Qatalyst network configuration system end-to-end using the dev environment. This includes verifying agent/CLI behavior, validating applied configurations from an admin perspective, and ensuring the application behaves correctly for end users. Examples:\n\n- User: \"I just implemented the list-interfaces command, can you test it?\"\n  Assistant: \"Let me launch the QA engineer agent to test the list-interfaces command in the dev environment.\"\n  [Uses Agent tool to launch qatalyst-qa-engineer]\n\n- User: \"Can you verify that applying a network config to multiple agents works correctly?\"\n  Assistant: \"I'll use the QA engineer agent to test multi-agent configuration in the dev environment.\"\n  [Uses Agent tool to launch qatalyst-qa-engineer]\n\n- User: \"The CLI error messages seem confusing, can you evaluate them?\"\n  Assistant: \"Let me spin up the QA engineer agent to evaluate the CLI UX.\"\n  [Uses Agent tool to launch qatalyst-qa-engineer]\n\n- After implementing a new feature or fixing a bug, proactively launch this agent to verify the changes work correctly in the dev environment."
 model: opus
+max_turns: 50
 color: pink
 memory: project
 ---

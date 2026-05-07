@@ -2071,13 +2071,15 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 				return
 			}
 			prompt += scoreSuffix
+			thorough := req.Flags["thorough"]
+			maxTurns := resolveMaxTurns(agent, thorough)
 			agentModel := agent.model
 			if agentModel == "" {
 				agentModel = "default"
 			}
-			log.Printf("agent %s: starting %s review for %s (model=%s, max-turns=%d)", agent.name, req.Mode, req.PRURL, agentModel, agentMaxTurnsDefault)
+			log.Printf("agent %s: starting %s review for %s (model=%s, max-turns=%d)", agent.name, req.Mode, req.PRURL, agentModel, maxTurns)
 			agentStart := time.Now()
-			text, resp, err := runClaudeInDir(ctx, prompt, agentWorkDir, agent.model, agentMaxTurnsDefault)
+			text, resp, err := runClaudeInDir(ctx, prompt, agentWorkDir, agent.model, maxTurns)
 			agentDur := time.Since(agentStart)
 			if err != nil {
 				log.Printf("agent %s: failed for %s: %v", agent.name, req.PRURL, err)
@@ -2087,18 +2089,18 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 				mu.Unlock()
 				return
 			}
-			if resp.NumTurns >= agentMaxTurnsDefault {
-				log.Printf("agent %s: hit max turns (%d) for %s — output may be truncated", agent.name, agentMaxTurnsDefault, req.PRURL)
-				stats.AddWarning(fmt.Sprintf("`%s` hit max turns (%d) — output may be incomplete", agent.name, agentMaxTurnsDefault))
+			if resp.NumTurns >= maxTurns {
+				log.Printf("agent %s: hit max turns (%d) for %s — output may be truncated", agent.name, maxTurns, req.PRURL)
+				stats.AddWarning(fmt.Sprintf("`%s` hit max turns (%d) — output may be incomplete", agent.name, maxTurns))
 			}
 			stats.Add(resp)
-			stats.AddAgent(agent.name, resp.TotalCostUSD, agentDur, resp.NumTurns, agentMaxTurnsDefault)
+			stats.AddAgent(agent.name, resp.TotalCostUSD, agentDur, resp.NumTurns, maxTurns)
 			reviewText, ps := extractPerspectiveScore(agent.name, text)
 			mu.Lock()
 			reviews[idx] = fmt.Sprintf("## %s Review\n\n%s", strings.ToUpper(agent.name), reviewText)
 			perspectiveScores[idx] = ps
 			mu.Unlock()
-			log.Printf("agent %s: done for %s (perspective: %d/100, $%.4f, %d/%d turns)", agent.name, req.PRURL, ps.Score, resp.TotalCostUSD, resp.NumTurns, agentMaxTurnsDefault)
+			log.Printf("agent %s: done for %s (perspective: %d/100, $%.4f, %d/%d turns)", agent.name, req.PRURL, ps.Score, resp.TotalCostUSD, resp.NumTurns, maxTurns)
 		}(i, a)
 	}
 	wg.Wait()

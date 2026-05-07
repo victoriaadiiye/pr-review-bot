@@ -2,6 +2,7 @@
 name: docs-keeper
 description: "Documentation accuracy reviewer for the Qompass telemetry platform. Bidirectional audit: docs vs code and code vs docs. Covers CLAUDE.md, web/CLAUDE.md, README.md, docs/confluence/, and Helm values."
 model: sonnet
+max_turns: 50
 color: blue
 tools: Read, Grep, Glob, Bash
 ---

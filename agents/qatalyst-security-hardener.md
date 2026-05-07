@@ -2,6 +2,7 @@
 name: security-hardener
 description: "Security review specialist for the Qatalyst network installer. Focuses on risks unique to a root-level Linux system tool: privilege handling, file permission safety, input sanitization of sysfs/procfs data, TOCTOU races on filesystem operations, secrets in logs, and safe handling of user-supplied network configurations."
 model: sonnet
+max_turns: 50
 color: red
 tools: Read, Grep, Glob, Bash
 ---

@@ -2,6 +2,7 @@
 name: architecture-reviewer
 description: "Architecture reviewer for the Qompass telemetry platform. Evaluates package boundaries, dependency direction, component isolation (depguard), statelessness invariants, and separation of concerns across the ingest → NATS → writer → storage → dashboard pipeline."
 model: opus
+max_turns: 50
 color: cyan
 tools: Read, Grep, Glob, Bash
 ---

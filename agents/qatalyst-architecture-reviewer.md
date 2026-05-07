@@ -3,6 +3,7 @@ name: architecture-reviewer
 description: "Use this agent when the user wants a structural review of the project's architecture, modularity, maintainability, or overall code organization. This includes requests to evaluate package boundaries, dependency graphs, separation of concerns, or long-term maintainability risks.\\n\\nExamples:\\n- user: \"Review the architecture of this project\"\\n  assistant: \"I'll use the architecture-reviewer agent to analyze the project structure and provide a detailed architectural review.\"\\n\\n- user: \"Is this codebase well-organized? Are there any modularity concerns?\"\\n  assistant: \"Let me launch the architecture-reviewer agent to evaluate the project's modularity and organization.\"\\n\\n- user: \"We're planning a major refactor — what structural issues should we address?\"\\n  assistant: \"I'll use the architecture-reviewer agent to identify structural issues and refactoring priorities.\""
 tools: Bash, Glob, Grep, Read, WebFetch, WebSearch
 model: opus
+max_turns: 50
 color: cyan
 memory: project
 ---

@@ -2,6 +2,7 @@
 name: test-quality-reviewer
 description: "Reviews test quality across Go and TypeScript codebases. Evaluates test isolation, assertion strength, edge case coverage, table-driven test patterns, test naming, helper design, and whether tests actually prove the code works. Applicable to any project that enforces TDD."
 model: sonnet
+max_turns: 50
 color: purple
 tools: Read, Grep, Glob, Bash
 ---

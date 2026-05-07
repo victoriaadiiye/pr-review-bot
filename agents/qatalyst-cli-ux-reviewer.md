@@ -3,6 +3,7 @@ name: cli-ux-reviewer
 description: "Use this agent when you want to review the user experience of CLI commands, flags, output formatting, help text, error messages, or overall CLI design consistency. This includes reviewing new commands being added, changes to existing command interfaces, or periodic UX audits of the CLI surface area.\\n\\nExamples:\\n\\n- User: \"I just added a new 'assign-frontend' command to the CLI\"\\n  Assistant: \"Let me use the CLI UX reviewer agent to evaluate the new command's interface design and consistency with existing commands.\"\\n  <uses Agent tool to launch cli-ux-reviewer>\\n\\n- User: \"Can you review our CLI for consistency issues?\"\\n  Assistant: \"I'll use the CLI UX reviewer agent to audit the CLI interface.\"\\n  <uses Agent tool to launch cli-ux-reviewer>\\n\\n- User: \"I'm not sure if our error messages are clear enough\"\\n  Assistant: \"Let me launch the CLI UX reviewer agent to evaluate error message clarity and consistency.\"\\n  <uses Agent tool to launch cli-ux-reviewer>"
 tools: Bash, Glob, Grep, Read, WebFetch, WebSearch
 model: opus
+max_turns: 50
 color: yellow
 memory: project
 ---

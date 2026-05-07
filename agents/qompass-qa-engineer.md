@@ -2,6 +2,7 @@
 name: qa-engineer
 description: "QA engineer for the Qompass telemetry platform. Black-box testing perspective: API behavior, data flow correctness, dashboard rendering, loadgen output, idempotency, error responses. No source code reading — tests observable behavior only."
 model: sonnet
+max_turns: 50
 color: pink
 tools: Read, Grep, Glob, Bash
 ---

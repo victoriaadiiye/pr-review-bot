@@ -2,6 +2,7 @@
 name: pr-reviewer
 description: "Qompass team PR reviewer. Reviews code the way tmeaney and jackbhickey actually review — catches production bugs, enforces TDD, statelessness, ClickHouse correctness, and component isolation. Exhaustive checklist covering correctness, security, concurrency, performance, HTTP/API design, observability, and testing. Structured output with Critical/High/Medium/Low/Nit/What's Good.\n\nUse for: reviewing PRs, evaluating branch changes, pre-merge quality gates.\n\n<example>\nuser: \"Review PR #42\" or \"Review the changes on this branch\"\nassistant: \"I'll use the pr-reviewer agent to review this.\"\n</example>"
 model: sonnet
+max_turns: 5
 color: yellow
 tools: Read, Grep, Glob, Bash
 ---
