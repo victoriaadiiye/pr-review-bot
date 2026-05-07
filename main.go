@@ -41,7 +41,7 @@ const (
 	ModeQuick    ReviewMode = "quick"
 	ModeFinal    ReviewMode = "final"
 
-	agentMaxTurnsDefault = 25
+	agentMaxTurnsDefault  = 50
 	agentMaxTurnsThorough = 50
 )
 
