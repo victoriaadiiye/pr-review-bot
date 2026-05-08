@@ -2418,8 +2418,17 @@ For EACH finding in each review:
    - **INVALID: MISQUOTED** — code exists but reviewer misquoted or mischaracterized it
    - **INVALID: WRONG FILE** — reviewer attributes code to wrong file
    - **INVALID: PRE-EXISTING** — issue exists but was not introduced or modified by this PR
+   - **INVALID: WRONG CLASSIFICATION** — reviewer claims a violation based on incorrect assumptions about project rules (e.g., claiming a "leaf" package violates isolation when leaves are explicitly allowed to be imported, or asserting a linter rule that does not exist in the config shown in the diff)
    - **OVERSTATED** — observation has some basis but severity is inflated (e.g., "Critical" for a theoretical concern, or claiming "unbounded" when the code has explicit bounds). You MUST state what the correct severity should be (e.g., "OVERSTATED: Medium — requires authenticated access and sustained scanning"). Critical means: unauthorized access, data corruption, or service unavailability for unauthenticated users with no sustained effort. Auth-gated issues cap at High. Theoretical concerns cap at Medium
+   - **OVERSTATED: DEFENSE-IN-DEPTH** — the issue is real at the flagged layer but a callee or downstream layer already enforces the constraint (e.g., handler missing bounds check but the storage query clamps it). Downgrade severity: a missing check at layer N when layer N+1 enforces it is a doc-code mismatch, not an unbounded risk
    - **UNVERIFIABLE** — claim may be valid but cannot be confirmed from the diff alone
+   - **UNVERIFIABLE: HISTORICAL CLAIM** — reviewer asserts something about prior reviews, regression history, or review rounds without evidence. Flag as unverifiable — reviewers must not cite review history they don't have access to
+
+## Additional Verification Rules
+
+5. **Verify counts** — when a reviewer states a specific count (e.g., "7 handlers use X", "6 ignored errors"), count the actual occurrences in the diff. If the count is wrong, note the correct count and mark the claim MISQUOTED if the error changes the finding's weight.
+6. **Check project-specific classifications** — if the diff contains isolation tests, depguard configs, or package classification files, use them as ground truth. A reviewer claiming an import violates isolation MUST be checked against these files. Importing a leaf package is always allowed.
+7. **Trace callees for severity** — when a reviewer claims "unbounded" or "no validation", check whether the called function (visible in the diff or referenced in unchanged context) already enforces the constraint. If so, downgrade severity.
 
 ## Output Format
 
@@ -2659,7 +2668,7 @@ func runScorer(ctx context.Context, perspectiveScores []PerspectiveScore, valida
 
 	validatorBlock := ""
 	if validatorOutput != "" {
-		validatorBlock = fmt.Sprintf("\n## Validator Results\nA strict validator has verified each reviewer finding against the actual diff. Findings marked INVALID were hallucinated or incorrect — do NOT count them as real issues. Only VERIFIED findings should influence your score.\n\nScoring adjustments based on validation:\n- Adjust perspective scores downward if a reviewer had many invalid findings, especially false Critical claims — a false Critical costs the most author time to investigate and should be penalized heavily\n- Adjust upward if their concerns were mostly dismissed but the code is actually sound\n- An overstated severity (e.g., claiming \"Critical\" for a theoretical or pre-existing concern) should reduce that reviewer's credibility weight, even if the underlying observation has some merit\n\n%s\n\n", validatorOutput)
+		validatorBlock = fmt.Sprintf("\n## Validator Results\nA strict validator has verified each reviewer finding against the actual diff. Findings marked INVALID or WRONG CLASSIFICATION were hallucinated or incorrect — do NOT count them as real issues. Only VERIFIED findings should influence your score.\n\nScoring adjustments based on validation:\n- Adjust perspective scores downward if a reviewer had many invalid findings, especially false Critical claims — a false Critical costs the most author time to investigate and should be penalized heavily\n- Findings marked WRONG CLASSIFICATION (e.g., claiming isolation violation on a leaf package) are false positives — treat same as INVALID\n- Findings marked DEFENSE-IN-DEPTH have real observations but overstated severity — use the validator's corrected severity, not the agent's original\n- Adjust upward if their concerns were mostly dismissed but the code is actually sound\n- An overstated severity (e.g., claiming \"Critical\" for a theoretical or pre-existing concern) should reduce that reviewer's credibility weight, even if the underlying observation has some merit\n\n%s\n\n", validatorOutput)
 	}
 
 	perspectiveBlock := ""
@@ -2828,13 +2837,15 @@ Merge them into ONE cohesive, comprehensive review. Structure:
 Rules:
 - The GO-EXPERT review is the most authoritative voice. When reviewers conflict, defer to GO-EXPERT. Its critical issues are always included. Its verdict carries the most weight in the final verdict.
 - Deduplicate overlapping feedback
-- Drop anything the validator flagged as incorrect
-- When the validator marks a finding as OVERSTATED, use the validator's corrected severity, not the agent's original. Never promote an OVERSTATED finding back to Critical
+- Drop anything the validator flagged as incorrect, including findings marked WRONG CLASSIFICATION
+- When the validator marks a finding as OVERSTATED or DEFENSE-IN-DEPTH, use the validator's corrected severity, not the agent's original. Never promote an OVERSTATED finding back to Critical
 - Agreement ≠ accuracy. Multiple reviewers flagging the same issue does NOT increase confidence. All agents see the same diff and share the same blind spots. When multiple reviewers agree, check whether they made the same reasoning error (e.g., all reading one file without checking callees). Weight validator results above reviewer consensus
 - Incorporate answers to reviewer questions from the validation
 - Keep it actionable and specific
 - Reference file names and line numbers where relevant
-- Do NOT include a Quality Score section, score table, or numerical scores — scoring is handled separately%s%s
+- Do NOT include a Quality Score section, score table, or numerical scores — scoring is handled separately
+- **Summary scope rule**: The Summary line MUST only describe changes visible in the diff and commit manifest. Do not infer, extrapolate, or generalize scope beyond what the files actually show. If the diff touches 3 areas, describe 3 areas — not a broader narrative. Fabricating scope (e.g., claiming "UI improvements across Fleet and Infrastructure" when no Fleet/Infrastructure files changed) is a critical synthesis failure
+- **No review history claims**: Do not assert that issues were "flagged in previous reviews" or are "third-round regressions" unless the prior review text is provided as input. Unverifiable historical claims sound authoritative but erode trust%s%s
 %s
 ## Reviews
 %s

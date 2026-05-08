@@ -27,7 +27,7 @@ Derived from 225 PRs, 130 review comments, and 9 explicit review-remediation PRs
 
 **2. No panic(), ever** — tmeaney: "never, ever panic!" This became a CLAUDE.md rule after PR #34. Zero tolerance. In a distributed system, panic kills the process, drops in-flight requests, cascading failures across the cluster. Always return an error.
 
-**3. No ignored errors** — `_ = fn()` where fn returns error is always Critical. tmeaney specifically called out Claude for rating ignored encode errors as "nit" — the team considers them bugs.
+**3. No ignored errors** — `_ = fn()` where fn returns error is always Critical. tmeaney specifically called out Claude for rating ignored encode errors as "nit" — the team considers them bugs. **Exception**: `defer _ = conn.Close()` on read-only resources (e.g., HTTP response bodies, read-only file handles) is an accepted pattern — the close error is not actionable. When counting ignored errors, separate `defer Close` on read-only resources from active-path error suppression (e.g., `_, _ = io.Copy(...)`, `_ = conn.CloseWrite()`). Only count active-path suppressions as violations.
 
 **4. TDD discipline** — RED commit first (test fails), GREEN commit (implementation). Never in the same commit. tmeaney: "TDD violation — test and implementation in same commit. CLAUDE.md is explicit." jackbhickey: "None of the four fixes added tests. Per feedback_tdd_no_excuses.md, each fix is supposed to be its own RED-GREEN cycle."
 
@@ -35,7 +35,7 @@ Derived from 225 PRs, 130 review comments, and 9 explicit review-remediation PRs
 
 **6. Fail closed on security** — Empty tenantID returns zero rows, not all rows. Missing auth config crashes the pod, doesn't silently degrade. `readonly=2` not `readonly=1` for ClickHouse profiles. Row policies on ALL tenant-data tables.
 
-**7. Component isolation** — Components under `internal/` cannot import each other. Enforced by depguard. New packages must be classified as component (add to `.golangci.yml` files: + deny:) or leaf (add to `leafPackages` in `isolation_test.go`). `TestComponentIsolationCoverage` catches drift.
+**7. Component isolation** — Components under `internal/` cannot import each other. Enforced by depguard. New packages must be classified as component (add to `.golangci.yml` files: + deny:) or leaf (add to `leafPackages` in `isolation_test.go`). `TestComponentIsolationCoverage` catches drift. **Importing a leaf is always allowed** — verify the package is classified as a component (not a leaf) before flagging. Do not assume classification from the package name.
 
 **8. ClickHouse schema correctness:**
 - New migrations go in `cluster-migrations/` with `ON CLUSTER` keyword. `migrations/` is deprecated.
@@ -324,6 +324,12 @@ Things this team's reviewers have specifically called out AI reviewers for getti
 3. **Domain ignorance** — The team expects reviewers to understand: MQ pipeline vs Nexus pipeline, ClickHouse ReplicatedMergeTree semantics, NATS JetStream consumer patterns, Kubernetes pod lifecycle, Gateway API routing. If you don't understand the domain context, say so rather than guessing.
 
 4. **False authority** — jackbhickey: "Infrastructure/Terraform review — not my strong suit... but the change is small and mechanical enough to reason about." It's OK to flag your confidence level on specific findings. The team respects reviewers who know their limits.
+
+5. **Defense-in-depth blind spots** — Before rating severity, trace the call chain. A missing validation at the handler layer is less critical if the callee (storage query, downstream function) enforces the same constraint. Rate the gap as a doc-code mismatch, not as the full risk of the missing check.
+
+6. **Precise counts** — When asserting a specific count ("7 handlers", "6 ignored errors"), count every occurrence in the diff. Wrong counts erode credibility and waste author time investigating phantom instances.
+
+7. **No review history claims** — Do not assert "flagged in previous reviews" or "third-round regression" unless you have actual prior review text. Unverifiable historical claims sound authoritative but cannot be checked.
 
 ---
 

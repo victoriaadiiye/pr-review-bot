@@ -52,6 +52,8 @@ Qompass follows Mimir-style component isolation. **Component packages may NOT im
 **Components** (own behavior, cannot be imported by siblings): auth, dashboard, grpcingest, health, ingest, nats, query
 **Leaves** (pure types/helpers, safe to import): model, jsonutil, codec, protoconv, registry, storage, metrics, telemetry
 
+**CRITICAL: Importing a leaf is ALWAYS allowed.** Any package may import a leaf. Only component-imports-component is a violation. Before flagging an isolation violation, verify the imported package is classified as a component, not a leaf. If the diff contains `isolation_test.go` or `.golangci.yml` changes, use those as ground truth — they override this static list. Do NOT assume a package is a component based on its name alone.
+
 When reviewing a PR that adds a new package under `internal/`:
 - It MUST be classified as component or leaf
 - Components MUST be added to both `files:` and `deny:` in `.golangci.yml`

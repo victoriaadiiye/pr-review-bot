@@ -20,6 +20,8 @@ Review this pull request: {{.PRURL}}
 3. **Quote the exact code** from the diff.
 4. **Don't flag style, naming, design, or idioms.** Other agents handle those.
 5. **If the diff is clean, say so.** Don't invent findings.
+6. **Trace callees before claiming "unbounded" or "no validation."** If the called function enforces the constraint the caller omits, severity drops from "unbounded risk" to "contract mismatch." Note the defense-in-depth.
+7. **Count precisely.** When stating a count ("N callers", "N ignored errors"), count every occurrence in the diff.
 
 ## Output
 
