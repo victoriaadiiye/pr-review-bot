@@ -2254,3 +2254,45 @@ func TestFilterAgentsByDiff(t *testing.T) {
 		})
 	}
 }
+
+func TestDiffLocationAt(t *testing.T) {
+	diff := `diff --git a/cmd/server.go b/cmd/server.go
+--- a/cmd/server.go
++++ b/cmd/server.go
+@@ -10,3 +10,4 @@
+ existing line
++new line with MergeTree
+ another line
+diff --git a/internal/storage/migrations/001.sql b/internal/storage/migrations/001.sql
+--- a/internal/storage/migrations/001.sql
++++ b/internal/storage/migrations/001.sql
+@@ -1,2 +1,3 @@
++CREATE TABLE events ENGINE = ReplacingMergeTree
+`
+
+	tests := []struct {
+		name     string
+		substr  string
+		wantFile string
+	}{
+		{"match in go file", "MergeTree", "cmd/server.go"},
+		{"match in sql file", "ReplacingMergeTree", "internal/storage/migrations/001.sql"},
+		{"match before any file header", "diff --git", "(unknown)"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			offset := strings.Index(diff, tt.substr)
+			if offset < 0 {
+				t.Fatalf("substring %q not found in diff", tt.substr)
+			}
+			file, line := diffLocationAt(diff, offset)
+			if file != tt.wantFile {
+				t.Errorf("file = %q, want %q", file, tt.wantFile)
+			}
+			if line < 1 {
+				t.Errorf("line = %d, want >= 1", line)
+			}
+		})
+	}
+}

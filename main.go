@@ -1115,13 +1115,31 @@ func filterAgentsByDiff(agents []agentFile, diff string) []agentFile {
 			log.Printf("agent %s: invalid diff_match pattern %q: %v — skipping agent", a.name, a.diffMatch, err)
 			continue
 		}
-		if re.MatchString(diff) {
+		if loc := re.FindStringIndex(diff); loc != nil {
+			match := diff[loc[0]:loc[1]]
+			file, line := diffLocationAt(diff, loc[0])
+			log.Printf("agent %s: activated — matched %q at %s:%d", a.name, match, file, line)
 			filtered = append(filtered, a)
 		} else {
 			log.Printf("agent %s: diff_match %q not found in diff — skipping", a.name, a.diffMatch)
 		}
 	}
 	return filtered
+}
+
+func diffLocationAt(diff string, offset int) (file string, line int) {
+	prefix := diff[:offset]
+	line = strings.Count(prefix, "\n") + 1
+	file = "(unknown)"
+	if idx := strings.LastIndex(prefix, "\n+++ b/"); idx >= 0 {
+		rest := prefix[idx+len("\n+++ b/"):]
+		if nl := strings.IndexByte(rest, '\n'); nl >= 0 {
+			file = rest[:nl]
+		} else {
+			file = rest
+		}
+	}
+	return file, line
 }
 
 func filterOnlyAgents(agents []agentFile, only []string) []agentFile {
