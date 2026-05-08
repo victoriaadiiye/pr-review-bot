@@ -1543,6 +1543,99 @@ func TestFilterAgentsByProject_ThenFilterAgents(t *testing.T) {
 	}
 }
 
+func TestParseOnlyAgents(t *testing.T) {
+	tests := []struct {
+		input string
+		want  []string
+	}{
+		{"review https://github.com/org/repo/pull/1", nil},
+		{"review https://github.com/org/repo/pull/1 --only correctness", []string{"correctness"}},
+		{"review https://github.com/org/repo/pull/1 --only correctness,go-expert", []string{"correctness", "go-expert"}},
+		{"review https://github.com/org/repo/pull/1 --only correctness,go-expert,pragmatic", []string{"correctness", "go-expert", "pragmatic"}},
+		{"--only design https://github.com/org/repo/pull/1", []string{"design"}},
+	}
+	for _, tt := range tests {
+		got := parseOnlyAgents(tt.input)
+		if len(got) != len(tt.want) {
+			t.Errorf("parseOnlyAgents(%q) = %v, want %v", tt.input, got, tt.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tt.want[i] {
+				t.Errorf("parseOnlyAgents(%q)[%d] = %q, want %q", tt.input, i, got[i], tt.want[i])
+			}
+		}
+	}
+}
+
+func TestFilterOnlyAgents(t *testing.T) {
+	agents := []agentFile{
+		{name: "correctness"},
+		{name: "design"},
+		{name: "go-expert"},
+		{name: "pragmatic"},
+	}
+
+	t.Run("nil only returns all", func(t *testing.T) {
+		got := filterOnlyAgents(agents, nil)
+		if len(got) != 4 {
+			t.Fatalf("got %d agents, want 4", len(got))
+		}
+	})
+
+	t.Run("empty only returns all", func(t *testing.T) {
+		got := filterOnlyAgents(agents, []string{})
+		if len(got) != 4 {
+			t.Fatalf("got %d agents, want 4", len(got))
+		}
+	})
+
+	t.Run("single agent", func(t *testing.T) {
+		got := filterOnlyAgents(agents, []string{"correctness"})
+		if len(got) != 1 || got[0].name != "correctness" {
+			t.Fatalf("got %v, want [correctness]", got)
+		}
+	})
+
+	t.Run("multiple agents", func(t *testing.T) {
+		got := filterOnlyAgents(agents, []string{"correctness", "go-expert"})
+		if len(got) != 2 {
+			t.Fatalf("got %d agents, want 2", len(got))
+		}
+		if got[0].name != "correctness" || got[1].name != "go-expert" {
+			t.Errorf("got [%s, %s], want [correctness, go-expert]", got[0].name, got[1].name)
+		}
+	})
+
+	t.Run("nonexistent agent returns empty", func(t *testing.T) {
+		got := filterOnlyAgents(agents, []string{"nonexistent"})
+		if len(got) != 0 {
+			t.Fatalf("got %d agents, want 0", len(got))
+		}
+	})
+
+	t.Run("mix of valid and invalid", func(t *testing.T) {
+		got := filterOnlyAgents(agents, []string{"correctness", "nonexistent"})
+		if len(got) != 1 || got[0].name != "correctness" {
+			t.Fatalf("got %v, want [correctness]", got)
+		}
+	})
+}
+
+func TestFilterOnlyAgents_WithFlagFilter(t *testing.T) {
+	agents := []agentFile{
+		{name: "correctness"},
+		{name: "design"},
+		{name: "necessity", flag: "bare-necessities"},
+	}
+
+	filtered := filterAgents(agents, map[string]bool{"bare-necessities": true})
+	got := filterOnlyAgents(filtered, []string{"correctness", "necessity"})
+	if len(got) != 2 {
+		t.Fatalf("got %d agents, want 2", len(got))
+	}
+}
+
 func TestLoadProjectsConfig_RealFile(t *testing.T) {
 	old := projectsConfigPath
 	projectsConfigPath = "projects.json"
@@ -1963,5 +2056,132 @@ func TestBuildReviewMemory(t *testing.T) {
 	}
 	if len(mem.FilesReviewed) != 1 || mem.FilesReviewed[0] != "main.go" {
 		t.Errorf("FilesReviewed = %v, want [main.go]", mem.FilesReviewed)
+	}
+}
+
+func TestMinInt(t *testing.T) {
+	tests := []struct {
+		a, b, want int
+	}{
+		{5, 10, 5},
+		{10, 5, 5},
+		{7, 7, 7},
+		{0, 5, 0},
+		{12, 40, 12},
+	}
+	for _, tt := range tests {
+		got := minInt(tt.a, tt.b)
+		if got != tt.want {
+			t.Errorf("minInt(%d, %d) = %d, want %d", tt.a, tt.b, got, tt.want)
+		}
+	}
+}
+
+func TestDiffManifest_FormatForValidator_Empty(t *testing.T) {
+	m := DiffManifest{}
+	got := m.FormatForValidator()
+	if got != "" {
+		t.Errorf("empty manifest should return empty string, got %q", got)
+	}
+}
+
+func TestDiffManifest_FormatForValidator_WithCommits(t *testing.T) {
+	m := DiffManifest{
+		Commits: []CommitEntry{
+			{SHA: "abc123def456", Subject: "feat: add handler", Files: []string{"main.go", "handler.go"}},
+			{SHA: "def789abc012", Subject: "test: add handler test", Files: []string{"main_test.go"}},
+		},
+		Files: []string{"main.go", "handler.go", "main_test.go"},
+	}
+	got := m.FormatForValidator()
+
+	if !strings.Contains(got, "## PR Commit Manifest") {
+		t.Error("should contain manifest header")
+	}
+	if !strings.Contains(got, "`abc123def456`") {
+		t.Error("should contain first commit SHA")
+	}
+	if !strings.Contains(got, "feat: add handler") {
+		t.Error("should contain first commit subject")
+	}
+	if !strings.Contains(got, "  - main.go") {
+		t.Error("should contain file listing for first commit")
+	}
+	if !strings.Contains(got, "`def789abc012`") {
+		t.Error("should contain second commit SHA")
+	}
+	if !strings.Contains(got, "  - main_test.go") {
+		t.Error("should contain file listing for second commit")
+	}
+	if !strings.Contains(got, "**Total files changed in PR:** 3") {
+		t.Error("should contain total file count")
+	}
+}
+
+func TestDiffManifest_FormatForValidator_NoFiles(t *testing.T) {
+	m := DiffManifest{
+		Commits: []CommitEntry{
+			{SHA: "abc123", Subject: "empty commit", Files: nil},
+		},
+		Files: nil,
+	}
+	got := m.FormatForValidator()
+	if !strings.Contains(got, "`abc123`") {
+		t.Error("should contain commit SHA")
+	}
+	if !strings.Contains(got, "**Total files changed in PR:** 0") {
+		t.Error("should show 0 total files")
+	}
+}
+
+func TestCommitEntry_JSONRoundTrip(t *testing.T) {
+	entry := CommitEntry{
+		SHA:     "abc123def456",
+		Subject: "fix: handle nil",
+		Files:   []string{"main.go", "util.go"},
+	}
+	data, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got CommitEntry
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.SHA != entry.SHA {
+		t.Errorf("SHA = %q, want %q", got.SHA, entry.SHA)
+	}
+	if got.Subject != entry.Subject {
+		t.Errorf("Subject = %q, want %q", got.Subject, entry.Subject)
+	}
+	if len(got.Files) != 2 || got.Files[0] != "main.go" || got.Files[1] != "util.go" {
+		t.Errorf("Files = %v, want [main.go util.go]", got.Files)
+	}
+}
+
+func TestDiffManifest_JSONRoundTrip(t *testing.T) {
+	m := DiffManifest{
+		Commits: []CommitEntry{
+			{SHA: "abc123", Subject: "first", Files: []string{"a.go"}},
+			{SHA: "def456", Subject: "second", Files: []string{"b.go", "c.go"}},
+		},
+		Files: []string{"a.go", "b.go", "c.go"},
+	}
+	data, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got DiffManifest
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Commits) != 2 {
+		t.Fatalf("Commits len = %d, want 2", len(got.Commits))
+	}
+	if got.Commits[0].SHA != "abc123" {
+		t.Errorf("Commits[0].SHA = %q, want %q", got.Commits[0].SHA, "abc123")
+	}
+	if len(got.Files) != 3 {
+		t.Errorf("Files len = %d, want 3", len(got.Files))
 	}
 }

@@ -61,6 +61,7 @@ type ReviewRequest struct {
 	SpecContent        string
 	SpecPath           string
 	Flags              map[string]bool
+	OnlyAgents         []string
 }
 
 type claudeResponse struct {
@@ -579,6 +580,7 @@ var (
 	testPattern          = regexp.MustCompile(`--test\b`)
 	specPattern          = regexp.MustCompile(`--spec\s+(\S+)`)
 	flagPattern          = regexp.MustCompile(`--([a-z][-a-z0-9]*)\b`)
+	onlyPattern          = regexp.MustCompile(`--only\s+([\w,.-]+)`)
 	previousScorePattern = regexp.MustCompile(`\*\*Quality Score: (\d+)/100\*\*`)
 	previousSpecPattern  = regexp.MustCompile(`<!-- spec: (\S+) -->`)
 	reviewRequestPattern = regexp.MustCompile(`(?i)\breview\b`)
@@ -772,6 +774,7 @@ func runCLI(args []string) {
 
 	mode, modeExplicit := parseMode(input)
 	flags := parseFlags(input)
+	onlyAgents := parseOnlyAgents(input)
 	noGitHub := strings.Contains(input, "--no-github")
 
 	if mode == ModeInitial && !modeExplicit && sessionStore.Get(prURL) != "" {
@@ -798,6 +801,7 @@ func runCLI(args []string) {
 		projCfg, _ := loadProjectsConfig()
 		filtered := filterAgentsByProject(agents, projCfg.agentsForRepo(owner, repo))
 		filtered = filterAgents(filtered, flags)
+		filtered = filterOnlyAgents(filtered, onlyAgents)
 		var names []string
 		for _, a := range filtered {
 			names = append(names, a.name)
@@ -851,6 +855,7 @@ func runCLI(args []string) {
 		Questions:          reviewQuestions,
 		Mode:               mode,
 		Flags:              flags,
+		OnlyAgents:         onlyAgents,
 		PreviousReviews:    previousReviews,
 		AcknowledgedIssues: acknowledgedIssues,
 	}
@@ -1073,7 +1078,7 @@ func parseSpecPath(text string) string {
 func parseFlags(text string) map[string]bool {
 	reserved := map[string]bool{
 		"initial": true, "re-review": true, "quick": true, "final": true,
-		"self": true, "spec": true, "test": true, "no-github": true,
+		"self": true, "spec": true, "test": true, "no-github": true, "only": true,
 	}
 	flags := make(map[string]bool)
 	for _, m := range flagPattern.FindAllStringSubmatch(text, -1) {
@@ -1092,6 +1097,39 @@ func filterAgents(agents []agentFile, flags map[string]bool) []agentFile {
 		}
 	}
 	return filtered
+}
+
+func filterOnlyAgents(agents []agentFile, only []string) []agentFile {
+	if len(only) == 0 {
+		return agents
+	}
+	allowed := make(map[string]bool, len(only))
+	for _, name := range only {
+		allowed[name] = true
+	}
+	var filtered []agentFile
+	for _, a := range agents {
+		if allowed[a.name] {
+			filtered = append(filtered, a)
+		}
+	}
+	return filtered
+}
+
+func parseOnlyAgents(text string) []string {
+	m := onlyPattern.FindStringSubmatch(text)
+	if m == nil {
+		return nil
+	}
+	parts := strings.Split(m[1], ",")
+	var agents []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			agents = append(agents, p)
+		}
+	}
+	return agents
 }
 
 func resolveMaxTurns(agent agentFile, thorough bool) int {
@@ -1122,6 +1160,7 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 	selfReview := selfPattern.MatchString(ev.Text)
 	jiraTicket := parseJiraTicket(ev.Text)
 	flags := parseFlags(ev.Text)
+	onlyAgents := parseOnlyAgents(ev.Text)
 
 	if mode == ModeInitial && !modeExplicit && sessionStore.Get(prURL) != "" {
 		mode = ModeReReview
@@ -1158,6 +1197,7 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 		projCfg, _ := loadProjectsConfig()
 		filtered := filterAgentsByProject(agents, projCfg.agentsForRepo(owner, repo))
 		filtered = filterAgents(filtered, flags)
+		filtered = filterOnlyAgents(filtered, onlyAgents)
 		var agentNames []string
 		for _, a := range filtered {
 			agentNames = append(agentNames, a.name)
@@ -1272,7 +1312,9 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 			if agentErr == nil {
 				projCfg, _ := loadProjectsConfig()
 				filtered := filterAgentsByProject(agents, projCfg.agentsForRepo(owner, repo))
-				agentCount = len(filterAgents(filtered, flags))
+				filtered = filterAgents(filtered, flags)
+				filtered = filterOnlyAgents(filtered, onlyAgents)
+				agentCount = len(filtered)
 			}
 			dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Launching %d agent(s) in %s mode...", len(diff), agentCount, mode))
 		}
@@ -1294,6 +1336,7 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 		SpecContent:        specContent,
 		SpecPath:           specPath,
 		Flags:              flags,
+		OnlyAgents:         onlyAgents,
 	}
 
 	if ctx.Err() != nil {
@@ -1511,6 +1554,100 @@ func (s *SessionStore) Set(prURL, sessionID string) {
 	raw, _ := json.Marshal(s.data)
 	_ = os.WriteFile(s.path, raw, 0o644)
 	log.Printf("session-store: saved %s → %s", prURL, sessionID)
+}
+
+// --- Diff Manifest ---
+
+type CommitEntry struct {
+	SHA     string   `json:"sha"`
+	Subject string   `json:"subject"`
+	Files   []string `json:"files"`
+}
+
+type DiffManifest struct {
+	Commits []CommitEntry `json:"commits"`
+	Files   []string      `json:"files"`
+}
+
+func buildDiffManifest(ctx context.Context, gitDir, mergeBase, prRef string) DiffManifest {
+	var manifest DiffManifest
+
+	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir,
+		"log", "--no-merges", "--format=%H %s", mergeBase+".."+prRef)
+	out, err := cmd.Output()
+	if err != nil {
+		log.Printf("diff-manifest: commit log failed: %v", err)
+		return manifest
+	}
+
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, " ", 2)
+		if len(parts) < 2 {
+			continue
+		}
+		sha := parts[0]
+		subject := parts[1]
+
+		filesCmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir,
+			"diff-tree", "--no-commit-id", "-r", "--name-only", sha)
+		filesOut, filesErr := filesCmd.Output()
+		var files []string
+		if filesErr == nil {
+			for _, f := range strings.Split(strings.TrimSpace(string(filesOut)), "\n") {
+				if f != "" {
+					files = append(files, f)
+				}
+			}
+		}
+
+		manifest.Commits = append(manifest.Commits, CommitEntry{
+			SHA:     sha[:minInt(12, len(sha))],
+			Subject: subject,
+			Files:   files,
+		})
+	}
+
+	if mergeBase != "" && prRef != "" {
+		filesCmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir,
+			"diff", "--name-only", mergeBase, prRef)
+		filesOut, filesErr := filesCmd.Output()
+		if filesErr == nil {
+			for _, f := range strings.Split(strings.TrimSpace(string(filesOut)), "\n") {
+				if f != "" {
+					manifest.Files = append(manifest.Files, f)
+				}
+			}
+		}
+	}
+
+	return manifest
+}
+
+func (m DiffManifest) FormatForValidator() string {
+	if len(m.Commits) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("## PR Commit Manifest\n")
+	b.WriteString("Each commit in this PR and the files it touches:\n\n")
+	for _, c := range m.Commits {
+		fmt.Fprintf(&b, "- `%s` %s\n", c.SHA, c.Subject)
+		for _, f := range c.Files {
+			fmt.Fprintf(&b, "  - %s\n", f)
+		}
+	}
+	b.WriteString(fmt.Sprintf("\n**Total files changed in PR:** %d\n", len(m.Files)))
+	return b.String()
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // --- Smart Diff ---
@@ -1939,6 +2076,8 @@ func fetchSpecFromRepo(ctx context.Context, owner, repo, specPath, prNum string)
 
 func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, req ReviewRequest) (string, *ScoreResult, *UsageStats, error) {
 	stats := &UsageStats{}
+	logDir := reviewLogDir(req.Owner, req.Repo, req.PRNum, time.Now())
+	log.Printf("review logs: %s", logDir)
 
 	var extraContext strings.Builder
 	if req.JiraContext != "" {
@@ -2024,8 +2163,10 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 	}
 	agents := filterAgentsByProject(allAgents, projCfg.agentsForRepo(req.Owner, req.Repo))
 	agents = filterAgents(agents, req.Flags)
+	agents = filterOnlyAgents(agents, req.OnlyAgents)
 
 	agentWorkDir := ""
+	var manifest DiffManifest
 	if req.PRNum != "" {
 		wt, wtErr := repoCache.CreateWorktree(ctx, req.Owner, req.Repo, req.PRNum)
 		if wtErr != nil {
@@ -2033,6 +2174,17 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 		} else {
 			agentWorkDir = wt
 			defer repoCache.RemoveWorktree(ctx, req.Owner, req.Repo, wt)
+		}
+
+		gitDir := repoCache.gitDir(req.Owner, req.Repo)
+		baseRef, baseErr := getPRBaseRef(ctx, req.Owner, req.Repo, req.PRNum)
+		if baseErr == nil {
+			prRef := "refs/prs/" + req.PRNum
+			mergeBase, mbErr := gitMergeBase(ctx, gitDir, "refs/heads/"+baseRef, prRef)
+			if mbErr == nil {
+				manifest = buildDiffManifest(ctx, gitDir, mergeBase, prRef)
+				log.Printf("diff-manifest: %d commits, %d files for %s", len(manifest.Commits), len(manifest.Files), req.PRURL)
+			}
 		}
 	}
 
@@ -2099,6 +2251,7 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 			}
 			stats.Add(resp)
 			stats.AddAgent(agent.name, resp.TotalCostUSD, agentDur, resp.NumTurns, maxTurns)
+			writeAgentLog(logDir, agent.name, text)
 			reviewText, ps := extractPerspectiveScore(agent.name, text)
 			mu.Lock()
 			reviews[idx] = fmt.Sprintf("## %s Review\n\n%s", strings.ToUpper(agent.name), reviewText)
@@ -2129,28 +2282,47 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 	dmUser(api, notifyUserID, fmt.Sprintf("%d/%d agents done. Running validator...", successfulReviews, len(agents)))
 	allReviews := strings.Join(filteredReviews, "\n\n---\n\n")
 
+	manifestBlock := manifest.FormatForValidator()
+
 	log.Printf("validator: starting for %s", req.PRURL)
 	valStart := time.Now()
-	validated, valResp, err := runClaude(ctx, fmt.Sprintf(`You are a review validator. You have %d independent code reviews of a PR and the original diff.
+	validated, valResp, err := runClaude(ctx, fmt.Sprintf(`You are a strict review validator. You have %d independent code reviews of a PR, the original diff, and a commit manifest showing exactly which files each commit touches.
 
-Your job:
-1. Check each review for accuracy — are the claims correct given the actual diff?
-2. Flag any incorrect or misleading feedback
-3. Note if reviewers missed anything important
-4. Check if any questions raised by reviewers can be answered from the diff itself — if so, answer them
+Your job is to verify every claim in every review against the actual diff. Reviewers are known to hallucinate — referencing code from other PRs, inventing file paths, misquoting code, or making claims about unchanged code.
 
-Be concise. Output a validation report.
+## Validation Process
 
+For EACH finding in each review:
+1. **Locate the exact code** — find the quoted code or referenced file:line in the diff below. If it does not appear in the diff, the finding is INVALID.
+2. **Verify the claim** — does the code actually have the problem described? Read the surrounding diff context.
+3. **Check the commit** — if the reviewer references a specific change, verify it appears in the commit manifest below.
+4. **Classify** each finding as:
+   - **VERIFIED** — code exists in diff, claim is accurate
+   - **INVALID: NOT IN DIFF** — reviewer references code/files not present in this PR's diff
+   - **INVALID: MISQUOTED** — code exists but reviewer misquoted or mischaracterized it
+   - **INVALID: WRONG FILE** — reviewer attributes code to wrong file
+   - **INVALID: PRE-EXISTING** — issue exists but was not introduced or modified by this PR
+   - **UNVERIFIABLE** — claim may be valid but cannot be confirmed from the diff alone
+
+## Output Format
+
+For each review, list every finding with its validation status and a one-line explanation. Then provide:
+- Total findings vs verified vs invalid
+- Any important issues the reviewers missed that ARE visible in the diff
+- Answers to any questions reviewers raised that can be answered from the diff
+
+%s
 ## Original Diff
 `+"```diff\n%s\n```"+`
 
 ## Reviews to Validate
-%s`, len(agents), req.Diff, allReviews))
+%s`, len(agents), manifestBlock, req.Diff, allReviews))
 	if err != nil {
 		return "", nil, stats, fmt.Errorf("validator failed: %w", err)
 	}
 	stats.Add(valResp)
 	stats.AddAgent("validator", valResp.TotalCostUSD, time.Since(valStart), valResp.NumTurns, 0)
+	writeAgentLog(logDir, "validator", validated)
 	log.Printf("validator: done for %s ($%.4f)", req.PRURL, valResp.TotalCostUSD)
 
 	dmUser(api, notifyUserID, "Validator done. Scoring + merging...")
@@ -2176,6 +2348,7 @@ Be concise. Output a validation report.
 		} else {
 			stats.Add(scoreResp)
 			stats.AddAgent("scorer", scoreResp.TotalCostUSD, time.Since(scorerStart), scoreResp.NumTurns, 0)
+			writeAgentLog(logDir, "scorer", fmt.Sprintf("Score: %d/100\n\n%s", score.Overall, score.Summary))
 			log.Printf("scorer: done for %s (score: %d/100, $%.4f)", req.PRURL, score.Overall, scoreResp.TotalCostUSD)
 		}
 	}()
@@ -2189,6 +2362,7 @@ Be concise. Output a validation report.
 		}
 		stats.Add(mergeResp)
 		stats.AddAgent("merger", mergeResp.TotalCostUSD, time.Since(mergerStart), mergeResp.NumTurns, 0)
+		writeAgentLog(logDir, "merger", merged)
 		log.Printf("merger: done for %s ($%.4f)", req.PRURL, mergeResp.TotalCostUSD)
 	}()
 	scoreMerge.Wait()
@@ -2619,6 +2793,25 @@ func runClaudeOpts(ctx context.Context, prompt, resumeSessionID, workDir string,
 	}
 
 	return strings.TrimSpace(string(out)), claudeResponse{}, nil
+}
+
+func reviewLogDir(owner, repo, prNum string, ts time.Time) string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".pr-review-logs", owner, repo, prNum, ts.Format("20060102-150405"))
+}
+
+func writeAgentLog(dir, stage, text string) {
+	if dir == "" {
+		return
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		log.Printf("agent-log: mkdir failed: %v", err)
+		return
+	}
+	path := filepath.Join(dir, stage+".md")
+	if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+		log.Printf("agent-log: write failed for %s: %v", path, err)
+	}
 }
 
 func postGitHubComment(owner, repo, prNum, review string) error {
