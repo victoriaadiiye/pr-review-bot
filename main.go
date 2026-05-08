@@ -559,6 +559,10 @@ const reviewDiscipline = `
 5. **Verify "missing" claims before filing.** Before claiming code is "missing," "untested," or "unhandled," search for the relevant function, method, or test name across the package and its callers. "Not in this file" ≠ "doesn't exist." If you are in diff-only mode and cannot search, label the finding: "UNVERIFIED — could not confirm absence across codebase." Never state "no tests exist" after checking only one file.
 
 6. **Severity calibration.** Critical = enables unauthorized access, data corruption, or service unavailability for unauthenticated users with no sustained effort. If exploiting the issue requires authenticated access, sustained scanning, or unlikely preconditions, cap at High. Ask: "What happens if an unauthenticated user hits this once?" — if the answer is "nothing," it is not Critical.
+
+7. **Count before you claim.** When stating any specific count ("N callers", "N ignored errors", "N handlers"), enumerate every occurrence you found in the diff. If you cannot list them, do not state the count. Wrong counts waste author time investigating phantom instances.
+
+8. **No review history claims.** Do not assert "flagged in previous reviews," "third-round regression," or "repeatedly raised." You do not have access to prior review text unless it is explicitly provided in the context above. Unverifiable historical claims erode trust.
 `
 
 const scoreSuffix = `
@@ -2426,9 +2430,14 @@ For EACH finding in each review:
 
 ## Additional Verification Rules
 
-5. **Verify counts** — when a reviewer states a specific count (e.g., "7 handlers use X", "6 ignored errors"), count the actual occurrences in the diff. If the count is wrong, note the correct count and mark the claim MISQUOTED if the error changes the finding's weight.
-6. **Check project-specific classifications** — if the diff contains isolation tests, depguard configs, or package classification files, use them as ground truth. A reviewer claiming an import violates isolation MUST be checked against these files. Importing a leaf package is always allowed.
+5. **Verify counts** — when a reviewer states a specific count (e.g., "7 handlers use X", "6 ignored errors"), count the actual occurrences in the diff. State YOUR count explicitly (e.g., "Reviewer claims 7, I count 5: [list each]"). If the count is wrong, mark the claim MISQUOTED and note the correct count — wrong counts erode author trust and waste investigation time.
+6. **Check project-specific classifications before isolation findings** — this is a CRITICAL check. If a reviewer claims a component isolation violation:
+   a. Search the diff for isolation_test.go — check if the imported package appears in leafPackages. Leaves are ALWAYS allowed to be imported.
+   b. Search the diff for .golangci.yml — check if the imported package appears in the depguard component-isolation deny list. Only packages in the deny list are components.
+   c. If neither file is in the diff, check the commit manifest for these files. If you cannot verify the classification, mark the finding UNVERIFIABLE, not VERIFIED.
+   d. A false Critical claiming isolation violation on a leaf package is the highest-impact bot failure mode — it wastes the most author time.
 7. **Trace callees for severity** — when a reviewer claims "unbounded" or "no validation", check whether the called function (visible in the diff or referenced in unchanged context) already enforces the constraint. If so, downgrade severity.
+8. **Verify scope attribution** — when a reviewer flags code, check the commit manifest to confirm the flagged file appears in this PR's commits. If the file is not in the manifest, mark the finding INVALID: NOT IN PR SCOPE. Findings against code from other PRs waste reviewer attention.
 
 ## Output Format
 
@@ -2482,7 +2491,7 @@ For each review, list every finding with its validation status and a one-line ex
 		defer scoreMerge.Done()
 		log.Printf("merger: starting for %s", req.PRURL)
 		mergerStart := time.Now()
-		merged, mergeResp, mergeErr = runMerger(ctx, allReviews, validated, req.Mode, req.SpecContent, req.AcknowledgedIssues, failedAgentNames)
+		merged, mergeResp, mergeErr = runMerger(ctx, allReviews, validated, req.Mode, req.SpecContent, req.AcknowledgedIssues, failedAgentNames, manifest)
 		if mergeErr != nil {
 			return
 		}
@@ -2780,7 +2789,7 @@ func formatScoreHeader(score ScoreResult, previousReviews string) string {
 	return header
 }
 
-func runMerger(ctx context.Context, allReviews, validated string, mode ReviewMode, specContent, acknowledgedIssues string, failedAgents []string) (string, claudeResponse, error) {
+func runMerger(ctx context.Context, allReviews, validated string, mode ReviewMode, specContent, acknowledgedIssues string, failedAgents []string, manifest DiffManifest) (string, claudeResponse, error) {
 	var modeRules string
 	switch mode {
 	case ModeFinal:
@@ -2823,6 +2832,16 @@ RE-REVIEW RULES:
 			strings.Join(failedAgents, ", "))
 	}
 
+	manifestFileList := ""
+	if len(manifest.Files) > 0 {
+		var mfb strings.Builder
+		mfb.WriteString("\n\n## PR File Manifest (ground truth)\nThese are the ONLY files changed in this PR. Your Summary MUST NOT claim changes to files or areas not in this list.\n")
+		for _, f := range manifest.Files {
+			fmt.Fprintf(&mfb, "- %s\n", f)
+		}
+		manifestFileList = mfb.String()
+	}
+
 	text, resp, err := runClaude(ctx, fmt.Sprintf(`You are a review synthesizer. You have 4 independent code reviews and a validation report.
 
 Merge them into ONE cohesive, comprehensive review. Structure:
@@ -2844,14 +2863,14 @@ Rules:
 - Keep it actionable and specific
 - Reference file names and line numbers where relevant
 - Do NOT include a Quality Score section, score table, or numerical scores — scoring is handled separately
-- **Summary scope rule**: The Summary line MUST only describe changes visible in the diff and commit manifest. Do not infer, extrapolate, or generalize scope beyond what the files actually show. If the diff touches 3 areas, describe 3 areas — not a broader narrative. Fabricating scope (e.g., claiming "UI improvements across Fleet and Infrastructure" when no Fleet/Infrastructure files changed) is a critical synthesis failure
+- **Summary scope rule**: The Summary line MUST only describe changes visible in the PR File Manifest below. Cross-check every area you mention against the file list — if no files in that area appear in the manifest, do not mention it. Fabricating scope (e.g., claiming "UI improvements across Fleet and Infrastructure" when no Fleet/Infrastructure files changed) is a critical synthesis failure
 - **No review history claims**: Do not assert that issues were "flagged in previous reviews" or are "third-round regressions" unless the prior review text is provided as input. Unverifiable historical claims sound authoritative but erode trust%s%s
 %s
 ## Reviews
 %s
 
 ## Validation Report
-%s%s%s`, specSection, ackSection, specRule, ackRule, modeRules, allReviews, validated, specContext, coverageNote))
+%s%s%s%s`, specSection, ackSection, specRule, ackRule, modeRules, allReviews, validated, specContext, coverageNote, manifestFileList))
 	if err != nil {
 		return "", claudeResponse{}, fmt.Errorf("merger failed: %w", err)
 	}
