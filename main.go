@@ -2147,7 +2147,7 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 		if err != nil {
 			return "", nil, stats, err
 		}
-		score, scoreResp, scoreErr := runScorer(ctx, nil, req.Diff, req.SpecContent, req.AcknowledgedIssues)
+		score, scoreResp, scoreErr := runScorer(ctx, nil, "", req.Diff, req.SpecContent, req.AcknowledgedIssues)
 		if scoreErr == nil {
 			stats.Add(scoreResp)
 			result = formatScoreHeader(score, req.PreviousReviews) + "\n\n---\n\n" + result
@@ -2163,7 +2163,7 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 			if err == nil {
 				stats.Add(mergeResp)
 				sessionStore.Set(req.PRURL, mergeResp.SessionID)
-				score, scoreResp, scoreErr := runScorer(ctx, nil, req.Diff, req.SpecContent, req.AcknowledgedIssues)
+				score, scoreResp, scoreErr := runScorer(ctx, nil, "", req.Diff, req.SpecContent, req.AcknowledgedIssues)
 				if scoreErr == nil {
 					stats.Add(scoreResp)
 					result = formatScoreHeader(score, req.PreviousReviews) + "\n\n---\n\n" + result
@@ -2186,7 +2186,7 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 		if deltaResp.SessionID != "" {
 			sessionStore.Set(req.PRURL, deltaResp.SessionID)
 		}
-		score, scoreResp, scoreErr := runScorer(ctx, nil, req.Diff, req.SpecContent, req.AcknowledgedIssues)
+		score, scoreResp, scoreErr := runScorer(ctx, nil, "", req.Diff, req.SpecContent, req.AcknowledgedIssues)
 		if scoreErr == nil {
 			stats.Add(scoreResp)
 			result = formatScoreHeader(score, req.PreviousReviews) + "\n\n---\n\n" + result
@@ -2387,7 +2387,7 @@ For each review, list every finding with its validation status and a one-line ex
 		defer scoreMerge.Done()
 		log.Printf("scorer: starting for %s", req.PRURL)
 		scorerStart := time.Now()
-		score, scoreResp, scoreErr = runScorer(ctx, filteredScores, req.Diff, req.SpecContent, req.AcknowledgedIssues)
+		score, scoreResp, scoreErr = runScorer(ctx, filteredScores, validated, req.Diff, req.SpecContent, req.AcknowledgedIssues)
 		if scoreErr != nil {
 			log.Printf("scorer: failed for %s: %v", req.PRURL, scoreErr)
 		} else {
@@ -2570,7 +2570,7 @@ Keep it short. If the code is sound, say so and approve.
 	return text, nil
 }
 
-func runScorer(ctx context.Context, perspectiveScores []PerspectiveScore, diff, specContent, acknowledgedIssues string) (ScoreResult, claudeResponse, error) {
+func runScorer(ctx context.Context, perspectiveScores []PerspectiveScore, validatorOutput, diff, specContent, acknowledgedIssues string) (ScoreResult, claudeResponse, error) {
 	specDimension := ""
 	specBlock := ""
 	specJSON := ""
@@ -2583,6 +2583,11 @@ func runScorer(ctx context.Context, perspectiveScores []PerspectiveScore, diff, 
 	ackBlock := ""
 	if acknowledgedIssues != "" {
 		ackBlock = fmt.Sprintf("\n## Acknowledged Issues\nThe following issues were explicitly acknowledged by the author (ack, won't fix, intentional, by design, etc.). Do NOT penalize scores for these items — they represent informed decisions, not oversights:\n\n%s\n\n", acknowledgedIssues)
+	}
+
+	validatorBlock := ""
+	if validatorOutput != "" {
+		validatorBlock = fmt.Sprintf("\n## Validator Results\nA strict validator has verified each reviewer finding against the actual diff. Findings marked INVALID were hallucinated or incorrect — do NOT count them as real issues. Only VERIFIED findings should influence your score. Adjust perspective scores downward if a reviewer had many invalid findings, and upward if their concerns were mostly dismissed but the code is actually sound.\n\n%s\n\n", validatorOutput)
 	}
 
 	perspectiveBlock := ""
@@ -2615,11 +2620,11 @@ When reviewer perspective scores are provided, critically evaluate each one:
 - A low-confidence score or one from a less relevant perspective should be weighted less
 - If a reviewer's rationale contradicts the actual diff, disregard their score
 - Your dimensional scores should reflect your own analysis informed by — but not averaging — the perspective scores
-%s%s
+%s%s%s
 Respond with ONLY this JSON object, no markdown fences, no other text:
 {"correctness":N,"security":N,"design":N,"go_quality":N,"testing":N,"production_readiness":N%s,"overall":N,"summary":"one sentence"}
 
-`+"```diff\n%s\n```", perspectiveBlock, specDimension, specBlock, ackBlock, specJSON, diff)
+`+"```diff\n%s\n```", perspectiveBlock, specDimension, validatorBlock, specBlock, ackBlock, specJSON, diff)
 
 	text, resp, err := runClaude(ctx, prompt)
 	if err != nil {
