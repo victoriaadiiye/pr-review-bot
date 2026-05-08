@@ -2763,7 +2763,34 @@ func runClaudeWithSession(ctx context.Context, prompt, resumeSessionID string) (
 	return runClaudeOpts(ctx, prompt, resumeSessionID, "", 0)
 }
 
+const claudeMaxRetries = 2
+
 func runClaudeOpts(ctx context.Context, prompt, resumeSessionID, workDir string, maxTurns int, modelOverride ...string) (string, claudeResponse, error) {
+	var lastText string
+	var lastResp claudeResponse
+	var lastErr error
+	for attempt := range claudeMaxRetries + 1 {
+		lastText, lastResp, lastErr = runClaudeOnce(ctx, prompt, resumeSessionID, workDir, maxTurns, modelOverride...)
+		if lastErr == nil {
+			return lastText, lastResp, nil
+		}
+		if ctx.Err() != nil {
+			return lastText, lastResp, lastErr
+		}
+		if attempt < claudeMaxRetries {
+			backoff := time.Duration(1<<uint(attempt)) * 5 * time.Second
+			log.Printf("claude: attempt %d/%d failed (%v), retrying in %v", attempt+1, claudeMaxRetries+1, lastErr, backoff)
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return lastText, lastResp, lastErr
+			}
+		}
+	}
+	return lastText, lastResp, lastErr
+}
+
+func runClaudeOnce(ctx context.Context, prompt, resumeSessionID, workDir string, maxTurns int, modelOverride ...string) (string, claudeResponse, error) {
 	if workDir == "" {
 		workDir = os.TempDir()
 	}

@@ -1,6 +1,6 @@
 ---
 model: opus
-max_turns: 3
+max_turns: 10
 ---
 
 {{.ModePreamble}}
