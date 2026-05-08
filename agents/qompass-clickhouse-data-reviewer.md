@@ -71,6 +71,20 @@ Is the metric cluster-wide (`node_id=0`) or per-node (`node_id>0`)? Code that pr
 - Without `FINAL`, queries may return duplicate rows for recently inserted data
 - The version column determines which row survives — ties are non-deterministic
 - Background merges are async — don't assume immediate dedup after insert
+- TTL evaluates after dedup — the surviving row (by version column) determines TTL base
+
+### AggregatingMergeTree Gotchas
+
+- TTL evaluates on **merged** (aggregated) rows, not on individual pre-merge parts
+- Aggregate functions that update with new inserts (e.g., `max(last_seen)`, `maxState(timestamp)`) refresh the TTL column — an actively-written row never expires
+- Only rows whose aggregated TTL column is stale will be dropped
+- Before flagging TTL concerns on AggregatingMergeTree, check whether the aggregate function refreshes the TTL column. `max(timestamp)` with active inserts = row never expires
+
+### Common False Positives to Avoid
+
+- **"TTL will silently drop active data" on AggregatingMergeTree** — only true if the aggregate doesn't refresh the TTL column. Check the aggregate function first
+- **"Unbounded" when bounds exist downstream** — before claiming a query or allocation is unbounded, check whether the calling code or reader layer enforces limits
+- **"No validation" when validation exists in callee** — search the call chain, not just the immediate function
 
 ## ClickHouse Best Practices Reference (from clickhouse.com/docs/best-practices)
 

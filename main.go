@@ -555,6 +555,10 @@ const reviewDiscipline = `
 3. **Distinguish theoretical from practical concerns.** For storage-layer concerns (TTL, merge behavior, partition strategy, cardinality), read the write-path code and any inline documentation before assigning severity. A concern that applies "in general" but not for this table's specific write pattern is informational at most, not critical.
 
 4. **Pre-existing patterns are not PR findings.** If your finding applies to code or patterns that predate this PR and are not modified in this diff, you MUST label it: "Pre-existing: [description]. Not introduced by this PR." Do not frame established patterns as something the PR author should fix. These should never be classified as Critical.
+
+5. **Verify "missing" claims before filing.** Before claiming code is "missing," "untested," or "unhandled," search for the relevant function, method, or test name across the package and its callers. "Not in this file" ≠ "doesn't exist." If you are in diff-only mode and cannot search, label the finding: "UNVERIFIED — could not confirm absence across codebase." Never state "no tests exist" after checking only one file.
+
+6. **Severity calibration.** Critical = enables unauthorized access, data corruption, or service unavailability for unauthenticated users with no sustained effort. If exploiting the issue requires authenticated access, sustained scanning, or unlikely preconditions, cap at High. Ask: "What happens if an unauthenticated user hits this once?" — if the answer is "nothing," it is not Critical.
 `
 
 const scoreSuffix = `
@@ -1790,12 +1794,28 @@ func nonMergeFiles(ctx context.Context, gitDir, mergeBase, prRef string) ([]stri
 	return files, nil
 }
 
-func buildSmartDiff(ctx context.Context, gitDir, mergeBase, prRef string) (string, error) {
+func buildSmartDiff(ctx context.Context, gitDir, mergeBase, prRef string, prFiles map[string]bool) (string, error) {
 	const maxChars = 120_000
 
 	files, filesErr := nonMergeFiles(ctx, gitDir, mergeBase, prRef)
 	if filesErr != nil {
 		log.Printf("repo-cache: non-merge files failed, falling back to full diff: %v", filesErr)
+	}
+
+	if filesErr == nil && len(prFiles) > 0 {
+		var filtered []string
+		var dropped []string
+		for _, f := range files {
+			if prFiles[f] {
+				filtered = append(filtered, f)
+			} else {
+				dropped = append(dropped, f)
+			}
+		}
+		if len(dropped) > 0 {
+			log.Printf("repo-cache: PR scope filter removed %d file(s) not in GitHub's PR file list: %v", len(dropped), dropped)
+		}
+		files = filtered
 	}
 
 	args := []string{"--git-dir", gitDir, "diff", mergeBase, prRef}
@@ -1893,7 +1913,33 @@ func fetchDiff(ctx context.Context, owner, repo, prNum string) (string, error) {
 		return "", err
 	}
 
-	return buildSmartDiff(ctx, gitDir, mergeBase, prRef)
+	prFiles, prFilesErr := getPRFiles(ctx, owner, repo, prNum)
+	if prFilesErr != nil {
+		log.Printf("repo-cache: could not get PR file list from GitHub, skipping scope filter: %v", prFilesErr)
+	}
+
+	return buildSmartDiff(ctx, gitDir, mergeBase, prRef, prFiles)
+}
+
+func getPRFiles(ctx context.Context, owner, repo, prNum string) (map[string]bool, error) {
+	cmd := exec.CommandContext(ctx, "gh", "pr", "view", prNum,
+		"--repo", fmt.Sprintf("%s/%s", owner, repo),
+		"--json", "files", "--jq", ".files[].path")
+	out, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("get PR files: %w; stderr: %s", err, string(exitErr.Stderr))
+		}
+		return nil, fmt.Errorf("get PR files: %w", err)
+	}
+	files := make(map[string]bool)
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			files[line] = true
+		}
+	}
+	return files, nil
 }
 
 func getPRBaseRef(ctx context.Context, owner, repo, prNum string) (string, error) {
@@ -2372,7 +2418,7 @@ For EACH finding in each review:
    - **INVALID: MISQUOTED** — code exists but reviewer misquoted or mischaracterized it
    - **INVALID: WRONG FILE** — reviewer attributes code to wrong file
    - **INVALID: PRE-EXISTING** — issue exists but was not introduced or modified by this PR
-   - **OVERSTATED** — observation has some basis but severity is inflated (e.g., "Critical" for a theoretical concern, or claiming "unbounded" when the code has explicit bounds). Note what the correct severity should be
+   - **OVERSTATED** — observation has some basis but severity is inflated (e.g., "Critical" for a theoretical concern, or claiming "unbounded" when the code has explicit bounds). You MUST state what the correct severity should be (e.g., "OVERSTATED: Medium — requires authenticated access and sustained scanning"). Critical means: unauthorized access, data corruption, or service unavailability for unauthenticated users with no sustained effort. Auth-gated issues cap at High. Theoretical concerns cap at Medium
    - **UNVERIFIABLE** — claim may be valid but cannot be confirmed from the diff alone
 
 ## Output Format
@@ -2783,6 +2829,8 @@ Rules:
 - The GO-EXPERT review is the most authoritative voice. When reviewers conflict, defer to GO-EXPERT. Its critical issues are always included. Its verdict carries the most weight in the final verdict.
 - Deduplicate overlapping feedback
 - Drop anything the validator flagged as incorrect
+- When the validator marks a finding as OVERSTATED, use the validator's corrected severity, not the agent's original. Never promote an OVERSTATED finding back to Critical
+- Agreement ≠ accuracy. Multiple reviewers flagging the same issue does NOT increase confidence. All agents see the same diff and share the same blind spots. When multiple reviewers agree, check whether they made the same reasoning error (e.g., all reading one file without checking callees). Weight validator results above reviewer consensus
 - Incorporate answers to reviewer questions from the validation
 - Keep it actionable and specific
 - Reference file names and line numbers where relevant
