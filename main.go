@@ -544,6 +544,19 @@ type PerspectiveScore struct {
 	Rationale  string `json:"rationale"`
 }
 
+const reviewDiscipline = `
+
+## Review Discipline Rules
+
+1. **Only review code in the diff.** Every finding MUST reference code that appears in the diff below. If a file or function is not modified in this PR, do not flag it. If you believe a *missing* change is needed (e.g., "you changed X but didn't update Y"), verify by reading Y's current content before claiming it is stale — do not assume.
+
+2. **Check for defensive measures before escalating severity.** Before claiming something is "unbounded," "unprotected," or "missing validation," search the same function and its callers for bounds checks, comments explaining the design, rate limits, or other safeguards. If the code explicitly addresses your concern, acknowledge it and downgrade or drop the finding.
+
+3. **Distinguish theoretical from practical concerns.** For storage-layer concerns (TTL, merge behavior, partition strategy, cardinality), read the write-path code and any inline documentation before assigning severity. A concern that applies "in general" but not for this table's specific write pattern is informational at most, not critical.
+
+4. **Pre-existing patterns are not PR findings.** If your finding applies to code or patterns that predate this PR and are not modified in this diff, you MUST label it: "Pre-existing: [description]. Not introduced by this PR." Do not frame established patterns as something the PR author should fix. These should never be classified as Critical.
+`
+
 const scoreSuffix = `
 
 ## Perspective Score
@@ -2270,7 +2283,7 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 				mu.Unlock()
 				return
 			}
-			prompt += scoreSuffix
+			prompt += reviewDiscipline + scoreSuffix
 			thorough := req.Flags["thorough"]
 			maxTurns := resolveMaxTurns(agent, thorough)
 			agentModel := agent.model
@@ -2320,14 +2333,26 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 	if successfulReviews == 0 {
 		return "", nil, stats, fmt.Errorf("all %d agents failed", len(agents))
 	}
+	var failedAgentNames []string
 	if agentFailures > 0 {
-		log.Printf("warning: %d/%d agents failed, continuing with %d", agentFailures, len(agents), successfulReviews)
+		for i, a := range agents {
+			if reviews[i] == "" {
+				failedAgentNames = append(failedAgentNames, a.name)
+			}
+		}
+		log.Printf("warning: %d/%d agents failed (%s), continuing with %d", agentFailures, len(agents), strings.Join(failedAgentNames, ", "), successfulReviews)
 	}
 
 	dmUser(api, notifyUserID, fmt.Sprintf("%d/%d agents done. Running validator...", successfulReviews, len(agents)))
 	allReviews := strings.Join(filteredReviews, "\n\n---\n\n")
 
 	manifestBlock := manifest.FormatForValidator()
+
+	coverageNote := ""
+	if len(failedAgentNames) > 0 {
+		coverageNote = fmt.Sprintf("\n## Agent Coverage Gaps\n%d of %d review agents failed and produced no output: %s. Their review dimensions are not covered below. Note this in your summary so readers know which perspectives are missing.\n\n",
+			len(failedAgentNames), len(agents), strings.Join(failedAgentNames, ", "))
+	}
 
 	log.Printf("validator: starting for %s", req.PRURL)
 	valStart := time.Now()
@@ -2347,6 +2372,7 @@ For EACH finding in each review:
    - **INVALID: MISQUOTED** — code exists but reviewer misquoted or mischaracterized it
    - **INVALID: WRONG FILE** — reviewer attributes code to wrong file
    - **INVALID: PRE-EXISTING** — issue exists but was not introduced or modified by this PR
+   - **OVERSTATED** — observation has some basis but severity is inflated (e.g., "Critical" for a theoretical concern, or claiming "unbounded" when the code has explicit bounds). Note what the correct severity should be
    - **UNVERIFIABLE** — claim may be valid but cannot be confirmed from the diff alone
 
 ## Output Format
@@ -2356,12 +2382,12 @@ For each review, list every finding with its validation status and a one-line ex
 - Any important issues the reviewers missed that ARE visible in the diff
 - Answers to any questions reviewers raised that can be answered from the diff
 
-%s
+%s%s
 ## Original Diff
 `+"```diff\n%s\n```"+`
 
 ## Reviews to Validate
-%s`, len(agents), manifestBlock, req.Diff, allReviews))
+%s`, len(agents), manifestBlock, coverageNote, req.Diff, allReviews))
 	if err != nil {
 		return "", nil, stats, fmt.Errorf("validator failed: %w", err)
 	}
@@ -2401,7 +2427,7 @@ For each review, list every finding with its validation status and a one-line ex
 		defer scoreMerge.Done()
 		log.Printf("merger: starting for %s", req.PRURL)
 		mergerStart := time.Now()
-		merged, mergeResp, mergeErr = runMerger(ctx, allReviews, validated, req.Mode, req.SpecContent, req.AcknowledgedIssues)
+		merged, mergeResp, mergeErr = runMerger(ctx, allReviews, validated, req.Mode, req.SpecContent, req.AcknowledgedIssues, failedAgentNames)
 		if mergeErr != nil {
 			return
 		}
@@ -2587,7 +2613,7 @@ func runScorer(ctx context.Context, perspectiveScores []PerspectiveScore, valida
 
 	validatorBlock := ""
 	if validatorOutput != "" {
-		validatorBlock = fmt.Sprintf("\n## Validator Results\nA strict validator has verified each reviewer finding against the actual diff. Findings marked INVALID were hallucinated or incorrect — do NOT count them as real issues. Only VERIFIED findings should influence your score. Adjust perspective scores downward if a reviewer had many invalid findings, and upward if their concerns were mostly dismissed but the code is actually sound.\n\n%s\n\n", validatorOutput)
+		validatorBlock = fmt.Sprintf("\n## Validator Results\nA strict validator has verified each reviewer finding against the actual diff. Findings marked INVALID were hallucinated or incorrect — do NOT count them as real issues. Only VERIFIED findings should influence your score.\n\nScoring adjustments based on validation:\n- Adjust perspective scores downward if a reviewer had many invalid findings, especially false Critical claims — a false Critical costs the most author time to investigate and should be penalized heavily\n- Adjust upward if their concerns were mostly dismissed but the code is actually sound\n- An overstated severity (e.g., claiming \"Critical\" for a theoretical or pre-existing concern) should reduce that reviewer's credibility weight, even if the underlying observation has some merit\n\n%s\n\n", validatorOutput)
 	}
 
 	perspectiveBlock := ""
@@ -2699,7 +2725,7 @@ func formatScoreHeader(score ScoreResult, previousReviews string) string {
 	return header
 }
 
-func runMerger(ctx context.Context, allReviews, validated string, mode ReviewMode, specContent, acknowledgedIssues string) (string, claudeResponse, error) {
+func runMerger(ctx context.Context, allReviews, validated string, mode ReviewMode, specContent, acknowledgedIssues string, failedAgents []string) (string, claudeResponse, error) {
 	var modeRules string
 	switch mode {
 	case ModeFinal:
@@ -2736,6 +2762,12 @@ RE-REVIEW RULES:
 		ackRule = "\n- Issues explicitly acknowledged by the author (ack, won't fix, intentional, by design) must NOT appear in Critical Issues or Design Concerns. List them separately as acknowledged. Do not let them influence the verdict negatively"
 	}
 
+	coverageNote := ""
+	if len(failedAgents) > 0 {
+		coverageNote = fmt.Sprintf("\n\n## Coverage Gaps\nThe following review agents failed and produced no output: %s. Note these gaps at the end of your review so the reader knows which perspectives were not covered.",
+			strings.Join(failedAgents, ", "))
+	}
+
 	text, resp, err := runClaude(ctx, fmt.Sprintf(`You are a review synthesizer. You have 4 independent code reviews and a validation report.
 
 Merge them into ONE cohesive, comprehensive review. Structure:
@@ -2760,7 +2792,7 @@ Rules:
 %s
 
 ## Validation Report
-%s%s`, specSection, ackSection, specRule, ackRule, modeRules, allReviews, validated, specContext))
+%s%s%s`, specSection, ackSection, specRule, ackRule, modeRules, allReviews, validated, specContext, coverageNote))
 	if err != nil {
 		return "", claudeResponse{}, fmt.Errorf("merger failed: %w", err)
 	}
