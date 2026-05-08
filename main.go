@@ -2265,6 +2265,7 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 			agentDur := time.Since(agentStart)
 			if err != nil {
 				log.Printf("agent %s: failed for %s: %v", agent.name, req.PRURL, err)
+				writeAgentLog(logDir, agent.name+"-error", fmt.Sprintf("ERROR: %v\n\nPartial output:\n%s", err, text))
 				stats.AddWarning(fmt.Sprintf("`%s` failed: %v", agent.name, err))
 				mu.Lock()
 				agentFailures++
@@ -2798,6 +2799,9 @@ func runClaudeOpts(ctx context.Context, prompt, resumeSessionID, workDir string,
 			errDetail := resp.Result
 			if errDetail == "" {
 				errDetail = strings.TrimSpace(stderr.String())
+			}
+			if errDetail == "" {
+				errDetail = strings.TrimSpace(string(out))
 			}
 			if errDetail == "" {
 				errDetail = "(no detail from claude CLI)"
