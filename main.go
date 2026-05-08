@@ -166,11 +166,12 @@ func diffLines(diff string) int {
 }
 
 type agentFile struct {
-	name     string
-	flag     string
-	model    string
-	maxTurns int
-	template *template.Template
+	name      string
+	flag      string
+	diffMatch string
+	model     string
+	maxTurns  int
+	template  *template.Template
 }
 
 type promptData struct {
@@ -468,7 +469,7 @@ func loadAgents() ([]agentFile, error) {
 		}
 		name := strings.TrimSuffix(e.Name(), ".md")
 		content := string(raw)
-		var flag, model string
+		var flag, diffMatch, model string
 		var maxTurns int
 		if strings.HasPrefix(content, "---\n") {
 			if end := strings.Index(content[4:], "\n---\n"); end >= 0 {
@@ -477,6 +478,9 @@ func loadAgents() ([]agentFile, error) {
 				for _, line := range strings.Split(frontmatter, "\n") {
 					if strings.HasPrefix(line, "flag:") {
 						flag = strings.TrimSpace(strings.TrimPrefix(line, "flag:"))
+					}
+					if strings.HasPrefix(line, "diff_match:") {
+						diffMatch = strings.TrimSpace(strings.TrimPrefix(line, "diff_match:"))
 					}
 					if strings.HasPrefix(line, "model:") {
 						model = strings.TrimSpace(strings.TrimPrefix(line, "model:"))
@@ -493,7 +497,7 @@ func loadAgents() ([]agentFile, error) {
 		if err != nil {
 			return nil, fmt.Errorf("parse agent template %s: %w", path, err)
 		}
-		agents = append(agents, agentFile{name: name, flag: flag, model: model, maxTurns: maxTurns, template: tmpl})
+		agents = append(agents, agentFile{name: name, flag: flag, diffMatch: diffMatch, model: model, maxTurns: maxTurns, template: tmpl})
 	}
 	if len(agents) == 0 {
 		return nil, fmt.Errorf("no .md agent files found in %s", agentsDir)
@@ -1094,6 +1098,27 @@ func filterAgents(agents []agentFile, flags map[string]bool) []agentFile {
 	for _, a := range agents {
 		if a.flag == "" || flags[a.flag] {
 			filtered = append(filtered, a)
+		}
+	}
+	return filtered
+}
+
+func filterAgentsByDiff(agents []agentFile, diff string) []agentFile {
+	var filtered []agentFile
+	for _, a := range agents {
+		if a.diffMatch == "" {
+			filtered = append(filtered, a)
+			continue
+		}
+		re, err := regexp.Compile(a.diffMatch)
+		if err != nil {
+			log.Printf("agent %s: invalid diff_match pattern %q: %v — skipping agent", a.name, a.diffMatch, err)
+			continue
+		}
+		if re.MatchString(diff) {
+			filtered = append(filtered, a)
+		} else {
+			log.Printf("agent %s: diff_match %q not found in diff — skipping", a.name, a.diffMatch)
 		}
 	}
 	return filtered
@@ -2163,6 +2188,7 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 	}
 	agents := filterAgentsByProject(allAgents, projCfg.agentsForRepo(req.Owner, req.Repo))
 	agents = filterAgents(agents, req.Flags)
+	agents = filterAgentsByDiff(agents, req.Diff)
 	agents = filterOnlyAgents(agents, req.OnlyAgents)
 
 	agentWorkDir := ""

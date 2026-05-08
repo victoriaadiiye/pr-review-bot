@@ -2185,3 +2185,72 @@ func TestDiffManifest_JSONRoundTrip(t *testing.T) {
 		t.Errorf("Files len = %d, want 3", len(got.Files))
 	}
 }
+
+func TestFilterAgentsByDiff(t *testing.T) {
+	agents := []agentFile{
+		{name: "general"},
+		{name: "clickhouse", diffMatch: `(?i)(clickhouse|MergeTree|CREATE\s+TABLE)`},
+		{name: "sql-only", diffMatch: `\.sql`},
+		{name: "bad-regex", diffMatch: `[invalid`},
+	}
+
+	tests := []struct {
+		name string
+		diff string
+		want []string
+	}{
+		{
+			name: "no diff_match agents always included",
+			diff: "just some go code",
+			want: []string{"general"},
+		},
+		{
+			name: "clickhouse keyword matches",
+			diff: "import clickhouse-go driver",
+			want: []string{"general", "clickhouse"},
+		},
+		{
+			name: "MergeTree matches case insensitive",
+			diff: "ENGINE = ReplacingMergeTree(ver)",
+			want: []string{"general", "clickhouse"},
+		},
+		{
+			name: "CREATE TABLE matches",
+			diff: "CREATE TABLE events (",
+			want: []string{"general", "clickhouse"},
+		},
+		{
+			name: "sql file matches",
+			diff: "--- a/migrations/001.sql\n+++ b/migrations/001.sql",
+			want: []string{"general", "sql-only"},
+		},
+		{
+			name: "multiple agents match",
+			diff: "CREATE TABLE events in migrations/001.sql",
+			want: []string{"general", "clickhouse", "sql-only"},
+		},
+		{
+			name: "nothing matches",
+			diff: "func handleHTTP(w http.ResponseWriter)",
+			want: []string{"general"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := filterAgentsByDiff(agents, tt.diff)
+			var names []string
+			for _, a := range got {
+				names = append(names, a.name)
+			}
+			if len(names) != len(tt.want) {
+				t.Fatalf("got %v, want %v", names, tt.want)
+			}
+			for i, name := range names {
+				if name != tt.want[i] {
+					t.Errorf("got[%d] = %q, want %q", i, name, tt.want[i])
+				}
+			}
+		})
+	}
+}
