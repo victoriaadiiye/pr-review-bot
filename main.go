@@ -579,13 +579,15 @@ const reviewDiscipline = `
 7. **Count before you claim.** When stating any specific count ("N callers", "N ignored errors", "N handlers"), enumerate every occurrence you found in the diff. If you cannot list them, do not state the count. Wrong counts waste author time investigating phantom instances.
 
 8. **No review history claims.** Do not assert "flagged in previous reviews," "third-round regression," or "repeatedly raised." You do not have access to prior review text unless it is explicitly provided in the context above. Unverifiable historical claims erode trust.
+
+9. **Verify "unreachable" and "dead code" claims.** Before claiming code is unreachable or a branch is dead, trace all paths including error conditions, init failures, and interface implementations. Defensive guards against nil or error states are not dead code — they protect against upstream failures. "Always non-nil in the happy path" ≠ "unreachable."
 `
 
 const scoreSuffix = `
 
 ## Perspective Score
 
-After your review, rate this PR's overall quality FROM YOUR PERSPECTIVE on a scale of 0-100 (100 = flawless, 0 = critically broken).
+After your review, rate this PR's overall quality FROM YOUR PERSPECTIVE on a scale of 0-100 (100 = solid, well-thought-out PR with no critical issues, 0 = critically broken). Suggestions and non-blocking observations should not reduce the score — only critical issues should.
 
 End your response with EXACTLY this JSON block on its own line:
 ` + "```" + `
