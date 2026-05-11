@@ -539,113 +539,6 @@ func TestHumanSize(t *testing.T) {
 	}
 }
 
-func TestSessionStore_GetSet(t *testing.T) {
-	dir := t.TempDir()
-	s := &SessionStore{
-		path: filepath.Join(dir, "sessions.json"),
-		data: make(map[string]string),
-	}
-
-	prURL := "https://github.com/org/repo/pull/42"
-
-	if got := s.Get(prURL); got != "" {
-		t.Errorf("Get on empty store = %q, want empty", got)
-	}
-
-	s.Set(prURL, "session-abc-123")
-	if got := s.Get(prURL); got != "session-abc-123" {
-		t.Errorf("Get after Set = %q, want %q", got, "session-abc-123")
-	}
-}
-
-func TestSessionStore_Overwrites(t *testing.T) {
-	dir := t.TempDir()
-	s := &SessionStore{
-		path: filepath.Join(dir, "sessions.json"),
-		data: make(map[string]string),
-	}
-
-	prURL := "https://github.com/org/repo/pull/42"
-	s.Set(prURL, "session-1")
-	s.Set(prURL, "session-2")
-
-	if got := s.Get(prURL); got != "session-2" {
-		t.Errorf("Get after overwrite = %q, want %q", got, "session-2")
-	}
-}
-
-func TestSessionStore_PersistsToDisk(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "sessions.json")
-	s := &SessionStore{
-		path: path,
-		data: make(map[string]string),
-	}
-
-	s.Set("https://github.com/org/repo/pull/1", "sess-aaa")
-	s.Set("https://github.com/org/repo/pull/2", "sess-bbb")
-
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read persisted file: %v", err)
-	}
-	var ondisk map[string]string
-	if err := json.Unmarshal(raw, &ondisk); err != nil {
-		t.Fatalf("unmarshal persisted file: %v", err)
-	}
-	if ondisk["https://github.com/org/repo/pull/1"] != "sess-aaa" {
-		t.Errorf("disk PR 1 = %q, want sess-aaa", ondisk["https://github.com/org/repo/pull/1"])
-	}
-	if ondisk["https://github.com/org/repo/pull/2"] != "sess-bbb" {
-		t.Errorf("disk PR 2 = %q, want sess-bbb", ondisk["https://github.com/org/repo/pull/2"])
-	}
-}
-
-func TestSessionStore_LoadsFromDisk(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "sessions.json")
-
-	seed := map[string]string{
-		"https://github.com/org/repo/pull/99": "sess-from-disk",
-	}
-	raw, _ := json.Marshal(seed)
-	os.WriteFile(path, raw, 0o644)
-
-	s := &SessionStore{path: path, data: make(map[string]string)}
-	if diskRaw, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(diskRaw, &s.data)
-	}
-
-	if got := s.Get("https://github.com/org/repo/pull/99"); got != "sess-from-disk" {
-		t.Errorf("Get from loaded store = %q, want %q", got, "sess-from-disk")
-	}
-}
-
-func TestSessionStore_MultiplePRs(t *testing.T) {
-	dir := t.TempDir()
-	s := &SessionStore{
-		path: filepath.Join(dir, "sessions.json"),
-		data: make(map[string]string),
-	}
-
-	s.Set("https://github.com/org/repo/pull/1", "sess-1")
-	s.Set("https://github.com/org/repo/pull/2", "sess-2")
-	s.Set("https://github.com/other/repo/pull/1", "sess-3")
-
-	if got := s.Get("https://github.com/org/repo/pull/1"); got != "sess-1" {
-		t.Errorf("PR 1 = %q, want sess-1", got)
-	}
-	if got := s.Get("https://github.com/org/repo/pull/2"); got != "sess-2" {
-		t.Errorf("PR 2 = %q, want sess-2", got)
-	}
-	if got := s.Get("https://github.com/other/repo/pull/1"); got != "sess-3" {
-		t.Errorf("other/repo PR 1 = %q, want sess-3", got)
-	}
-	if got := s.Get("https://github.com/org/repo/pull/999"); got != "" {
-		t.Errorf("nonexistent PR = %q, want empty", got)
-	}
-}
-
 func TestLoadAgents_DiscoversFiles(t *testing.T) {
 	dir := t.TempDir()
 	old := agentsDir
@@ -1020,6 +913,53 @@ func TestFilterAgents(t *testing.T) {
 		got := filterAgents(agents, nil)
 		if len(got) != 2 {
 			t.Fatalf("got %d agents, want 2", len(got))
+		}
+	})
+}
+
+func TestFilterFlaggedAgents(t *testing.T) {
+	agents := []agentFile{
+		{name: "correctness"},
+		{name: "design"},
+		{name: "necessity", flag: "bare-necessities"},
+		{name: "deep", flag: "deep-dive"},
+	}
+
+	t.Run("no flags — no agents", func(t *testing.T) {
+		got := filterFlaggedAgents(agents, map[string]bool{})
+		if len(got) != 0 {
+			t.Fatalf("got %d agents, want 0", len(got))
+		}
+	})
+
+	t.Run("bare-necessities flag — only necessity", func(t *testing.T) {
+		got := filterFlaggedAgents(agents, map[string]bool{"bare-necessities": true})
+		if len(got) != 1 {
+			t.Fatalf("got %d agents, want 1", len(got))
+		}
+		if got[0].name != "necessity" {
+			t.Errorf("got %s, want necessity", got[0].name)
+		}
+	})
+
+	t.Run("both flags — both flagged agents", func(t *testing.T) {
+		got := filterFlaggedAgents(agents, map[string]bool{"bare-necessities": true, "deep-dive": true})
+		if len(got) != 2 {
+			t.Fatalf("got %d agents, want 2", len(got))
+		}
+	})
+
+	t.Run("nil flags — no agents", func(t *testing.T) {
+		got := filterFlaggedAgents(agents, nil)
+		if len(got) != 0 {
+			t.Fatalf("got %d agents, want 0", len(got))
+		}
+	})
+
+	t.Run("unrelated flag — no agents", func(t *testing.T) {
+		got := filterFlaggedAgents(agents, map[string]bool{"thorough": true})
+		if len(got) != 0 {
+			t.Fatalf("got %d agents, want 0", len(got))
 		}
 	})
 }

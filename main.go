@@ -741,8 +741,7 @@ var (
 	reviewRequestPattern = regexp.MustCompile(`(?i)\breview\b`)
 	ackPattern           = regexp.MustCompile(`(?i)\b(ack(nowledg(ed?|ing))?|won'?t\s*fix|wontfix|intentional|by\s*design|noted|accepted|will\s*(fix|address)\s*later|tracking\s+in|known\s+issue|out\s*of\s*scope|deferred)\b`)
 
-	repoCache    *RepoCache
-	sessionStore *SessionStore
+	repoCache *RepoCache
 
 	activeReviews   = make(map[string]context.CancelFunc)
 	activeReviewsMu sync.Mutex
@@ -1208,7 +1207,6 @@ func runCLI(args []string) {
 	_ = godotenv.Load()
 	initGitHubAuth()
 	repoCache = NewRepoCache()
-	sessionStore = NewSessionStore()
 
 	input := strings.Join(args, " ")
 	ref, ok := parsePRRef(input)
@@ -1252,9 +1250,11 @@ func runCLISinglePR(ctx context.Context, input, owner, repo, prNum, prURL string
 	onlyAgents := parseOnlyAgents(input)
 	noGitHub := strings.Contains(input, "--no-github")
 
-	if mode == ModeInitial && !modeExplicit && sessionStore.Get(prURL) != "" {
-		mode = ModeReReview
-		log.Printf("auto-re-review: found existing session for %s, upgrading to re-review", prURL)
+	if mode == ModeInitial && !modeExplicit {
+		if mem, err := loadReviewMemory(owner, repo, prNum); err == nil && mem != nil {
+			mode = ModeReReview
+			log.Printf("auto-re-review: found review memory for %s (review #%d), upgrading to re-review", prURL, mem.ReviewCount)
+		}
 	}
 
 	model := os.Getenv("CLAUDE_MODEL")
@@ -1485,7 +1485,6 @@ func main() {
 	_ = godotenv.Load()
 	initGitHubAuth()
 	repoCache = NewRepoCache()
-	sessionStore = NewSessionStore()
 
 	botToken := mustEnv("SLACK_BOT_TOKEN")
 	appToken := mustEnv("SLACK_APP_TOKEN")
@@ -1739,6 +1738,16 @@ func filterAgents(agents []agentFile, flags map[string]bool) []agentFile {
 	return filtered
 }
 
+func filterFlaggedAgents(agents []agentFile, flags map[string]bool) []agentFile {
+	var filtered []agentFile
+	for _, a := range agents {
+		if a.flag != "" && flags[a.flag] {
+			filtered = append(filtered, a)
+		}
+	}
+	return filtered
+}
+
 func filterAgentsByDiff(agents []agentFile, diff string) []agentFile {
 	var filtered []agentFile
 	for _, a := range agents {
@@ -1868,9 +1877,11 @@ func handleSinglePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEv
 	flags := parseFlags(ev.Text)
 	onlyAgents := parseOnlyAgents(ev.Text)
 
-	if mode == ModeInitial && !modeExplicit && sessionStore.Get(prURL) != "" {
-		mode = ModeReReview
-		log.Printf("auto-re-review: found existing session for %s, upgrading to re-review", prURL)
+	if mode == ModeInitial && !modeExplicit {
+		if mem, err := loadReviewMemory(owner, repo, prNum); err == nil && mem != nil {
+			mode = ModeReReview
+			log.Printf("auto-re-review: found review memory for %s (review #%d), upgrading to re-review", prURL, mem.ReviewCount)
+		}
 	}
 
 	_ = api.AddReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
@@ -2003,12 +2014,7 @@ func handleSinglePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEv
 	}
 
 	if mode == ModeReReview {
-		sessionID := sessionStore.Get(prURL)
-		if sessionID != "" {
-			dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Resuming previous session for re-review...", len(diff)))
-		} else {
-			dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Running delta re-review (no previous session)...", len(diff)))
-		}
+		dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Running delta re-review...", len(diff)))
 	} else {
 		if mode == ModeQuick {
 			dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Launching 1 agent in %s mode...", len(diff), mode))
@@ -2399,43 +2405,6 @@ func (c *RepoCache) RemoveWorktree(ctx context.Context, owner, repo, wtDir strin
 	_ = exec.CommandContext(ctx, "git", "--git-dir", gd, "worktree", "remove", "--force", wtDir).Run()
 	os.RemoveAll(wtDir)
 	log.Printf("repo-cache: removed worktree %s", wtDir)
-}
-
-// --- Session Store ---
-
-type SessionStore struct {
-	path string
-	mu   sync.Mutex
-	data map[string]string // PR URL → merger session ID
-}
-
-func NewSessionStore() *SessionStore {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		log.Fatalf("session-store: cannot determine home dir: %v", err)
-	}
-	path := filepath.Join(home, ".pr-review-cache", "sessions.json")
-	s := &SessionStore{path: path, data: make(map[string]string)}
-	if raw, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(raw, &s.data)
-	}
-	log.Printf("session-store: %s (%d sessions)", path, len(s.data))
-	return s
-}
-
-func (s *SessionStore) Get(prURL string) string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.data[prURL]
-}
-
-func (s *SessionStore) Set(prURL, sessionID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.data[prURL] = sessionID
-	raw, _ := json.Marshal(s.data)
-	_ = os.WriteFile(s.path, raw, 0o644)
-	log.Printf("session-store: saved %s → %s", prURL, sessionID)
 }
 
 // --- Diff Manifest ---
@@ -3048,34 +3017,16 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 	}
 
 	if req.Mode == ModeReReview {
-		if sessionID := sessionStore.Get(req.PRURL); sessionID != "" {
-			result, mergeResp, err := runReReview(ctx, api, notifyUserID, req, sessionID, stats)
-			if err == nil {
-				stats.Add(mergeResp)
-				sessionStore.Set(req.PRURL, mergeResp.SessionID)
-				score, scoreResp, scoreErr := runScorer(ctx, nil, "", req.Diff, req.SpecContent, req.AcknowledgedIssues)
-				if scoreErr == nil {
-					stats.Add(scoreResp)
-					result = formatScoreHeader(score, req.PreviousReviews) + "\n\n---\n\n" + result
-					return result, &score, stats, nil
-				}
-				log.Printf("scorer: failed for %s: %v", req.PRURL, scoreErr)
-				return result, nil, stats, nil
-			}
-			log.Printf("re-review session resume failed for %s: %v — falling back to delta review", req.PRURL, err)
-			dmUser(api, notifyUserID, fmt.Sprintf("Session resume failed, running delta review for <%s>...", req.PRURL))
-		} else {
-			log.Printf("re-review: no stored session for %s — running delta review", req.PRURL)
-			dmUser(api, notifyUserID, fmt.Sprintf("No previous session found for <%s>, running delta review...", req.PRURL))
-		}
 		result, deltaResp, err := runDeltaReReview(ctx, req, contextBlock, questionsStr)
 		if err != nil {
 			return "", nil, stats, err
 		}
 		stats.Add(deltaResp)
-		if deltaResp.SessionID != "" {
-			sessionStore.Set(req.PRURL, deltaResp.SessionID)
+
+		if flaggedResult, ok := runFlaggedAgents(ctx, req, logDir, contextBlock, questionsStr, stats); ok {
+			result += "\n\n---\n\n" + flaggedResult
 		}
+
 		score, scoreResp, scoreErr := runScorer(ctx, nil, "", req.Diff, req.SpecContent, req.AcknowledgedIssues)
 		if scoreErr == nil {
 			stats.Add(scoreResp)
@@ -3296,10 +3247,6 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 		return "", nil, stats, mergeErr
 	}
 
-	if mergeResp.SessionID != "" {
-		sessionStore.Set(req.PRURL, mergeResp.SessionID)
-	}
-
 	// Save review memory for subsequent runs
 	if req.Owner != "" && req.Repo != "" && req.PRNum != "" {
 		var scorePtr *ScoreResult
@@ -3320,39 +3267,6 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 	}
 
 	return merged, nil, stats, nil
-}
-
-func runReReview(ctx context.Context, api SlackAPI, notifyUserID string, req ReviewRequest, sessionID string, stats *UsageStats) (string, claudeResponse, error) {
-	dmUser(api, notifyUserID, fmt.Sprintf("Resuming previous review session for <%s>...", req.PRURL))
-	log.Printf("re-review: resuming session %s for %s", sessionID, req.PRURL)
-
-	var ackNote string
-	if req.AcknowledgedIssues != "" {
-		ackNote = fmt.Sprintf("\n\n## Acknowledged Issues\nThese were explicitly acknowledged by the author — do NOT re-flag or penalize:\n\n%s", req.AcknowledgedIssues)
-	}
-
-	prompt := fmt.Sprintf(`You are continuing your previous code review of this PR: %s
-The author has pushed changes since your last review. Below is the COMPLETE CURRENT DIFF of the PR (not just what changed since last review).
-
-Your job:
-1. Compare this diff against the issues you raised in your previous review
-2. For each previous issue: state whether it was RESOLVED, PARTIALLY RESOLVED, or STILL PRESENT
-3. Flag any NEW issues introduced in the updated code
-4. Provide an updated merged review in the same format as before (Summary, Critical Issues, Design Concerns, Suggestions, What's Good, Verdict)
-5. If all critical issues are resolved and no new ones appeared, recommend approval
-
-IMPORTANT: Do NOT include a Quality Score section or score table — scoring is handled separately.
-Do NOT add meta-commentary about the diff or your process. Go straight into the review.
-%s
-## Updated Diff
-`+"```diff\n%s\n```", req.PRURL, ackNote, req.Diff)
-
-	text, resp, err := runClaudeWithSession(ctx, prompt, sessionID)
-	if err != nil {
-		return "", claudeResponse{}, err
-	}
-	log.Printf("re-review: session resume done for %s ($%.4f)", req.PRURL, resp.TotalCostUSD)
-	return text, resp, nil
 }
 
 func runDeltaReReview(ctx context.Context, req ReviewRequest, contextBlock, questionsStr string) (string, claudeResponse, error) {
@@ -3502,6 +3416,78 @@ async function cancelReview(prURL) {
 }
 poll(); pollLogs(); setInterval(poll, 3000); setInterval(pollLogs, 2000);
 </script></body></html>`
+
+func runFlaggedAgents(ctx context.Context, req ReviewRequest, logDir, contextBlock, questionsStr string, stats *UsageStats) (string, bool) {
+	if len(req.Flags) == 0 {
+		return "", false
+	}
+	allAgents, err := loadAgents()
+	if err != nil {
+		log.Printf("flagged-agents: load failed: %v", err)
+		return "", false
+	}
+	agents := filterFlaggedAgents(allAgents, req.Flags)
+	if len(agents) == 0 {
+		return "", false
+	}
+
+	log.Printf("flagged-agents: running %d flag-gated agent(s) alongside re-review: %s", len(agents), agentNames(agents))
+
+	data := promptData{
+		ModePreamble: modePreamble(req.Mode),
+		PRURL:        req.PRURL,
+		ContextBlock: contextBlock,
+		QuestionsStr: questionsStr,
+		Diff:         req.Diff,
+	}
+
+	reviews := make([]string, len(agents))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for i, a := range agents {
+		wg.Add(1)
+		go func(idx int, agent agentFile) {
+			defer wg.Done()
+			prompt, renderErr := renderAgent(agent, data)
+			if renderErr != nil {
+				log.Printf("flagged-agent %s: render failed: %v", agent.name, renderErr)
+				return
+			}
+			prompt += reviewDiscipline + scoreSuffix
+			maxTurns := resolveMaxTurns(agent, req.Flags["thorough"])
+			log.Printf("flagged-agent %s: starting for %s (max-turns=%d)", agent.name, req.PRURL, maxTurns)
+			agentStart := time.Now()
+			text, resp, err := runClaude(ctx, prompt)
+			agentDur := time.Since(agentStart)
+			if err != nil {
+				log.Printf("flagged-agent %s: failed: %v", agent.name, err)
+				writeAgentLog(logDir, agent.name+"-error", fmt.Sprintf("ERROR: %v\n\nPartial output:\n%s", err, text))
+				return
+			}
+			stats.Add(resp)
+			stats.AddAgent(agent.name, resp.TotalCostUSD, agentDur, resp.NumTurns, maxTurns)
+			writeAgentLog(logDir, agent.name, text)
+			reviewText, _ := extractPerspectiveScore(agent.name, text)
+			mu.Lock()
+			reviews[idx] = fmt.Sprintf("## %s Review (Flag-Gated)\n\n%s", strings.ToUpper(agent.name), reviewText)
+			mu.Unlock()
+			log.Printf("flagged-agent %s: done for %s ($%.4f, %d/%d turns)", agent.name, req.PRURL, resp.TotalCostUSD, resp.NumTurns, maxTurns)
+		}(i, a)
+	}
+	wg.Wait()
+
+	var results []string
+	for _, r := range reviews {
+		if r != "" {
+			results = append(results, r)
+		}
+	}
+	if len(results) == 0 {
+		return "", false
+	}
+	return strings.Join(results, "\n\n---\n\n"), true
+}
 
 const diffScopeRule = `IMPORTANT: Only raise issues about code that appears in the diff below. Do not speculate about code outside the diff, do not flag pre-existing issues in unchanged code, and do not hallucinate file contents you cannot see. Every finding must quote the exact code from the diff. If the diff is clean, say so.
 
@@ -3856,25 +3842,21 @@ func questionsBlock(questions string) string {
 }
 
 func runClaude(ctx context.Context, prompt string) (string, claudeResponse, error) {
-	return runClaudeOpts(ctx, prompt, "", "", 0)
+	return runClaudeOpts(ctx, prompt, "", 0)
 }
 
 func runClaudeInDir(ctx context.Context, prompt, workDir, modelOverride string, maxTurns int) (string, claudeResponse, error) {
-	return runClaudeOpts(ctx, prompt, "", workDir, maxTurns, modelOverride)
-}
-
-func runClaudeWithSession(ctx context.Context, prompt, resumeSessionID string) (string, claudeResponse, error) {
-	return runClaudeOpts(ctx, prompt, resumeSessionID, "", 0)
+	return runClaudeOpts(ctx, prompt, workDir, maxTurns, modelOverride)
 }
 
 const claudeMaxRetries = 2
 
-func runClaudeOpts(ctx context.Context, prompt, resumeSessionID, workDir string, maxTurns int, modelOverride ...string) (string, claudeResponse, error) {
+func runClaudeOpts(ctx context.Context, prompt, workDir string, maxTurns int, modelOverride ...string) (string, claudeResponse, error) {
 	var lastText string
 	var lastResp claudeResponse
 	var lastErr error
 	for attempt := range claudeMaxRetries + 1 {
-		lastText, lastResp, lastErr = runClaudeOnce(ctx, prompt, resumeSessionID, workDir, maxTurns, modelOverride...)
+		lastText, lastResp, lastErr = runClaudeOnce(ctx, prompt, workDir, maxTurns, modelOverride...)
 		if lastErr == nil {
 			return lastText, lastResp, nil
 		}
@@ -3894,7 +3876,7 @@ func runClaudeOpts(ctx context.Context, prompt, resumeSessionID, workDir string,
 	return lastText, lastResp, lastErr
 }
 
-func runClaudeOnce(ctx context.Context, prompt, resumeSessionID, workDir string, maxTurns int, modelOverride ...string) (string, claudeResponse, error) {
+func runClaudeOnce(ctx context.Context, prompt, workDir string, maxTurns int, modelOverride ...string) (string, claudeResponse, error) {
 	if workDir == "" {
 		workDir = os.TempDir()
 	}
@@ -3911,9 +3893,6 @@ func runClaudeOnce(ctx context.Context, prompt, resumeSessionID, workDir string,
 	args := []string{"-p", "Follow the instructions provided on stdin.", "--output-format", "json", "--model", model}
 	if maxTurns > 0 {
 		args = append(args, "--max-turns", strconv.Itoa(maxTurns))
-	}
-	if resumeSessionID != "" {
-		args = append(args, "--resume", resumeSessionID)
 	}
 	cmd := exec.CommandContext(ctx, "claude", args...)
 	cmd.Dir = workDir
