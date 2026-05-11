@@ -1,0 +1,13 @@
+services:
+  bot:
+    build: .
+    env_file: .env
+    volumes:
+      - cache:/data/cache
+      - ~/.claude:/root/.claude:ro
+    ports:
+      - "${HEALTH_PORT:-8080}:8080"
+    restart: unless-stopped
+
+volumes:
+  cache:

@@ -6,15 +6,19 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"text/template"
 	"time"
 
@@ -684,6 +688,115 @@ func cancelReview(ts string) bool {
 	return cancelled
 }
 
+// --- Review Queue ---
+
+type ReviewJob struct {
+	Fn func()
+}
+
+type ReviewQueue struct {
+	jobs       chan ReviewJob
+	maxWorkers int
+	wg         sync.WaitGroup
+	startTime  time.Time
+	queued     atomic.Int64
+	completed  atomic.Int64
+	dropped    atomic.Int64
+}
+
+func NewReviewQueue(workers, queueSize int) *ReviewQueue {
+	q := &ReviewQueue{
+		jobs:       make(chan ReviewJob, queueSize),
+		maxWorkers: workers,
+		startTime:  time.Now(),
+	}
+	for i := range workers {
+		q.wg.Add(1)
+		go func(id int) {
+			defer q.wg.Done()
+			log.Printf("worker %d started", id)
+			for job := range q.jobs {
+				job.Fn()
+			}
+			log.Printf("worker %d stopped", id)
+		}(i)
+	}
+	log.Printf("review queue: %d workers, %d queue depth", workers, queueSize)
+	return q
+}
+
+func (q *ReviewQueue) Submit(fn func()) bool {
+	q.queued.Add(1)
+	select {
+	case q.jobs <- ReviewJob{Fn: fn}:
+		return true
+	default:
+		q.queued.Add(-1)
+		q.dropped.Add(1)
+		log.Printf("review queue full, dropping job")
+		return false
+	}
+}
+
+func (q *ReviewQueue) Drain() {
+	close(q.jobs)
+	q.wg.Wait()
+}
+
+func (q *ReviewQueue) Stats() (pending int, active int, completed int64, dropped int64) {
+	pending = len(q.jobs)
+	completed = q.completed.Load()
+	dropped = q.dropped.Load()
+	activeReviewsMu.Lock()
+	active = len(activeReviews)
+	activeReviewsMu.Unlock()
+	return
+}
+
+// --- Health Server ---
+
+type HealthServer struct {
+	*http.Server
+	Addr string
+}
+
+func startHealthServer(port string, queue *ReviewQueue) *HealthServer {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{"status":"ok","uptime":"%s"}`, time.Since(queue.startTime).Round(time.Second))
+	})
+
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		pending, active, completed, dropped := queue.Stats()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"uptime_seconds": int(time.Since(queue.startTime).Seconds()),
+			"queue_pending":  pending,
+			"reviews_active": active,
+			"reviews_done":   completed,
+			"reviews_dropped": dropped,
+			"workers":        queue.maxWorkers,
+		})
+	})
+
+	ln, err := net.Listen("tcp", ":"+port)
+	if err != nil {
+		log.Fatalf("health server listen: %v", err)
+	}
+	srv := &http.Server{Handler: mux}
+	hs := &HealthServer{Server: srv, Addr: ln.Addr().String()}
+	go func() {
+		log.Printf("health server listening on %s", hs.Addr)
+		if err := srv.Serve(ln); err != http.ErrServerClosed {
+			log.Printf("health server error: %v", err)
+		}
+	}()
+	return hs
+}
+
 func findPRInThread(api SlackAPI, channelID, threadTS string) (owner, repo, prNum string, fullText string, ok bool) {
 	msgs, _, _, err := api.GetConversationReplies(&slack.GetConversationRepliesParameters{
 		ChannelID: channelID,
@@ -958,6 +1071,40 @@ func (n *nopSlack) GetConversationReplies(*slack.GetConversationRepliesParameter
 	return nil, false, "", nil
 }
 
+func parseWatchedChannels(env string) map[string]bool {
+	if env == "*" {
+		return nil
+	}
+	channels := make(map[string]bool)
+	for _, ch := range strings.Split(env, ",") {
+		ch = strings.TrimSpace(ch)
+		if ch != "" {
+			channels[ch] = true
+		}
+	}
+	return channels
+}
+
+func isWatchedChannel(channelID string, watched map[string]bool) bool {
+	if watched == nil {
+		return true
+	}
+	return watched[channelID]
+}
+
+func envIntOr(key string, fallback int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		log.Printf("invalid %s=%q, using default %d", key, v, fallback)
+		return fallback
+	}
+	return n
+}
+
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "review" {
 		runCLI(os.Args[2:])
@@ -970,12 +1117,35 @@ func main() {
 
 	botToken := mustEnv("SLACK_BOT_TOKEN")
 	appToken := mustEnv("SLACK_APP_TOKEN")
-	channelID := mustEnv("WATCHED_CHANNEL_ID")
+	watchedChannels := parseWatchedChannels(mustEnv("WATCHED_CHANNEL_ID"))
 	notifyUserID := mustEnv("NOTIFY_USER_ID")
 	reviewQuestions := os.Getenv("REVIEW_QUESTIONS")
 
+	workers := envIntOr("REVIEW_WORKERS", 3)
+	queueSize := envIntOr("REVIEW_QUEUE_SIZE", 10)
+	healthPort := os.Getenv("HEALTH_PORT")
+	if healthPort == "" {
+		healthPort = "8080"
+	}
+
+	queue := NewReviewQueue(workers, queueSize)
+
+	submitReview := func(api SlackAPI, channel string, fn func()) {
+		if !queue.Submit(func() {
+			fn()
+			queue.completed.Add(1)
+		}) {
+			api.PostMessage(channel, slack.MsgOptionText("Review queue full — try again shortly.", false))
+		}
+	}
+
 	api := slack.New(botToken, slack.OptionAppLevelToken(appToken))
 	client := socketmode.New(api)
+
+	healthSrv := startHealthServer(healthPort, queue)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	go func() {
 		for evt := range client.Events {
@@ -1000,7 +1170,9 @@ func main() {
 					}
 				}
 				if rev.Reaction == "claude_it" {
-					go handleReactionReview(api, rev, rev.Item.Channel, notifyUserID, reviewQuestions)
+					submitReview(api, rev.Item.Channel, func() {
+						handleReactionReview(api, rev, rev.Item.Channel, notifyUserID, reviewQuestions)
+					})
 				}
 
 			case string(slackevents.AppMention):
@@ -1026,9 +1198,12 @@ func main() {
 							log.Printf("skipping duplicate @mention review for %s (already in progress)", prURL)
 							continue
 						}
-						ctx, cancel := context.WithCancel(context.Background())
+						rCtx, cancel := context.WithCancel(ctx)
 						trackReview(msgEv.TimeStamp, prURL, cancel)
-						go handlePR(ctx, api, msgEv, prURL, owner, repo, prNum, ev.Channel, notifyUserID, reviewQuestions)
+						msgCopy, ownerC, repoC, prNumC, chC := *msgEv, owner, repo, prNum, ev.Channel
+						submitReview(api, ev.Channel, func() {
+							handlePR(rCtx, api, &msgCopy, prURL, ownerC, repoC, prNumC, chC, notifyUserID, reviewQuestions)
+						})
 					}
 					continue
 				}
@@ -1056,16 +1231,21 @@ func main() {
 							Channel:   ev.Channel,
 							TimeStamp: ev.TimeStamp,
 						}
-						ctx, cancel := context.WithCancel(context.Background())
+						rCtx, cancel := context.WithCancel(ctx)
 						trackReview(msgEv.TimeStamp, prURL, cancel)
-						go handlePR(ctx, api, msgEv, prURL, owner, repo, prNum, ev.Channel, notifyUserID, reviewQuestions)
+						msgCopy := *msgEv
+						ownerC, repoC, prNumC, chC := owner, repo, prNum, ev.Channel
+						submitReview(api, ev.Channel, func() {
+							handlePR(rCtx, api, &msgCopy, prURL, ownerC, repoC, prNumC, chC, notifyUserID, reviewQuestions)
+						})
 					} else {
-						ctx, cancel := context.WithCancel(context.Background())
+						rCtx, cancel := context.WithCancel(ctx)
 						trackReview(ev.TimeStamp, prURL, cancel)
-						go func() {
-							defer untrackReview(ev.TimeStamp, prURL)
-							handleThreadFollowup(ctx, api, ev, owner, repo, prNum, notifyUserID)
-						}()
+						evCopy := *ev
+						submitReview(api, ev.Channel, func() {
+							defer untrackReview(evCopy.TimeStamp, prURL)
+							handleThreadFollowup(rCtx, api, &evCopy, owner, repo, prNum, notifyUserID)
+						})
 					}
 				}
 
@@ -1074,7 +1254,7 @@ func main() {
 				if !ok || ev.BotID != "" || ev.SubType != "" {
 					continue
 				}
-				if ev.Channel != channelID {
+				if !isWatchedChannel(ev.Channel, watchedChannels) {
 					continue
 				}
 
@@ -1090,18 +1270,32 @@ func main() {
 						log.Printf("skipping duplicate auto-review for %s (already in progress)", prURL)
 						continue
 					}
-					ctx, cancel := context.WithCancel(context.Background())
+					rCtx, cancel := context.WithCancel(ctx)
 					trackReview(ev.TimeStamp, prURL, cancel)
-					go handlePR(ctx, api, ev, prURL, owner, repo, prNum, channelID, notifyUserID, reviewQuestions)
+					evCopy, ownerC, repoC, prNumC, chC := *ev, owner, repo, prNum, ev.Channel
+					submitReview(api, ev.Channel, func() {
+						handlePR(rCtx, api, &evCopy, prURL, ownerC, repoC, prNumC, chC, notifyUserID, reviewQuestions)
+					})
 				}
 			}
 		}
 	}()
 
 	log.Println("PR Review Bot running...")
-	if err := client.Run(); err != nil {
-		log.Fatal(err)
-	}
+
+	go func() {
+		if err := client.RunContext(ctx); err != nil && ctx.Err() == nil {
+			log.Fatalf("slack client error: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	log.Println("shutting down — draining active reviews...")
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	healthSrv.Shutdown(shutdownCtx)
+	queue.Drain()
+	log.Println("shutdown complete")
 }
 
 func parseMode(text string) (ReviewMode, bool) {
