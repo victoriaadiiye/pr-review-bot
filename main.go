@@ -3238,52 +3238,7 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 
 	log.Printf("validator: starting for %s", req.PRURL)
 	valStart := time.Now()
-	validated, valResp, err := runClaude(ctx, fmt.Sprintf(`You are a strict review validator. You have %d independent code reviews of a PR, the original diff, and a commit manifest showing exactly which files each commit touches.
-
-Your job is to verify every claim in every review against the actual diff. Reviewers are known to hallucinate — referencing code from other PRs, inventing file paths, misquoting code, or making claims about unchanged code.
-
-## Validation Process
-
-For EACH finding in each review:
-1. **Locate the exact code** — find the quoted code or referenced file:line in the diff below. If it does not appear in the diff, the finding is INVALID.
-2. **Verify the claim** — does the code actually have the problem described? Read the surrounding diff context.
-3. **Check the commit** — if the reviewer references a specific change, verify it appears in the commit manifest below.
-4. **Classify** each finding as:
-   - **VERIFIED** — code exists in diff, claim is accurate
-   - **INVALID: NOT IN DIFF** — reviewer references code/files not present in this PR's diff
-   - **INVALID: MISQUOTED** — code exists but reviewer misquoted or mischaracterized it
-   - **INVALID: WRONG FILE** — reviewer attributes code to wrong file
-   - **INVALID: PRE-EXISTING** — issue exists but was not introduced or modified by this PR
-   - **INVALID: WRONG CLASSIFICATION** — reviewer claims a violation based on incorrect assumptions about project rules (e.g., claiming a "leaf" package violates isolation when leaves are explicitly allowed to be imported, or asserting a linter rule that does not exist in the config shown in the diff)
-   - **OVERSTATED** — observation has some basis but severity is inflated (e.g., "Critical" for a theoretical concern, or claiming "unbounded" when the code has explicit bounds). You MUST state what the correct severity should be (e.g., "OVERSTATED: Medium — requires authenticated access and sustained scanning"). Critical means: unauthorized access, data corruption, or service unavailability for unauthenticated users with no sustained effort. Auth-gated issues cap at High. Theoretical concerns cap at Medium
-   - **OVERSTATED: DEFENSE-IN-DEPTH** — the issue is real at the flagged layer but a callee or downstream layer already enforces the constraint (e.g., handler missing bounds check but the storage query clamps it). Downgrade severity: a missing check at layer N when layer N+1 enforces it is a doc-code mismatch, not an unbounded risk
-   - **UNVERIFIABLE** — claim may be valid but cannot be confirmed from the diff alone
-   - **UNVERIFIABLE: HISTORICAL CLAIM** — reviewer asserts something about prior reviews, regression history, or review rounds without evidence. Flag as unverifiable — reviewers must not cite review history they don't have access to
-
-## Additional Verification Rules
-
-5. **Verify counts** — when a reviewer states a specific count (e.g., "7 handlers use X", "6 ignored errors"), count the actual occurrences in the diff. State YOUR count explicitly (e.g., "Reviewer claims 7, I count 5: [list each]"). If the count is wrong, mark the claim MISQUOTED and note the correct count — wrong counts erode author trust and waste investigation time.
-6. **Check project-specific classifications before isolation findings** — this is a CRITICAL check. If a reviewer claims a component isolation violation:
-   a. Search the diff for isolation_test.go — check if the imported package appears in leafPackages. Leaves are ALWAYS allowed to be imported.
-   b. Search the diff for .golangci.yml — check if the imported package appears in the depguard component-isolation deny list. Only packages in the deny list are components.
-   c. If neither file is in the diff, check the commit manifest for these files. If you cannot verify the classification, mark the finding UNVERIFIABLE, not VERIFIED.
-   d. A false Critical claiming isolation violation on a leaf package is the highest-impact bot failure mode — it wastes the most author time.
-7. **Trace callees for severity** — when a reviewer claims "unbounded" or "no validation", check whether the called function (visible in the diff or referenced in unchanged context) already enforces the constraint. If so, downgrade severity.
-8. **Verify scope attribution** — when a reviewer flags code, check the commit manifest to confirm the flagged file appears in this PR's commits. If the file is not in the manifest, mark the finding INVALID: NOT IN PR SCOPE. Findings against code from other PRs waste reviewer attention.
-
-## Output Format
-
-For each review, list every finding with its validation status and a one-line explanation. Then provide:
-- Total findings vs verified vs invalid
-- Any important issues the reviewers missed that ARE visible in the diff
-- Answers to any questions reviewers raised that can be answered from the diff
-
-%s%s
-## Original Diff
-`+"```diff\n%s\n```"+`
-
-## Reviews to Validate
-%s`, len(agents), manifestBlock, coverageNote, req.Diff, allReviews))
+	validated, valResp, err := runClaude(ctx, buildValidatorPrompt(len(agents), manifestBlock, coverageNote, req.Diff, allReviews))
 	if err != nil {
 		return "", nil, stats, fmt.Errorf("validator failed: %w", err)
 	}
@@ -3606,6 +3561,57 @@ Keep it short. If the code is sound, say so and approve.
 	return text, nil
 }
 
+func buildValidatorPrompt(numAgents int, manifestBlock, coverageNote, diff, allReviews string) string {
+	return fmt.Sprintf(`You are a strict review validator. You have %d independent code reviews of a PR, the original diff, and a commit manifest showing exactly which files each commit touches.
+
+Your job is to verify every claim in every review against the actual diff. Reviewers are known to hallucinate — referencing code from other PRs, inventing file paths, misquoting code, or making claims about unchanged code.
+
+## Validation Process
+
+For EACH finding in each review:
+1. **Locate the exact code** — find the quoted code or referenced file:line in the diff below. If it does not appear in the diff, the finding is INVALID.
+2. **Verify the claim** — does the code actually have the problem described? Read the surrounding diff context.
+3. **Check the commit** — if the reviewer references a specific change, verify it appears in the commit manifest below.
+4. **Classify** each finding as:
+   - **VERIFIED** — code exists in diff, claim is accurate
+   - **INVALID: NOT IN DIFF** — reviewer references code/files not present in this PR's diff
+   - **INVALID: MISQUOTED** — code exists but reviewer misquoted or mischaracterized it
+   - **INVALID: WRONG FILE** — reviewer attributes code to wrong file
+   - **INVALID: PRE-EXISTING** — issue exists but was not introduced or modified by this PR
+   - **INVALID: WRONG CLASSIFICATION** — reviewer claims a violation based on incorrect assumptions about project rules (e.g., claiming a "leaf" package violates isolation when leaves are explicitly allowed to be imported, or asserting a linter rule that does not exist in the config shown in the diff)
+   - **OVERSTATED** — observation has some basis but severity is inflated (e.g., "Critical" for a theoretical concern, or claiming "unbounded" when the code has explicit bounds). You MUST state what the correct severity should be (e.g., "OVERSTATED: Medium — requires authenticated access and sustained scanning"). Critical means: unauthorized access, data corruption, or service unavailability for unauthenticated users with no sustained effort. Auth-gated issues cap at High. Theoretical concerns cap at Medium
+   - **OVERSTATED: DEFENSE-IN-DEPTH** — the issue is real at the flagged layer but a callee or downstream layer already enforces the constraint (e.g., handler missing bounds check but the storage query clamps it). Downgrade severity: a missing check at layer N when layer N+1 enforces it is a doc-code mismatch, not an unbounded risk
+   - **UNVERIFIABLE** — claim may be valid but cannot be confirmed from the diff alone
+   - **UNVERIFIABLE: HISTORICAL CLAIM** — reviewer asserts something about prior reviews, regression history, or review rounds without evidence. Flag as unverifiable — reviewers must not cite review history they don't have access to
+
+## Additional Verification Rules
+
+5. **Verify counts** — when a reviewer states a specific count (e.g., "7 handlers use X", "6 ignored errors"), count the actual occurrences in the diff. State YOUR count explicitly (e.g., "Reviewer claims 7, I count 5: [list each]"). If the count is wrong, mark the claim MISQUOTED and note the correct count — wrong counts erode author trust and waste investigation time.
+6. **Check project-specific classifications before isolation findings** — this is a CRITICAL check. If a reviewer claims a component isolation violation:
+   a. Search the diff for isolation_test.go — check if the imported package appears in leafPackages. Leaves are ALWAYS allowed to be imported.
+   b. Search the diff for .golangci.yml — check if the imported package appears in the depguard component-isolation deny list. Only packages in the deny list are components.
+   c. If neither file is in the diff, check the commit manifest for these files. If you cannot verify the classification, mark the finding UNVERIFIABLE, not VERIFIED.
+   d. A false Critical claiming isolation violation on a leaf package is the highest-impact bot failure mode — it wastes the most author time.
+7. **Trace callees for severity** — when a reviewer claims "unbounded" or "no validation", check whether the called function (visible in the diff or referenced in unchanged context) already enforces the constraint. If so, downgrade severity.
+8. **Verify scope attribution** — when a reviewer flags code, check the commit manifest to confirm the flagged file appears in this PR's commits. If the file is not in the manifest, mark the finding INVALID: NOT IN PR SCOPE. Findings against code from other PRs waste reviewer attention.
+9. **Verify cross-file dependencies before claiming something is unnecessary** — when a reviewer claims a file, function, or migration is not needed, trace its usage across ALL files in the diff. Multi-file PRs often have cross-file dependency chains (e.g., migration A creates a user that migration B references in a policy, or a helper function used only by a new module also in the diff). Check the commit manifest for co-committed files that may depend on the flagged code. If file X is co-committed with files that reference entities created by X, it is a dependency — not unnecessary scope. Mark claims of "unnecessary" as INVALID: CROSS-FILE DEPENDENCY when the dependency chain is visible in the diff.
+10. **Verify document content claims** — when a reviewer claims a document contains (or lacks) specific text (e.g., "doc references stale migration numbers"), locate the document in the diff and verify the claimed text actually exists or is absent. Do not trust reviewers' characterizations of document content — they hallucinate file contents. If the document is not in the diff, mark as UNVERIFIABLE.
+
+## Output Format
+
+For each review, list every finding with its validation status and a one-line explanation. Then provide:
+- Total findings vs verified vs invalid
+- Any important issues the reviewers missed that ARE visible in the diff
+- Answers to any questions reviewers raised that can be answered from the diff
+
+%s%s
+## Original Diff
+`+"```diff\n%s\n```"+`
+
+## Reviews to Validate
+%s`, numAgents, manifestBlock, coverageNote, diff, allReviews)
+}
+
 func runScorer(ctx context.Context, perspectiveScores []PerspectiveScore, validatorOutput, diff, specContent, acknowledgedIssues string) (ScoreResult, claudeResponse, error) {
 	specDimension := ""
 	specBlock := ""
@@ -3739,7 +3745,7 @@ func formatScoreHeader(score ScoreResult, previousReviews string) string {
 	return header
 }
 
-func runMerger(ctx context.Context, allReviews, validated string, mode ReviewMode, specContent, acknowledgedIssues string, failedAgents []string, manifest DiffManifest) (string, claudeResponse, error) {
+func buildMergerPrompt(allReviews, validated string, mode ReviewMode, specContent, acknowledgedIssues string, failedAgents []string, manifest DiffManifest) string {
 	var modeRules string
 	switch mode {
 	case ModeFinal:
@@ -3794,7 +3800,7 @@ RE-REVIEW RULES:
 
 	ethos := loadEthos()
 
-	text, resp, err := runClaude(ctx, fmt.Sprintf(`You are a review synthesizer. You have 4 independent code reviews and a validation report.
+	return fmt.Sprintf(`You are a review synthesizer. You have 4 independent code reviews and a validation report.
 
 %s
 
@@ -3818,13 +3824,18 @@ Rules:
 - Reference file names and line numbers where relevant
 - Do NOT include a Quality Score section, score table, or numerical scores — scoring is handled separately
 - **Summary scope rule**: The Summary line MUST only describe changes visible in the PR File Manifest below. Cross-check every area you mention against the file list — if no files in that area appear in the manifest, do not mention it. Fabricating scope (e.g., claiming "UI improvements across Fleet and Infrastructure" when no Fleet/Infrastructure files changed) is a critical synthesis failure
-- **No review history claims**: Do not assert that issues were "flagged in previous reviews" or are "third-round regressions" unless the prior review text is provided as input. Unverifiable historical claims sound authoritative but erode trust%s%s
+- **No review history claims**: Do not assert that issues were "flagged in previous reviews" or are "third-round regressions" unless the prior review text is provided as input. Unverifiable historical claims sound authoritative but erode trust
+- **Filter out-of-scope findings**: When reviewers or the validator flag items as OUT OF SCOPE, out-of-scope, or "not part of this PR's core change," do NOT include them in Critical Issues or Design Concerns. These are drive-by observations about code that exists but is not the focus of this PR. At most, mention them in a brief "Out of Scope" note after Suggestions — never let them influence the verdict%s%s
 %s
 ## Reviews
 %s
 
 ## Validation Report
-%s%s%s%s`, ethos, specSection, ackSection, specRule, ackRule, modeRules, allReviews, validated, specContext, coverageNote, manifestFileList))
+%s%s%s%s`, ethos, specSection, ackSection, specRule, ackRule, modeRules, allReviews, validated, specContext, coverageNote, manifestFileList)
+}
+
+func runMerger(ctx context.Context, allReviews, validated string, mode ReviewMode, specContent, acknowledgedIssues string, failedAgents []string, manifest DiffManifest) (string, claudeResponse, error) {
+	text, resp, err := runClaude(ctx, buildMergerPrompt(allReviews, validated, mode, specContent, acknowledgedIssues, failedAgents, manifest))
 	if err != nil {
 		return "", claudeResponse{}, fmt.Errorf("merger failed: %w", err)
 	}

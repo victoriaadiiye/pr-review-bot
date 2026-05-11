@@ -2984,3 +2984,129 @@ func TestIsPRURL(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildValidatorPrompt_ContainsCrossDependencyRule(t *testing.T) {
+	prompt := buildValidatorPrompt(4, "", "", "diff content", "review content")
+	if !strings.Contains(prompt, "cross-file dependenc") {
+		t.Error("validator prompt should contain cross-file dependency verification rule")
+	}
+	if !strings.Contains(prompt, "migration") {
+		t.Error("validator prompt should mention migrations as an example of cross-file dependencies")
+	}
+}
+
+func TestBuildValidatorPrompt_PreservesExistingRules(t *testing.T) {
+	prompt := buildValidatorPrompt(3, "## Manifest\n", "", "diff", "reviews")
+	checks := []string{
+		"VERIFIED",
+		"INVALID: NOT IN DIFF",
+		"OVERSTATED",
+		"Verify counts",
+		"Trace callees for severity",
+		"Verify scope attribution",
+	}
+	for _, want := range checks {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("validator prompt missing existing rule: %q", want)
+		}
+	}
+}
+
+func TestBuildMergerPrompt_ContainsOutOfScopeRule(t *testing.T) {
+	prompt := buildMergerPrompt("reviews", "validated", ModeInitial, "", "", nil, DiffManifest{})
+	if !strings.Contains(prompt, "OUT OF SCOPE") || !strings.Contains(prompt, "out-of-scope") {
+		t.Error("merger prompt should contain out-of-scope filtering rule")
+	}
+}
+
+func TestBuildMergerPrompt_PreservesExistingRules(t *testing.T) {
+	prompt := buildMergerPrompt("reviews", "validated", ModeInitial, "", "", nil, DiffManifest{})
+	checks := []string{
+		"GO-EXPERT",
+		"Deduplicate",
+		"Summary scope rule",
+		"No review history claims",
+	}
+	for _, want := range checks {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("merger prompt missing existing rule: %q", want)
+		}
+	}
+}
+
+func TestBuildMergerPrompt_ModeRules(t *testing.T) {
+	final := buildMergerPrompt("r", "v", ModeFinal, "", "", nil, DiffManifest{})
+	if !strings.Contains(final, "FINAL REVIEW RULES") {
+		t.Error("final mode should include final review rules")
+	}
+
+	reReview := buildMergerPrompt("r", "v", ModeReReview, "", "", nil, DiffManifest{})
+	if !strings.Contains(reReview, "RE-REVIEW RULES") {
+		t.Error("re-review mode should include re-review rules")
+	}
+}
+
+func TestAgentPrompts_ContainAntiHallucinationRule(t *testing.T) {
+	dir := t.TempDir()
+	old := agentsDir
+	agentsDir = dir
+	defer func() { agentsDir = old }()
+
+	// Copy real agent files to temp dir
+	realAgentsDir := "agents"
+	entries, err := os.ReadDir(realAgentsDir)
+	if err != nil {
+		t.Skipf("cannot read agents dir: %v", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		data, _ := os.ReadFile(filepath.Join(realAgentsDir, e.Name()))
+		os.WriteFile(filepath.Join(dir, e.Name()), data, 0o644)
+	}
+
+	agents, err := loadAgents()
+	if err != nil {
+		t.Fatalf("loadAgents: %v", err)
+	}
+
+	coreAgents := map[string]bool{"correctness": true, "go-expert": true, "pragmatic": true}
+	for _, a := range agents {
+		if !coreAgents[a.name] {
+			continue
+		}
+		rendered, err := renderAgent(a, promptData{Diff: "test"})
+		if err != nil {
+			t.Fatalf("renderAgent %s: %v", a.name, err)
+		}
+		if !strings.Contains(rendered, "not visible in the diff") {
+			t.Errorf("agent %q should contain anti-hallucination rule about not asserting content beyond the diff", a.name)
+		}
+	}
+}
+
+func TestAgentPrompts_ContainLineNumberGuidance(t *testing.T) {
+	dir := t.TempDir()
+	old := agentsDir
+	agentsDir = dir
+	defer func() { agentsDir = old }()
+
+	realAgentsDir := "agents"
+	entries, err := os.ReadDir(realAgentsDir)
+	if err != nil {
+		t.Skipf("cannot read agents dir: %v", err)
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		data, _ := os.ReadFile(filepath.Join(realAgentsDir, e.Name()))
+		os.WriteFile(filepath.Join(dir, e.Name()), data, 0o644)
+	}
+
+	ethos := loadEthos()
+	if !strings.Contains(ethos, "line number") {
+		t.Error("ethos should contain line number accuracy guidance")
+	}
+}
