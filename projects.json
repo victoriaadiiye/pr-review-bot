@@ -1,0 +1,13 @@
+{
+  "projects": {
+    "Qumulo/qompass": {
+      "agents": ["qompass-pr-reviewer", "qompass-architecture-reviewer", "qompass-clickhouse-data-reviewer", "qompass-observability-domain", "qompass-docs-keeper"]
+    },
+    "Qumulo/qatalyst": {
+      "agents": ["qatalyst-golang-pr-reviewer", "qatalyst-architecture-reviewer", "qatalyst-cli-ux-reviewer", "qatalyst-linux-hardware", "qatalyst-security-hardener", "qatalyst-docs-keeper"]
+    }
+  },
+  "default": {
+    "agents": ["correctness", "go-expert", "pragmatic"]
+  }
+}

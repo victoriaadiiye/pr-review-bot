@@ -5,6 +5,7 @@ flag: bare-necessities
 
 Review this pull request: {{.PRURL}}
 {{.ContextBlock}}
+{{.PriorContext}}
 ## Your Process
 
 1. Identify the PR's stated purpose from the title, description, and context

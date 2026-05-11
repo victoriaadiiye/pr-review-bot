@@ -40,11 +40,17 @@ const (
 	ModeReReview ReviewMode = "re-review"
 	ModeQuick    ReviewMode = "quick"
 	ModeFinal    ReviewMode = "final"
+
+	agentMaxTurnsDefault  = 50
+	agentMaxTurnsThorough = 50
 )
 
 type ReviewRequest struct {
 	Diff               string
 	PRURL              string
+	Owner              string
+	Repo               string
+	PRNum              string
 	Questions          string
 	Mode               ReviewMode
 	SelfReview         bool
@@ -55,6 +61,7 @@ type ReviewRequest struct {
 	SpecContent        string
 	SpecPath           string
 	Flags              map[string]bool
+	OnlyAgents         []string
 }
 
 type claudeResponse struct {
@@ -77,6 +84,8 @@ type AgentMetric struct {
 	Name     string
 	CostUSD  float64
 	Duration time.Duration
+	Turns    int
+	MaxTurns int
 }
 
 type UsageStats struct {
@@ -88,6 +97,13 @@ type UsageStats struct {
 	TotalCacheRead    int64
 	AgentCalls        int
 	AgentMetrics      []AgentMetric
+	Warnings          []string
+}
+
+func (u *UsageStats) AddWarning(msg string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.Warnings = append(u.Warnings, msg)
 }
 
 func (u *UsageStats) Add(resp claudeResponse) {
@@ -101,10 +117,10 @@ func (u *UsageStats) Add(resp claudeResponse) {
 	u.AgentCalls++
 }
 
-func (u *UsageStats) AddAgent(name string, cost float64, dur time.Duration) {
+func (u *UsageStats) AddAgent(name string, cost float64, dur time.Duration, turns, maxTurns int) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	u.AgentMetrics = append(u.AgentMetrics, AgentMetric{Name: name, CostUSD: cost, Duration: dur})
+	u.AgentMetrics = append(u.AgentMetrics, AgentMetric{Name: name, CostUSD: cost, Duration: dur, Turns: turns, MaxTurns: maxTurns})
 }
 
 func (u *UsageStats) String() string {
@@ -126,7 +142,14 @@ func (u *UsageStats) MetricsSummary(model, triggerUser, channelID string) string
 	b.WriteString(fmt.Sprintf("> *Total cost:* $%.4f\n", u.TotalCostUSD))
 	b.WriteString("> *Agent breakdown:*\n")
 	for _, m := range u.AgentMetrics {
-		b.WriteString(fmt.Sprintf(">   • `%s` — $%.4f, %s\n", m.Name, m.CostUSD, m.Duration.Round(time.Second)))
+		turnStr := fmt.Sprintf("%d/%d turns", m.Turns, m.MaxTurns)
+		if m.MaxTurns <= 0 {
+			turnStr = fmt.Sprintf("%d turns", m.Turns)
+		}
+		b.WriteString(fmt.Sprintf(">   • `%s` — $%.4f, %s, %s\n", m.Name, m.CostUSD, m.Duration.Round(time.Second), turnStr))
+	}
+	for _, w := range u.Warnings {
+		b.WriteString(fmt.Sprintf("> :warning: %s\n", w))
 	}
 	return b.String()
 }
@@ -143,9 +166,12 @@ func diffLines(diff string) int {
 }
 
 type agentFile struct {
-	name     string
-	flag     string
-	template *template.Template
+	name      string
+	flag      string
+	diffMatch string
+	model     string
+	maxTurns  int
+	template  *template.Template
 }
 
 type promptData struct {
@@ -154,9 +180,277 @@ type promptData struct {
 	ContextBlock string
 	QuestionsStr string
 	Diff         string
+	PriorContext string
+}
+
+// ReviewMemory persists structured context across reviews of the same PR.
+type ReviewMemory struct {
+	PRURL          string             `json:"pr_url"`
+	LastReviewed   time.Time          `json:"last_reviewed"`
+	ReviewCount    int                `json:"review_count"`
+	Mode           string             `json:"mode"`
+	Score          int                `json:"score"`
+	Verdict        string             `json:"verdict"`
+	AgentSummaries []AgentSummary     `json:"agent_summaries"`
+	CriticalIssues []string           `json:"critical_issues"`
+	ResolvedIssues []string           `json:"resolved_issues"`
+	FilesReviewed  []string           `json:"files_reviewed"`
+	DiffStats      ReviewMemoryDiffSt `json:"diff_stats"`
+}
+
+type AgentSummary struct {
+	Agent       string `json:"agent"`
+	KeyFindings string `json:"key_findings"`
+	Score       int    `json:"score"`
+}
+
+type ReviewMemoryDiffSt struct {
+	Files     int `json:"files"`
+	Additions int `json:"additions"`
+	Deletions int `json:"deletions"`
+}
+
+func reviewMemoryPath(owner, repo, prNum string) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot determine home dir: %w", err)
+	}
+	return filepath.Join(home, ".pr-review-cache", owner, repo, "pr-"+prNum, "review-memory.json"), nil
+}
+
+func loadReviewMemory(owner, repo, prNum string) (*ReviewMemory, error) {
+	path, err := reviewMemoryPath(owner, repo, prNum)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read review memory: %w", err)
+	}
+	var mem ReviewMemory
+	if err := json.Unmarshal(data, &mem); err != nil {
+		return nil, fmt.Errorf("parse review memory: %w", err)
+	}
+	return &mem, nil
+}
+
+func saveReviewMemory(owner, repo, prNum string, mem *ReviewMemory) error {
+	path, err := reviewMemoryPath(owner, repo, prNum)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create review memory dir: %w", err)
+	}
+	data, err := json.MarshalIndent(mem, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal review memory: %w", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return fmt.Errorf("write review memory: %w", err)
+	}
+	return nil
+}
+
+func formatPriorContext(mem *ReviewMemory) string {
+	if mem == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("## Prior Review Context\n")
+	b.WriteString(fmt.Sprintf("This PR was previously reviewed %d time(s). Last review: %s\n\n",
+		mem.ReviewCount, mem.LastReviewed.Format("2006-01-02 15:04 UTC")))
+	b.WriteString(fmt.Sprintf("**Previous score:** %d/100 | **Verdict:** %s\n\n", mem.Score, mem.Verdict))
+
+	if len(mem.CriticalIssues) > 0 {
+		b.WriteString("**Critical issues from prior review:**\n")
+		for _, issue := range mem.CriticalIssues {
+			b.WriteString(fmt.Sprintf("- %s\n", issue))
+		}
+		b.WriteString("\n")
+	}
+
+	if len(mem.ResolvedIssues) > 0 {
+		b.WriteString("**Resolved issues:**\n")
+		for _, issue := range mem.ResolvedIssues {
+			b.WriteString(fmt.Sprintf("- %s\n", issue))
+		}
+		b.WriteString("\n")
+	}
+
+	if len(mem.AgentSummaries) > 0 {
+		b.WriteString("**Agent findings summary:**\n")
+		for _, as := range mem.AgentSummaries {
+			b.WriteString(fmt.Sprintf("- **%s** (score: %d): %s\n", as.Agent, as.Score, as.KeyFindings))
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString(fmt.Sprintf("**Files reviewed:** %d | **Diff:** +%d/-%d across %d files\n",
+		len(mem.FilesReviewed), mem.DiffStats.Additions, mem.DiffStats.Deletions, mem.DiffStats.Files))
+
+	return b.String()
+}
+
+func extractVerdict(mergedText string) string {
+	lower := strings.ToLower(mergedText)
+	if strings.Contains(lower, "request changes") {
+		return "Request Changes"
+	}
+	if strings.Contains(lower, "approve") {
+		return "Approve"
+	}
+	return "Unknown"
+}
+
+func extractCriticalIssues(mergedText string) []string {
+	var issues []string
+	lines := strings.Split(mergedText, "\n")
+	inCritical := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		lower := strings.ToLower(trimmed)
+		if strings.HasPrefix(lower, "## critical") || strings.HasPrefix(lower, "### critical") {
+			inCritical = true
+			continue
+		}
+		if inCritical && (strings.HasPrefix(trimmed, "## ") || strings.HasPrefix(trimmed, "### ")) {
+			break
+		}
+		if inCritical && strings.HasPrefix(trimmed, "- ") {
+			issues = append(issues, strings.TrimPrefix(trimmed, "- "))
+		}
+	}
+	return issues
+}
+
+func computeDiffStats(diff string) ReviewMemoryDiffSt {
+	var additions, deletions int
+	for _, line := range strings.Split(diff, "\n") {
+		if strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++") {
+			additions++
+		} else if strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---") {
+			deletions++
+		}
+	}
+	files := splitDiffByFile(diff)
+	return ReviewMemoryDiffSt{
+		Files:     len(files),
+		Additions: additions,
+		Deletions: deletions,
+	}
+}
+
+func buildReviewMemory(req ReviewRequest, mergedText string, score *ScoreResult, perspectiveScores []PerspectiveScore) *ReviewMemory {
+	existing, _ := loadReviewMemory(req.Owner, req.Repo, req.PRNum)
+	reviewCount := 1
+	var resolvedIssues []string
+	if existing != nil {
+		reviewCount = existing.ReviewCount + 1
+		resolvedIssues = existing.ResolvedIssues
+	}
+
+	overall := 0
+	if score != nil {
+		overall = score.Overall
+	}
+
+	var agentSummaries []AgentSummary
+	for _, ps := range perspectiveScores {
+		if ps.Agent != "" {
+			agentSummaries = append(agentSummaries, AgentSummary{
+				Agent:       ps.Agent,
+				KeyFindings: ps.Rationale,
+				Score:       ps.Score,
+			})
+		}
+	}
+
+	fileMap := splitDiffByFile(req.Diff)
+	var filesReviewed []string
+	for f := range fileMap {
+		filesReviewed = append(filesReviewed, f)
+	}
+	sort.Strings(filesReviewed)
+
+	return &ReviewMemory{
+		PRURL:          req.PRURL,
+		LastReviewed:   time.Now(),
+		ReviewCount:    reviewCount,
+		Mode:           string(req.Mode),
+		Score:          overall,
+		Verdict:        extractVerdict(mergedText),
+		AgentSummaries: agentSummaries,
+		CriticalIssues: extractCriticalIssues(mergedText),
+		ResolvedIssues: resolvedIssues,
+		FilesReviewed:  filesReviewed,
+		DiffStats:      computeDiffStats(req.Diff),
+	}
 }
 
 var agentsDir = "agents"
+
+type ProjectAgentConfig struct {
+	Agents []string `json:"agents"`
+}
+
+type ProjectsConfig struct {
+	Projects map[string]ProjectAgentConfig `json:"projects"`
+	Default  ProjectAgentConfig            `json:"default"`
+}
+
+var projectsConfigPath = "projects.json"
+
+func loadProjectsConfig() (*ProjectsConfig, error) {
+	data, err := os.ReadFile(projectsConfigPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read projects config: %w", err)
+	}
+	var cfg ProjectsConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parse projects config: %w", err)
+	}
+	return &cfg, nil
+}
+
+func (cfg *ProjectsConfig) agentsForRepo(owner, repo string) []string {
+	if cfg == nil {
+		return nil
+	}
+	key := owner + "/" + repo
+	for pattern, pc := range cfg.Projects {
+		if strings.EqualFold(pattern, key) {
+			return pc.Agents
+		}
+	}
+	if len(cfg.Default.Agents) > 0 {
+		return cfg.Default.Agents
+	}
+	return nil
+}
+
+func filterAgentsByProject(agents []agentFile, allowed []string) []agentFile {
+	if len(allowed) == 0 {
+		return agents
+	}
+	set := make(map[string]bool, len(allowed))
+	for _, name := range allowed {
+		set[name] = true
+	}
+	var filtered []agentFile
+	for _, a := range agents {
+		if set[a.name] {
+			filtered = append(filtered, a)
+		}
+	}
+	return filtered
+}
 
 func loadAgents() ([]agentFile, error) {
 	entries, err := os.ReadDir(agentsDir)
@@ -175,7 +469,8 @@ func loadAgents() ([]agentFile, error) {
 		}
 		name := strings.TrimSuffix(e.Name(), ".md")
 		content := string(raw)
-		var flag string
+		var flag, diffMatch, model string
+		var maxTurns int
 		if strings.HasPrefix(content, "---\n") {
 			if end := strings.Index(content[4:], "\n---\n"); end >= 0 {
 				frontmatter := content[4 : 4+end]
@@ -184,6 +479,17 @@ func loadAgents() ([]agentFile, error) {
 					if strings.HasPrefix(line, "flag:") {
 						flag = strings.TrimSpace(strings.TrimPrefix(line, "flag:"))
 					}
+					if strings.HasPrefix(line, "diff_match:") {
+						diffMatch = strings.TrimSpace(strings.TrimPrefix(line, "diff_match:"))
+					}
+					if strings.HasPrefix(line, "model:") {
+						model = strings.TrimSpace(strings.TrimPrefix(line, "model:"))
+					}
+					if strings.HasPrefix(line, "max_turns:") {
+						if v, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "max_turns:"))); err == nil && v > 0 {
+							maxTurns = v
+						}
+					}
 				}
 			}
 		}
@@ -191,7 +497,7 @@ func loadAgents() ([]agentFile, error) {
 		if err != nil {
 			return nil, fmt.Errorf("parse agent template %s: %w", path, err)
 		}
-		agents = append(agents, agentFile{name: name, flag: flag, template: tmpl})
+		agents = append(agents, agentFile{name: name, flag: flag, diffMatch: diffMatch, model: model, maxTurns: maxTurns, template: tmpl})
 	}
 	if len(agents) == 0 {
 		return nil, fmt.Errorf("no .md agent files found in %s", agentsDir)
@@ -238,6 +544,27 @@ type PerspectiveScore struct {
 	Rationale  string `json:"rationale"`
 }
 
+const reviewDiscipline = `
+
+## Review Discipline Rules
+
+1. **Only review code in the diff.** Every finding MUST reference code that appears in the diff below. If a file or function is not modified in this PR, do not flag it. If you believe a *missing* change is needed (e.g., "you changed X but didn't update Y"), verify by reading Y's current content before claiming it is stale — do not assume.
+
+2. **Check for defensive measures before escalating severity.** Before claiming something is "unbounded," "unprotected," or "missing validation," search the same function and its callers for bounds checks, comments explaining the design, rate limits, or other safeguards. If the code explicitly addresses your concern, acknowledge it and downgrade or drop the finding.
+
+3. **Distinguish theoretical from practical concerns.** For storage-layer concerns (TTL, merge behavior, partition strategy, cardinality), read the write-path code and any inline documentation before assigning severity. A concern that applies "in general" but not for this table's specific write pattern is informational at most, not critical.
+
+4. **Pre-existing patterns are not PR findings.** If your finding applies to code or patterns that predate this PR and are not modified in this diff, you MUST label it: "Pre-existing: [description]. Not introduced by this PR." Do not frame established patterns as something the PR author should fix. These should never be classified as Critical.
+
+5. **Verify "missing" claims before filing.** Before claiming code is "missing," "untested," or "unhandled," search for the relevant function, method, or test name across the package and its callers. "Not in this file" ≠ "doesn't exist." If you are in diff-only mode and cannot search, label the finding: "UNVERIFIED — could not confirm absence across codebase." Never state "no tests exist" after checking only one file.
+
+6. **Severity calibration.** Critical = enables unauthorized access, data corruption, or service unavailability for unauthenticated users with no sustained effort. If exploiting the issue requires authenticated access, sustained scanning, or unlikely preconditions, cap at High. Ask: "What happens if an unauthenticated user hits this once?" — if the answer is "nothing," it is not Critical.
+
+7. **Count before you claim.** When stating any specific count ("N callers", "N ignored errors", "N handlers"), enumerate every occurrence you found in the diff. If you cannot list them, do not state the count. Wrong counts waste author time investigating phantom instances.
+
+8. **No review history claims.** Do not assert "flagged in previous reviews," "third-round regression," or "repeatedly raised." You do not have access to prior review text unless it is explicitly provided in the context above. Unverifiable historical claims erode trust.
+`
+
 const scoreSuffix = `
 
 ## Perspective Score
@@ -278,6 +605,7 @@ var (
 	testPattern          = regexp.MustCompile(`--test\b`)
 	specPattern          = regexp.MustCompile(`--spec\s+(\S+)`)
 	flagPattern          = regexp.MustCompile(`--([a-z][-a-z0-9]*)\b`)
+	onlyPattern          = regexp.MustCompile(`--only\s+([\w,.-]+)`)
 	previousScorePattern = regexp.MustCompile(`\*\*Quality Score: (\d+)/100\*\*`)
 	previousSpecPattern  = regexp.MustCompile(`<!-- spec: (\S+) -->`)
 	reviewRequestPattern = regexp.MustCompile(`(?i)\breview\b`)
@@ -469,11 +797,12 @@ func runCLI(args []string) {
 	owner, repo, prNum := m[1], m[2], m[3]
 	prURL := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, prNum)
 
-	mode := parseMode(input)
+	mode, modeExplicit := parseMode(input)
 	flags := parseFlags(input)
+	onlyAgents := parseOnlyAgents(input)
 	noGitHub := strings.Contains(input, "--no-github")
 
-	if mode == ModeInitial && sessionStore.Get(prURL) != "" {
+	if mode == ModeInitial && !modeExplicit && sessionStore.Get(prURL) != "" {
 		mode = ModeReReview
 		log.Printf("auto-re-review: found existing session for %s, upgrading to re-review", prURL)
 	}
@@ -494,7 +823,10 @@ func runCLI(args []string) {
 
 	if testPattern.MatchString(input) {
 		agents, _ := loadAgents()
-		filtered := filterAgents(agents, flags)
+		projCfg, _ := loadProjectsConfig()
+		filtered := filterAgentsByProject(agents, projCfg.agentsForRepo(owner, repo))
+		filtered = filterAgents(filtered, flags)
+		filtered = filterOnlyAgents(filtered, onlyAgents)
 		var names []string
 		for _, a := range filtered {
 			names = append(names, a.name)
@@ -542,9 +874,13 @@ func runCLI(args []string) {
 	req := ReviewRequest{
 		Diff:               diff,
 		PRURL:              prURL,
+		Owner:              owner,
+		Repo:               repo,
+		PRNum:              prNum,
 		Questions:          reviewQuestions,
 		Mode:               mode,
 		Flags:              flags,
+		OnlyAgents:         onlyAgents,
 		PreviousReviews:    previousReviews,
 		AcknowledgedIssues: acknowledgedIssues,
 	}
@@ -691,7 +1027,7 @@ func main() {
 							continue
 						}
 						text := ev.Text
-						if parseMode(text) == ModeInitial {
+						if mode, explicit := parseMode(text); mode == ModeInitial && !explicit {
 							text += " --re-review"
 						}
 						if specPath := parseSpecPath(parentText); specPath != "" && parseSpecPath(text) == "" {
@@ -750,11 +1086,11 @@ func main() {
 	}
 }
 
-func parseMode(text string) ReviewMode {
+func parseMode(text string) (ReviewMode, bool) {
 	if m := modePattern.FindStringSubmatch(text); m != nil {
-		return ReviewMode(m[1])
+		return ReviewMode(m[1]), true
 	}
-	return ModeInitial
+	return ModeInitial, false
 }
 
 func parseSpecPath(text string) string {
@@ -767,7 +1103,7 @@ func parseSpecPath(text string) string {
 func parseFlags(text string) map[string]bool {
 	reserved := map[string]bool{
 		"initial": true, "re-review": true, "quick": true, "final": true,
-		"self": true, "spec": true, "test": true, "no-github": true,
+		"self": true, "spec": true, "test": true, "no-github": true, "only": true,
 	}
 	flags := make(map[string]bool)
 	for _, m := range flagPattern.FindAllStringSubmatch(text, -1) {
@@ -788,6 +1124,88 @@ func filterAgents(agents []agentFile, flags map[string]bool) []agentFile {
 	return filtered
 }
 
+func filterAgentsByDiff(agents []agentFile, diff string) []agentFile {
+	var filtered []agentFile
+	for _, a := range agents {
+		if a.diffMatch == "" {
+			filtered = append(filtered, a)
+			continue
+		}
+		re, err := regexp.Compile(a.diffMatch)
+		if err != nil {
+			log.Printf("agent %s: invalid diff_match pattern %q: %v — skipping agent", a.name, a.diffMatch, err)
+			continue
+		}
+		if loc := re.FindStringIndex(diff); loc != nil {
+			match := diff[loc[0]:loc[1]]
+			file, line := diffLocationAt(diff, loc[0])
+			log.Printf("agent %s: activated — matched %q at %s:%d", a.name, match, file, line)
+			filtered = append(filtered, a)
+		} else {
+			log.Printf("agent %s: diff_match %q not found in diff — skipping", a.name, a.diffMatch)
+		}
+	}
+	return filtered
+}
+
+func diffLocationAt(diff string, offset int) (file string, line int) {
+	prefix := diff[:offset]
+	line = strings.Count(prefix, "\n") + 1
+	file = "(unknown)"
+	if idx := strings.LastIndex(prefix, "\n+++ b/"); idx >= 0 {
+		rest := prefix[idx+len("\n+++ b/"):]
+		if nl := strings.IndexByte(rest, '\n'); nl >= 0 {
+			file = rest[:nl]
+		} else {
+			file = rest
+		}
+	}
+	return file, line
+}
+
+func filterOnlyAgents(agents []agentFile, only []string) []agentFile {
+	if len(only) == 0 {
+		return agents
+	}
+	allowed := make(map[string]bool, len(only))
+	for _, name := range only {
+		allowed[name] = true
+	}
+	var filtered []agentFile
+	for _, a := range agents {
+		if allowed[a.name] {
+			filtered = append(filtered, a)
+		}
+	}
+	return filtered
+}
+
+func parseOnlyAgents(text string) []string {
+	m := onlyPattern.FindStringSubmatch(text)
+	if m == nil {
+		return nil
+	}
+	parts := strings.Split(m[1], ",")
+	var agents []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			agents = append(agents, p)
+		}
+	}
+	return agents
+}
+
+func resolveMaxTurns(agent agentFile, thorough bool) int {
+	if thorough {
+		return agentMaxTurnsThorough
+	}
+	if agent.maxTurns > 0 {
+		return agent.maxTurns
+	}
+	return agentMaxTurnsDefault
+}
+
 func parseJiraTicket(text string) string {
 	cleaned := ghPRPattern.ReplaceAllString(text, "")
 	cleaned = modePattern.ReplaceAllString(cleaned, "")
@@ -802,12 +1220,13 @@ func parseJiraTicket(text string) string {
 func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, prURL, owner, repo, prNum, channelID, notifyUserID, reviewQuestions string) {
 	defer untrackReview(ev.TimeStamp, prURL)
 
-	mode := parseMode(ev.Text)
+	mode, modeExplicit := parseMode(ev.Text)
 	selfReview := selfPattern.MatchString(ev.Text)
 	jiraTicket := parseJiraTicket(ev.Text)
 	flags := parseFlags(ev.Text)
+	onlyAgents := parseOnlyAgents(ev.Text)
 
-	if mode == ModeInitial && sessionStore.Get(prURL) != "" {
+	if mode == ModeInitial && !modeExplicit && sessionStore.Get(prURL) != "" {
 		mode = ModeReReview
 		log.Printf("auto-re-review: found existing session for %s, upgrading to re-review", prURL)
 	}
@@ -839,7 +1258,10 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 			model = "claude-opus-4-6"
 		}
 		agents, _ := loadAgents()
-		filtered := filterAgents(agents, flags)
+		projCfg, _ := loadProjectsConfig()
+		filtered := filterAgentsByProject(agents, projCfg.agentsForRepo(owner, repo))
+		filtered = filterAgents(filtered, flags)
+		filtered = filterOnlyAgents(filtered, onlyAgents)
 		var agentNames []string
 		for _, a := range filtered {
 			agentNames = append(agentNames, a.name)
@@ -952,7 +1374,11 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 			agents, agentErr := loadAgents()
 			agentCount := 0
 			if agentErr == nil {
-				agentCount = len(filterAgents(agents, flags))
+				projCfg, _ := loadProjectsConfig()
+				filtered := filterAgentsByProject(agents, projCfg.agentsForRepo(owner, repo))
+				filtered = filterAgents(filtered, flags)
+				filtered = filterOnlyAgents(filtered, onlyAgents)
+				agentCount = len(filtered)
 			}
 			dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Launching %d agent(s) in %s mode...", len(diff), agentCount, mode))
 		}
@@ -961,6 +1387,9 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 	req := ReviewRequest{
 		Diff:               diff,
 		PRURL:              prURL,
+		Owner:              owner,
+		Repo:               repo,
+		PRNum:              prNum,
 		Questions:          reviewQuestions,
 		Mode:               mode,
 		SelfReview:         selfReview,
@@ -971,6 +1400,7 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 		SpecContent:        specContent,
 		SpecPath:           specPath,
 		Flags:              flags,
+		OnlyAgents:         onlyAgents,
 	}
 
 	if ctx.Err() != nil {
@@ -1130,6 +1560,29 @@ func (c *RepoCache) FileContent(ctx context.Context, gitDir, ref, path string) (
 	return string(out), nil
 }
 
+func (c *RepoCache) CreateWorktree(ctx context.Context, owner, repo, prNum string) (string, error) {
+	gd := c.gitDir(owner, repo)
+	tmpDir, err := os.MkdirTemp("", "pr-review-wt-*")
+	if err != nil {
+		return "", fmt.Errorf("create temp dir: %w", err)
+	}
+	ref := "refs/prs/" + prNum
+	cmd := exec.CommandContext(ctx, "git", "--git-dir", gd, "worktree", "add", "--detach", tmpDir, ref)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		os.RemoveAll(tmpDir)
+		return "", fmt.Errorf("create worktree: %s", string(out))
+	}
+	log.Printf("repo-cache: created worktree at %s for %s/%s#%s", tmpDir, owner, repo, prNum)
+	return tmpDir, nil
+}
+
+func (c *RepoCache) RemoveWorktree(ctx context.Context, owner, repo, wtDir string) {
+	gd := c.gitDir(owner, repo)
+	_ = exec.CommandContext(ctx, "git", "--git-dir", gd, "worktree", "remove", "--force", wtDir).Run()
+	os.RemoveAll(wtDir)
+	log.Printf("repo-cache: removed worktree %s", wtDir)
+}
+
 // --- Session Store ---
 
 type SessionStore struct {
@@ -1165,6 +1618,100 @@ func (s *SessionStore) Set(prURL, sessionID string) {
 	raw, _ := json.Marshal(s.data)
 	_ = os.WriteFile(s.path, raw, 0o644)
 	log.Printf("session-store: saved %s → %s", prURL, sessionID)
+}
+
+// --- Diff Manifest ---
+
+type CommitEntry struct {
+	SHA     string   `json:"sha"`
+	Subject string   `json:"subject"`
+	Files   []string `json:"files"`
+}
+
+type DiffManifest struct {
+	Commits []CommitEntry `json:"commits"`
+	Files   []string      `json:"files"`
+}
+
+func buildDiffManifest(ctx context.Context, gitDir, mergeBase, prRef string) DiffManifest {
+	var manifest DiffManifest
+
+	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir,
+		"log", "--no-merges", "--format=%H %s", mergeBase+".."+prRef)
+	out, err := cmd.Output()
+	if err != nil {
+		log.Printf("diff-manifest: commit log failed: %v", err)
+		return manifest
+	}
+
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, " ", 2)
+		if len(parts) < 2 {
+			continue
+		}
+		sha := parts[0]
+		subject := parts[1]
+
+		filesCmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir,
+			"diff-tree", "--no-commit-id", "-r", "--name-only", sha)
+		filesOut, filesErr := filesCmd.Output()
+		var files []string
+		if filesErr == nil {
+			for _, f := range strings.Split(strings.TrimSpace(string(filesOut)), "\n") {
+				if f != "" {
+					files = append(files, f)
+				}
+			}
+		}
+
+		manifest.Commits = append(manifest.Commits, CommitEntry{
+			SHA:     sha[:minInt(12, len(sha))],
+			Subject: subject,
+			Files:   files,
+		})
+	}
+
+	if mergeBase != "" && prRef != "" {
+		filesCmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir,
+			"diff", "--name-only", mergeBase, prRef)
+		filesOut, filesErr := filesCmd.Output()
+		if filesErr == nil {
+			for _, f := range strings.Split(strings.TrimSpace(string(filesOut)), "\n") {
+				if f != "" {
+					manifest.Files = append(manifest.Files, f)
+				}
+			}
+		}
+	}
+
+	return manifest
+}
+
+func (m DiffManifest) FormatForValidator() string {
+	if len(m.Commits) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("## PR Commit Manifest\n")
+	b.WriteString("Each commit in this PR and the files it touches:\n\n")
+	for _, c := range m.Commits {
+		fmt.Fprintf(&b, "- `%s` %s\n", c.SHA, c.Subject)
+		for _, f := range c.Files {
+			fmt.Fprintf(&b, "  - %s\n", f)
+		}
+	}
+	b.WriteString(fmt.Sprintf("\n**Total files changed in PR:** %d\n", len(m.Files)))
+	return b.String()
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // --- Smart Diff ---
@@ -1231,10 +1778,57 @@ func splitDiffByFile(fullDiff string) map[string]string {
 	return result
 }
 
-func buildSmartDiff(ctx context.Context, gitDir, mergeBase, prRef string) (string, error) {
+func nonMergeFiles(ctx context.Context, gitDir, mergeBase, prRef string) ([]string, error) {
+	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir,
+		"log", "--no-merges", "--name-only", "--format=",
+		mergeBase+".."+prRef)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("non-merge files: %w", err)
+	}
+	seen := make(map[string]bool)
+	var files []string
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" && !seen[line] {
+			seen[line] = true
+			files = append(files, line)
+		}
+	}
+	return files, nil
+}
+
+func buildSmartDiff(ctx context.Context, gitDir, mergeBase, prRef string, prFiles map[string]bool) (string, error) {
 	const maxChars = 120_000
 
-	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "diff", mergeBase, prRef)
+	files, filesErr := nonMergeFiles(ctx, gitDir, mergeBase, prRef)
+	if filesErr != nil {
+		log.Printf("repo-cache: non-merge files failed, falling back to full diff: %v", filesErr)
+	}
+
+	if filesErr == nil && len(prFiles) > 0 {
+		var filtered []string
+		var dropped []string
+		for _, f := range files {
+			if prFiles[f] {
+				filtered = append(filtered, f)
+			} else {
+				dropped = append(dropped, f)
+			}
+		}
+		if len(dropped) > 0 {
+			log.Printf("repo-cache: PR scope filter removed %d file(s) not in GitHub's PR file list: %v", len(dropped), dropped)
+		}
+		files = filtered
+	}
+
+	args := []string{"--git-dir", gitDir, "diff", mergeBase, prRef}
+	if filesErr == nil && len(files) > 0 {
+		args = append(args, "--")
+		args = append(args, files...)
+		log.Printf("repo-cache: scoping diff to %d file(s) from non-merge commits", len(files))
+	}
+	cmd := exec.CommandContext(ctx, "git", args...)
 	out, err := cmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -1323,7 +1917,33 @@ func fetchDiff(ctx context.Context, owner, repo, prNum string) (string, error) {
 		return "", err
 	}
 
-	return buildSmartDiff(ctx, gitDir, mergeBase, prRef)
+	prFiles, prFilesErr := getPRFiles(ctx, owner, repo, prNum)
+	if prFilesErr != nil {
+		log.Printf("repo-cache: could not get PR file list from GitHub, skipping scope filter: %v", prFilesErr)
+	}
+
+	return buildSmartDiff(ctx, gitDir, mergeBase, prRef, prFiles)
+}
+
+func getPRFiles(ctx context.Context, owner, repo, prNum string) (map[string]bool, error) {
+	cmd := exec.CommandContext(ctx, "gh", "pr", "view", prNum,
+		"--repo", fmt.Sprintf("%s/%s", owner, repo),
+		"--json", "files", "--jq", ".files[].path")
+	out, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("get PR files: %w; stderr: %s", err, string(exitErr.Stderr))
+		}
+		return nil, fmt.Errorf("get PR files: %w", err)
+	}
+	files := make(map[string]bool)
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			files[line] = true
+		}
+	}
+	return files, nil
 }
 
 func getPRBaseRef(ctx context.Context, owner, repo, prNum string) (string, error) {
@@ -1562,6 +2182,8 @@ func fetchSpecFromRepo(ctx context.Context, owner, repo, specPath, prNum string)
 
 func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, req ReviewRequest) (string, *ScoreResult, *UsageStats, error) {
 	stats := &UsageStats{}
+	logDir := reviewLogDir(req.Owner, req.Repo, req.PRNum, time.Now())
+	log.Printf("review logs: %s", logDir)
 
 	var extraContext strings.Builder
 	if req.JiraContext != "" {
@@ -1588,7 +2210,7 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 		if err != nil {
 			return "", nil, stats, err
 		}
-		score, scoreResp, scoreErr := runScorer(ctx, nil, req.Diff, req.SpecContent, req.AcknowledgedIssues)
+		score, scoreResp, scoreErr := runScorer(ctx, nil, "", req.Diff, req.SpecContent, req.AcknowledgedIssues)
 		if scoreErr == nil {
 			stats.Add(scoreResp)
 			result = formatScoreHeader(score, req.PreviousReviews) + "\n\n---\n\n" + result
@@ -1604,7 +2226,7 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 			if err == nil {
 				stats.Add(mergeResp)
 				sessionStore.Set(req.PRURL, mergeResp.SessionID)
-				score, scoreResp, scoreErr := runScorer(ctx, nil, req.Diff, req.SpecContent, req.AcknowledgedIssues)
+				score, scoreResp, scoreErr := runScorer(ctx, nil, "", req.Diff, req.SpecContent, req.AcknowledgedIssues)
 				if scoreErr == nil {
 					stats.Add(scoreResp)
 					result = formatScoreHeader(score, req.PreviousReviews) + "\n\n---\n\n" + result
@@ -1627,7 +2249,7 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 		if deltaResp.SessionID != "" {
 			sessionStore.Set(req.PRURL, deltaResp.SessionID)
 		}
-		score, scoreResp, scoreErr := runScorer(ctx, nil, req.Diff, req.SpecContent, req.AcknowledgedIssues)
+		score, scoreResp, scoreErr := runScorer(ctx, nil, "", req.Diff, req.SpecContent, req.AcknowledgedIssues)
 		if scoreErr == nil {
 			stats.Add(scoreResp)
 			result = formatScoreHeader(score, req.PreviousReviews) + "\n\n---\n\n" + result
@@ -1641,7 +2263,48 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 	if err != nil {
 		return "", nil, stats, fmt.Errorf("load agents: %w", err)
 	}
-	agents := filterAgents(allAgents, req.Flags)
+	projCfg, cfgErr := loadProjectsConfig()
+	if cfgErr != nil {
+		log.Printf("warning: %v — using all agents", cfgErr)
+	}
+	agents := filterAgentsByProject(allAgents, projCfg.agentsForRepo(req.Owner, req.Repo))
+	agents = filterAgents(agents, req.Flags)
+	agents = filterAgentsByDiff(agents, req.Diff)
+	agents = filterOnlyAgents(agents, req.OnlyAgents)
+
+	agentWorkDir := ""
+	var manifest DiffManifest
+	if req.PRNum != "" {
+		wt, wtErr := repoCache.CreateWorktree(ctx, req.Owner, req.Repo, req.PRNum)
+		if wtErr != nil {
+			log.Printf("worktree: failed, agents run without repo context: %v", wtErr)
+		} else {
+			agentWorkDir = wt
+			defer repoCache.RemoveWorktree(ctx, req.Owner, req.Repo, wt)
+		}
+
+		gitDir := repoCache.gitDir(req.Owner, req.Repo)
+		baseRef, baseErr := getPRBaseRef(ctx, req.Owner, req.Repo, req.PRNum)
+		if baseErr == nil {
+			prRef := "refs/prs/" + req.PRNum
+			mergeBase, mbErr := gitMergeBase(ctx, gitDir, "refs/heads/"+baseRef, prRef)
+			if mbErr == nil {
+				manifest = buildDiffManifest(ctx, gitDir, mergeBase, prRef)
+				log.Printf("diff-manifest: %d commits, %d files for %s", len(manifest.Commits), len(manifest.Files), req.PRURL)
+			}
+		}
+	}
+
+	var priorContext string
+	if req.Owner != "" && req.Repo != "" && req.PRNum != "" {
+		mem, memErr := loadReviewMemory(req.Owner, req.Repo, req.PRNum)
+		if memErr != nil {
+			log.Printf("review-memory: load failed for %s: %v", req.PRURL, memErr)
+		} else if mem != nil {
+			priorContext = formatPriorContext(mem)
+			log.Printf("review-memory: loaded prior context for %s (review #%d, score %d)", req.PRURL, mem.ReviewCount, mem.Score)
+		}
+	}
 
 	data := promptData{
 		ModePreamble: modePreamble(req.Mode),
@@ -1649,13 +2312,14 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 		ContextBlock: contextBlock,
 		QuestionsStr: questionsStr,
 		Diff:         req.Diff,
+		PriorContext: priorContext,
 	}
 
 	reviews := make([]string, len(agents))
 	perspectiveScores := make([]PerspectiveScore, len(agents))
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	var firstErr error
+	var agentFailures int
 
 	for i, a := range agents {
 		wg.Add(1)
@@ -1663,94 +2327,201 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 			defer wg.Done()
 			prompt, renderErr := renderAgent(agent, data)
 			if renderErr != nil {
+				log.Printf("agent %s: render failed: %v", agent.name, renderErr)
 				mu.Lock()
-				if firstErr == nil {
-					firstErr = renderErr
-				}
+				agentFailures++
 				mu.Unlock()
 				return
 			}
-			prompt += scoreSuffix
-			log.Printf("agent %s: starting %s review for %s", agent.name, req.Mode, req.PRURL)
+			prompt += reviewDiscipline + scoreSuffix
+			thorough := req.Flags["thorough"]
+			maxTurns := resolveMaxTurns(agent, thorough)
+			agentModel := agent.model
+			if agentModel == "" {
+				agentModel = "default"
+			}
+			log.Printf("agent %s: starting %s review for %s (model=%s, max-turns=%d)", agent.name, req.Mode, req.PRURL, agentModel, maxTurns)
 			agentStart := time.Now()
-			text, resp, err := runClaude(ctx, prompt)
+			text, resp, err := runClaudeInDir(ctx, prompt, agentWorkDir, agent.model, maxTurns)
 			agentDur := time.Since(agentStart)
 			if err != nil {
+				log.Printf("agent %s: failed for %s: %v", agent.name, req.PRURL, err)
+				writeAgentLog(logDir, agent.name+"-error", fmt.Sprintf("ERROR: %v\n\nPartial output:\n%s", err, text))
+				stats.AddWarning(fmt.Sprintf("`%s` failed: %v", agent.name, err))
 				mu.Lock()
-				if firstErr == nil {
-					firstErr = fmt.Errorf("agent %s failed: %w", agent.name, err)
-				}
+				agentFailures++
 				mu.Unlock()
 				return
 			}
+			if resp.NumTurns >= maxTurns {
+				log.Printf("agent %s: hit max turns (%d) for %s — output may be truncated", agent.name, maxTurns, req.PRURL)
+				stats.AddWarning(fmt.Sprintf("`%s` hit max turns (%d) — output may be incomplete", agent.name, maxTurns))
+			}
 			stats.Add(resp)
-			stats.AddAgent(agent.name, resp.TotalCostUSD, agentDur)
+			stats.AddAgent(agent.name, resp.TotalCostUSD, agentDur, resp.NumTurns, maxTurns)
+			writeAgentLog(logDir, agent.name, text)
 			reviewText, ps := extractPerspectiveScore(agent.name, text)
 			mu.Lock()
 			reviews[idx] = fmt.Sprintf("## %s Review\n\n%s", strings.ToUpper(agent.name), reviewText)
 			perspectiveScores[idx] = ps
 			mu.Unlock()
-			log.Printf("agent %s: done for %s (perspective: %d/100, $%.4f)", agent.name, req.PRURL, ps.Score, resp.TotalCostUSD)
+			log.Printf("agent %s: done for %s (perspective: %d/100, $%.4f, %d/%d turns)", agent.name, req.PRURL, ps.Score, resp.TotalCostUSD, resp.NumTurns, maxTurns)
 		}(i, a)
 	}
 	wg.Wait()
 
-	if firstErr != nil {
-		return "", nil, stats, firstErr
+	successfulReviews := 0
+	var filteredReviews []string
+	var filteredScores []PerspectiveScore
+	for i := range agents {
+		if reviews[i] != "" {
+			filteredReviews = append(filteredReviews, reviews[i])
+			filteredScores = append(filteredScores, perspectiveScores[i])
+			successfulReviews++
+		}
+	}
+	if successfulReviews == 0 {
+		return "", nil, stats, fmt.Errorf("all %d agents failed", len(agents))
+	}
+	var failedAgentNames []string
+	if agentFailures > 0 {
+		for i, a := range agents {
+			if reviews[i] == "" {
+				failedAgentNames = append(failedAgentNames, a.name)
+			}
+		}
+		log.Printf("warning: %d/%d agents failed (%s), continuing with %d", agentFailures, len(agents), strings.Join(failedAgentNames, ", "), successfulReviews)
 	}
 
-	dmUser(api, notifyUserID, fmt.Sprintf("All %d agents done. Running validator...", len(agents)))
-	allReviews := strings.Join(reviews, "\n\n---\n\n")
+	dmUser(api, notifyUserID, fmt.Sprintf("%d/%d agents done. Running validator...", successfulReviews, len(agents)))
+	allReviews := strings.Join(filteredReviews, "\n\n---\n\n")
+
+	manifestBlock := manifest.FormatForValidator()
+
+	coverageNote := ""
+	if len(failedAgentNames) > 0 {
+		coverageNote = fmt.Sprintf("\n## Agent Coverage Gaps\n%d of %d review agents failed and produced no output: %s. Their review dimensions are not covered below. Note this in your summary so readers know which perspectives are missing.\n\n",
+			len(failedAgentNames), len(agents), strings.Join(failedAgentNames, ", "))
+	}
 
 	log.Printf("validator: starting for %s", req.PRURL)
 	valStart := time.Now()
-	validated, valResp, err := runClaude(ctx, fmt.Sprintf(`You are a review validator. You have %d independent code reviews of a PR and the original diff.
+	validated, valResp, err := runClaude(ctx, fmt.Sprintf(`You are a strict review validator. You have %d independent code reviews of a PR, the original diff, and a commit manifest showing exactly which files each commit touches.
 
-Your job:
-1. Check each review for accuracy — are the claims correct given the actual diff?
-2. Flag any incorrect or misleading feedback
-3. Note if reviewers missed anything important
-4. Check if any questions raised by reviewers can be answered from the diff itself — if so, answer them
+Your job is to verify every claim in every review against the actual diff. Reviewers are known to hallucinate — referencing code from other PRs, inventing file paths, misquoting code, or making claims about unchanged code.
 
-Be concise. Output a validation report.
+## Validation Process
 
+For EACH finding in each review:
+1. **Locate the exact code** — find the quoted code or referenced file:line in the diff below. If it does not appear in the diff, the finding is INVALID.
+2. **Verify the claim** — does the code actually have the problem described? Read the surrounding diff context.
+3. **Check the commit** — if the reviewer references a specific change, verify it appears in the commit manifest below.
+4. **Classify** each finding as:
+   - **VERIFIED** — code exists in diff, claim is accurate
+   - **INVALID: NOT IN DIFF** — reviewer references code/files not present in this PR's diff
+   - **INVALID: MISQUOTED** — code exists but reviewer misquoted or mischaracterized it
+   - **INVALID: WRONG FILE** — reviewer attributes code to wrong file
+   - **INVALID: PRE-EXISTING** — issue exists but was not introduced or modified by this PR
+   - **INVALID: WRONG CLASSIFICATION** — reviewer claims a violation based on incorrect assumptions about project rules (e.g., claiming a "leaf" package violates isolation when leaves are explicitly allowed to be imported, or asserting a linter rule that does not exist in the config shown in the diff)
+   - **OVERSTATED** — observation has some basis but severity is inflated (e.g., "Critical" for a theoretical concern, or claiming "unbounded" when the code has explicit bounds). You MUST state what the correct severity should be (e.g., "OVERSTATED: Medium — requires authenticated access and sustained scanning"). Critical means: unauthorized access, data corruption, or service unavailability for unauthenticated users with no sustained effort. Auth-gated issues cap at High. Theoretical concerns cap at Medium
+   - **OVERSTATED: DEFENSE-IN-DEPTH** — the issue is real at the flagged layer but a callee or downstream layer already enforces the constraint (e.g., handler missing bounds check but the storage query clamps it). Downgrade severity: a missing check at layer N when layer N+1 enforces it is a doc-code mismatch, not an unbounded risk
+   - **UNVERIFIABLE** — claim may be valid but cannot be confirmed from the diff alone
+   - **UNVERIFIABLE: HISTORICAL CLAIM** — reviewer asserts something about prior reviews, regression history, or review rounds without evidence. Flag as unverifiable — reviewers must not cite review history they don't have access to
+
+## Additional Verification Rules
+
+5. **Verify counts** — when a reviewer states a specific count (e.g., "7 handlers use X", "6 ignored errors"), count the actual occurrences in the diff. State YOUR count explicitly (e.g., "Reviewer claims 7, I count 5: [list each]"). If the count is wrong, mark the claim MISQUOTED and note the correct count — wrong counts erode author trust and waste investigation time.
+6. **Check project-specific classifications before isolation findings** — this is a CRITICAL check. If a reviewer claims a component isolation violation:
+   a. Search the diff for isolation_test.go — check if the imported package appears in leafPackages. Leaves are ALWAYS allowed to be imported.
+   b. Search the diff for .golangci.yml — check if the imported package appears in the depguard component-isolation deny list. Only packages in the deny list are components.
+   c. If neither file is in the diff, check the commit manifest for these files. If you cannot verify the classification, mark the finding UNVERIFIABLE, not VERIFIED.
+   d. A false Critical claiming isolation violation on a leaf package is the highest-impact bot failure mode — it wastes the most author time.
+7. **Trace callees for severity** — when a reviewer claims "unbounded" or "no validation", check whether the called function (visible in the diff or referenced in unchanged context) already enforces the constraint. If so, downgrade severity.
+8. **Verify scope attribution** — when a reviewer flags code, check the commit manifest to confirm the flagged file appears in this PR's commits. If the file is not in the manifest, mark the finding INVALID: NOT IN PR SCOPE. Findings against code from other PRs waste reviewer attention.
+
+## Output Format
+
+For each review, list every finding with its validation status and a one-line explanation. Then provide:
+- Total findings vs verified vs invalid
+- Any important issues the reviewers missed that ARE visible in the diff
+- Answers to any questions reviewers raised that can be answered from the diff
+
+%s%s
 ## Original Diff
 `+"```diff\n%s\n```"+`
 
 ## Reviews to Validate
-%s`, len(agents), req.Diff, allReviews))
+%s`, len(agents), manifestBlock, coverageNote, req.Diff, allReviews))
 	if err != nil {
 		return "", nil, stats, fmt.Errorf("validator failed: %w", err)
 	}
 	stats.Add(valResp)
-	stats.AddAgent("validator", valResp.TotalCostUSD, time.Since(valStart))
+	stats.AddAgent("validator", valResp.TotalCostUSD, time.Since(valStart), valResp.NumTurns, 0)
+	writeAgentLog(logDir, "validator", validated)
 	log.Printf("validator: done for %s ($%.4f)", req.PRURL, valResp.TotalCostUSD)
 
-	dmUser(api, notifyUserID, "Validator done. Scoring...")
-	log.Printf("scorer: starting for %s", req.PRURL)
-	scorerStart := time.Now()
-	score, scoreResp, scoreErr := runScorer(ctx, perspectiveScores, req.Diff, req.SpecContent, req.AcknowledgedIssues)
-	if scoreErr != nil {
-		log.Printf("scorer: failed for %s: %v", req.PRURL, scoreErr)
-	} else {
-		stats.Add(scoreResp)
-		stats.AddAgent("scorer", scoreResp.TotalCostUSD, time.Since(scorerStart))
-		log.Printf("scorer: done for %s (score: %d/100, $%.4f)", req.PRURL, score.Overall, scoreResp.TotalCostUSD)
-	}
+	dmUser(api, notifyUserID, "Validator done. Scoring + merging...")
 
-	dmUser(api, notifyUserID, "Merging reviews...")
-	log.Printf("merger: starting for %s", req.PRURL)
-	mergerStart := time.Now()
-	merged, mergeResp, err := runMerger(ctx, allReviews, validated, req.Mode, req.SpecContent, req.AcknowledgedIssues)
-	if err != nil {
-		return "", nil, stats, err
+	var (
+		score      ScoreResult
+		scoreResp  claudeResponse
+		scoreErr   error
+		merged     string
+		mergeResp  claudeResponse
+		mergeErr   error
+		scoreMerge sync.WaitGroup
+	)
+
+	scoreMerge.Add(2)
+	go func() {
+		defer scoreMerge.Done()
+		log.Printf("scorer: starting for %s", req.PRURL)
+		scorerStart := time.Now()
+		score, scoreResp, scoreErr = runScorer(ctx, filteredScores, validated, req.Diff, req.SpecContent, req.AcknowledgedIssues)
+		if scoreErr != nil {
+			log.Printf("scorer: failed for %s: %v", req.PRURL, scoreErr)
+		} else {
+			stats.Add(scoreResp)
+			stats.AddAgent("scorer", scoreResp.TotalCostUSD, time.Since(scorerStart), scoreResp.NumTurns, 0)
+			writeAgentLog(logDir, "scorer", fmt.Sprintf("Score: %d/100\n\n%s", score.Overall, score.Summary))
+			log.Printf("scorer: done for %s (score: %d/100, $%.4f)", req.PRURL, score.Overall, scoreResp.TotalCostUSD)
+		}
+	}()
+	go func() {
+		defer scoreMerge.Done()
+		log.Printf("merger: starting for %s", req.PRURL)
+		mergerStart := time.Now()
+		merged, mergeResp, mergeErr = runMerger(ctx, allReviews, validated, req.Mode, req.SpecContent, req.AcknowledgedIssues, failedAgentNames, manifest)
+		if mergeErr != nil {
+			return
+		}
+		stats.Add(mergeResp)
+		stats.AddAgent("merger", mergeResp.TotalCostUSD, time.Since(mergerStart), mergeResp.NumTurns, 0)
+		writeAgentLog(logDir, "merger", merged)
+		log.Printf("merger: done for %s ($%.4f)", req.PRURL, mergeResp.TotalCostUSD)
+	}()
+	scoreMerge.Wait()
+
+	if mergeErr != nil {
+		return "", nil, stats, mergeErr
 	}
-	stats.Add(mergeResp)
-	stats.AddAgent("merger", mergeResp.TotalCostUSD, time.Since(mergerStart))
-	log.Printf("merger: done for %s ($%.4f)", req.PRURL, mergeResp.TotalCostUSD)
 
 	if mergeResp.SessionID != "" {
 		sessionStore.Set(req.PRURL, mergeResp.SessionID)
+	}
+
+	// Save review memory for subsequent runs
+	if req.Owner != "" && req.Repo != "" && req.PRNum != "" {
+		var scorePtr *ScoreResult
+		if scoreErr == nil {
+			scorePtr = &score
+		}
+		mem := buildReviewMemory(req, merged, scorePtr, filteredScores)
+		if err := saveReviewMemory(req.Owner, req.Repo, req.PRNum, mem); err != nil {
+			log.Printf("review-memory: save failed for %s: %v", req.PRURL, err)
+		} else {
+			log.Printf("review-memory: saved for %s (review #%d, score %d)", req.PRURL, mem.ReviewCount, mem.Score)
+		}
 	}
 
 	if scoreErr == nil {
@@ -1828,10 +2599,15 @@ Be specific about what changed. Reference files and lines.
 	return text, resp, nil
 }
 
+const diffScopeRule = `IMPORTANT: Only raise issues about code that appears in the diff below. Do not speculate about code outside the diff, do not flag pre-existing issues in unchanged code, and do not hallucinate file contents you cannot see. Every finding must quote the exact code from the diff. If the diff is clean, say so.
+
+`
+
 func modePreamble(mode ReviewMode) string {
+	base := diffScopeRule
 	switch mode {
 	case ModeReReview:
-		return `NOTE: This is a RE-REVIEW. This PR has been reviewed before by an automated system. Focus on:
+		return base + `NOTE: This is a RE-REVIEW. This PR has been reviewed before by an automated system. Focus on:
 - Whether previously identified issues have been addressed
 - Any new issues introduced since the last review
 - Remaining concerns that still need attention
@@ -1839,14 +2615,14 @@ Do not repeat feedback that has clearly been addressed.
 
 `
 	case ModeFinal:
-		return `NOTE: This is a FINAL REVIEW before merge. Err on the side of approval:
+		return base + `NOTE: This is a FINAL REVIEW before merge. Err on the side of approval:
 - Only flag truly critical/blocking issues (bugs, security, data loss)
 - Mention nice-to-haves and nit picks as OPTIONAL/non-blocking
 - If the code is generally sound and functional, recommend approval
 
 `
 	default:
-		return ""
+		return base
 	}
 }
 
@@ -1884,7 +2660,7 @@ Keep it short. If the code is sound, say so and approve.
 	return text, nil
 }
 
-func runScorer(ctx context.Context, perspectiveScores []PerspectiveScore, diff, specContent, acknowledgedIssues string) (ScoreResult, claudeResponse, error) {
+func runScorer(ctx context.Context, perspectiveScores []PerspectiveScore, validatorOutput, diff, specContent, acknowledgedIssues string) (ScoreResult, claudeResponse, error) {
 	specDimension := ""
 	specBlock := ""
 	specJSON := ""
@@ -1897,6 +2673,11 @@ func runScorer(ctx context.Context, perspectiveScores []PerspectiveScore, diff, 
 	ackBlock := ""
 	if acknowledgedIssues != "" {
 		ackBlock = fmt.Sprintf("\n## Acknowledged Issues\nThe following issues were explicitly acknowledged by the author (ack, won't fix, intentional, by design, etc.). Do NOT penalize scores for these items — they represent informed decisions, not oversights:\n\n%s\n\n", acknowledgedIssues)
+	}
+
+	validatorBlock := ""
+	if validatorOutput != "" {
+		validatorBlock = fmt.Sprintf("\n## Validator Results\nA strict validator has verified each reviewer finding against the actual diff. Findings marked INVALID or WRONG CLASSIFICATION were hallucinated or incorrect — do NOT count them as real issues. Only VERIFIED findings should influence your score.\n\nScoring adjustments based on validation:\n- Adjust perspective scores downward if a reviewer had many invalid findings, especially false Critical claims — a false Critical costs the most author time to investigate and should be penalized heavily\n- Findings marked WRONG CLASSIFICATION (e.g., claiming isolation violation on a leaf package) are false positives — treat same as INVALID\n- Findings marked DEFENSE-IN-DEPTH have real observations but overstated severity — use the validator's corrected severity, not the agent's original\n- Adjust upward if their concerns were mostly dismissed but the code is actually sound\n- An overstated severity (e.g., claiming \"Critical\" for a theoretical or pre-existing concern) should reduce that reviewer's credibility weight, even if the underlying observation has some merit\n\n%s\n\n", validatorOutput)
 	}
 
 	perspectiveBlock := ""
@@ -1929,11 +2710,11 @@ When reviewer perspective scores are provided, critically evaluate each one:
 - A low-confidence score or one from a less relevant perspective should be weighted less
 - If a reviewer's rationale contradicts the actual diff, disregard their score
 - Your dimensional scores should reflect your own analysis informed by — but not averaging — the perspective scores
-%s%s
+%s%s%s
 Respond with ONLY this JSON object, no markdown fences, no other text:
 {"correctness":N,"security":N,"design":N,"go_quality":N,"testing":N,"production_readiness":N%s,"overall":N,"summary":"one sentence"}
 
-`+"```diff\n%s\n```", perspectiveBlock, specDimension, specBlock, ackBlock, specJSON, diff)
+`+"```diff\n%s\n```", perspectiveBlock, specDimension, validatorBlock, specBlock, ackBlock, specJSON, diff)
 
 	text, resp, err := runClaude(ctx, prompt)
 	if err != nil {
@@ -2008,7 +2789,7 @@ func formatScoreHeader(score ScoreResult, previousReviews string) string {
 	return header
 }
 
-func runMerger(ctx context.Context, allReviews, validated string, mode ReviewMode, specContent, acknowledgedIssues string) (string, claudeResponse, error) {
+func runMerger(ctx context.Context, allReviews, validated string, mode ReviewMode, specContent, acknowledgedIssues string, failedAgents []string, manifest DiffManifest) (string, claudeResponse, error) {
 	var modeRules string
 	switch mode {
 	case ModeFinal:
@@ -2045,6 +2826,22 @@ RE-REVIEW RULES:
 		ackRule = "\n- Issues explicitly acknowledged by the author (ack, won't fix, intentional, by design) must NOT appear in Critical Issues or Design Concerns. List them separately as acknowledged. Do not let them influence the verdict negatively"
 	}
 
+	coverageNote := ""
+	if len(failedAgents) > 0 {
+		coverageNote = fmt.Sprintf("\n\n## Coverage Gaps\nThe following review agents failed and produced no output: %s. Note these gaps at the end of your review so the reader knows which perspectives were not covered.",
+			strings.Join(failedAgents, ", "))
+	}
+
+	manifestFileList := ""
+	if len(manifest.Files) > 0 {
+		var mfb strings.Builder
+		mfb.WriteString("\n\n## PR File Manifest (ground truth)\nThese are the ONLY files changed in this PR. Your Summary MUST NOT claim changes to files or areas not in this list.\n")
+		for _, f := range manifest.Files {
+			fmt.Fprintf(&mfb, "- %s\n", f)
+		}
+		manifestFileList = mfb.String()
+	}
+
 	text, resp, err := runClaude(ctx, fmt.Sprintf(`You are a review synthesizer. You have 4 independent code reviews and a validation report.
 
 Merge them into ONE cohesive, comprehensive review. Structure:
@@ -2059,17 +2856,21 @@ Merge them into ONE cohesive, comprehensive review. Structure:
 Rules:
 - The GO-EXPERT review is the most authoritative voice. When reviewers conflict, defer to GO-EXPERT. Its critical issues are always included. Its verdict carries the most weight in the final verdict.
 - Deduplicate overlapping feedback
-- Drop anything the validator flagged as incorrect
+- Drop anything the validator flagged as incorrect, including findings marked WRONG CLASSIFICATION
+- When the validator marks a finding as OVERSTATED or DEFENSE-IN-DEPTH, use the validator's corrected severity, not the agent's original. Never promote an OVERSTATED finding back to Critical
+- Agreement ≠ accuracy. Multiple reviewers flagging the same issue does NOT increase confidence. All agents see the same diff and share the same blind spots. When multiple reviewers agree, check whether they made the same reasoning error (e.g., all reading one file without checking callees). Weight validator results above reviewer consensus
 - Incorporate answers to reviewer questions from the validation
 - Keep it actionable and specific
 - Reference file names and line numbers where relevant
-- Do NOT include a Quality Score section, score table, or numerical scores — scoring is handled separately%s%s
+- Do NOT include a Quality Score section, score table, or numerical scores — scoring is handled separately
+- **Summary scope rule**: The Summary line MUST only describe changes visible in the PR File Manifest below. Cross-check every area you mention against the file list — if no files in that area appear in the manifest, do not mention it. Fabricating scope (e.g., claiming "UI improvements across Fleet and Infrastructure" when no Fleet/Infrastructure files changed) is a critical synthesis failure
+- **No review history claims**: Do not assert that issues were "flagged in previous reviews" or are "third-round regressions" unless the prior review text is provided as input. Unverifiable historical claims sound authoritative but erode trust%s%s
 %s
 ## Reviews
 %s
 
 ## Validation Report
-%s%s`, specSection, ackSection, specRule, ackRule, modeRules, allReviews, validated, specContext))
+%s%s%s%s`, specSection, ackSection, specRule, ackRule, modeRules, allReviews, validated, specContext, coverageNote, manifestFileList))
 	if err != nil {
 		return "", claudeResponse{}, fmt.Errorf("merger failed: %w", err)
 	}
@@ -2084,37 +2885,123 @@ func questionsBlock(questions string) string {
 }
 
 func runClaude(ctx context.Context, prompt string) (string, claudeResponse, error) {
-	return runClaudeWithSession(ctx, prompt, "")
+	return runClaudeOpts(ctx, prompt, "", "", 0)
+}
+
+func runClaudeInDir(ctx context.Context, prompt, workDir, modelOverride string, maxTurns int) (string, claudeResponse, error) {
+	return runClaudeOpts(ctx, prompt, "", workDir, maxTurns, modelOverride)
 }
 
 func runClaudeWithSession(ctx context.Context, prompt, resumeSessionID string) (string, claudeResponse, error) {
-	model := os.Getenv("CLAUDE_MODEL")
+	return runClaudeOpts(ctx, prompt, resumeSessionID, "", 0)
+}
+
+const claudeMaxRetries = 2
+
+func runClaudeOpts(ctx context.Context, prompt, resumeSessionID, workDir string, maxTurns int, modelOverride ...string) (string, claudeResponse, error) {
+	var lastText string
+	var lastResp claudeResponse
+	var lastErr error
+	for attempt := range claudeMaxRetries + 1 {
+		lastText, lastResp, lastErr = runClaudeOnce(ctx, prompt, resumeSessionID, workDir, maxTurns, modelOverride...)
+		if lastErr == nil {
+			return lastText, lastResp, nil
+		}
+		if ctx.Err() != nil {
+			return lastText, lastResp, lastErr
+		}
+		if attempt < claudeMaxRetries {
+			backoff := time.Duration(1<<uint(attempt)) * 5 * time.Second
+			log.Printf("claude: attempt %d/%d failed (%v), retrying in %v", attempt+1, claudeMaxRetries+1, lastErr, backoff)
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return lastText, lastResp, lastErr
+			}
+		}
+	}
+	return lastText, lastResp, lastErr
+}
+
+func runClaudeOnce(ctx context.Context, prompt, resumeSessionID, workDir string, maxTurns int, modelOverride ...string) (string, claudeResponse, error) {
+	if workDir == "" {
+		workDir = os.TempDir()
+	}
+	model := ""
+	if len(modelOverride) > 0 && modelOverride[0] != "" {
+		model = resolveModel(modelOverride[0])
+	}
+	if model == "" {
+		model = os.Getenv("CLAUDE_MODEL")
+	}
 	if model == "" {
 		model = "claude-opus-4-6"
 	}
 	args := []string{"-p", "Follow the instructions provided on stdin.", "--output-format", "json", "--model", model}
+	if maxTurns > 0 {
+		args = append(args, "--max-turns", strconv.Itoa(maxTurns))
+	}
 	if resumeSessionID != "" {
 		args = append(args, "--resume", resumeSessionID)
 	}
 	cmd := exec.CommandContext(ctx, "claude", args...)
+	cmd.Dir = workDir
 	cmd.Stdin = strings.NewReader(prompt)
-	out, err := cmd.Output()
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return "", claudeResponse{}, fmt.Errorf("claude CLI: %s", string(exitErr.Stderr))
-		}
-		return "", claudeResponse{}, err
-	}
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	runErr := cmd.Run()
+	out := []byte(stdout.String())
 
 	var resp claudeResponse
-	if err := json.Unmarshal(out, &resp); err != nil {
-		return strings.TrimSpace(string(out)), claudeResponse{}, nil
-	}
-	if resp.IsError {
-		return "", claudeResponse{}, fmt.Errorf("claude returned error: %s", resp.Result)
+	if jsonErr := json.Unmarshal(out, &resp); jsonErr == nil {
+		if resp.IsError {
+			errDetail := resp.Result
+			if errDetail == "" {
+				errDetail = strings.TrimSpace(stderr.String())
+			}
+			if errDetail == "" {
+				errDetail = strings.TrimSpace(string(out))
+			}
+			if errDetail == "" {
+				errDetail = "(no detail from claude CLI)"
+			}
+			return "", resp, fmt.Errorf("claude returned error: %s", errDetail)
+		}
+		return strings.TrimSpace(resp.Result), resp, nil
 	}
 
-	return strings.TrimSpace(resp.Result), resp, nil
+	if runErr != nil {
+		errMsg := strings.TrimSpace(stderr.String())
+		if errMsg == "" {
+			errMsg = strings.TrimSpace(stdout.String())
+		}
+		if errMsg == "" {
+			errMsg = runErr.Error()
+		}
+		return "", claudeResponse{}, fmt.Errorf("claude CLI: %s", errMsg)
+	}
+
+	return strings.TrimSpace(string(out)), claudeResponse{}, nil
+}
+
+func reviewLogDir(owner, repo, prNum string, ts time.Time) string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".pr-review-logs", owner, repo, prNum, ts.Format("20060102-150405"))
+}
+
+func writeAgentLog(dir, stage, text string) {
+	if dir == "" {
+		return
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		log.Printf("agent-log: mkdir failed: %v", err)
+		return
+	}
+	path := filepath.Join(dir, stage+".md")
+	if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+		log.Printf("agent-log: write failed for %s: %v", path, err)
+	}
 }
 
 func postGitHubComment(owner, repo, prNum, review string) error {
@@ -2178,4 +3065,17 @@ func capitalize(s string) string {
 		return s
 	}
 	return strings.ToUpper(s[:1]) + s[1:]
+}
+
+var modelAliases = map[string]string{
+	"opus":   "claude-opus-4-6",
+	"sonnet": "claude-sonnet-4-6",
+	"haiku":  "claude-haiku-4-5-20251001",
+}
+
+func resolveModel(name string) string {
+	if full, ok := modelAliases[name]; ok {
+		return full
+	}
+	return name
 }
