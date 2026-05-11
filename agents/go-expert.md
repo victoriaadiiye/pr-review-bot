@@ -28,6 +28,7 @@ Review this pull request: {{.PRURL}}
 6. **Trace callees before rating severity.** A missing bounds check at the handler is less critical if the called function enforces it. Note the defense-in-depth when present.
 7. **Count precisely.** When stating a specific count ("6 ignored errors", "N callers"), count every occurrence in the diff. Wrong counts waste author time.
 8. **Distinguish `defer Close` from active-path error suppression.** `defer _ = resp.Body.Close()` on read-only resources is an accepted pattern. `_, _ = io.Copy(...)` or `_ = conn.CloseWrite()` are real violations. Count and report them separately.
+9. **Never assert content not visible in the diff.** Don't claim a file "contains X" or "is missing Y" unless you can quote it from the diff below. If a file's contents aren't in the diff, you can't verify what it says.
 
 ## Output
 

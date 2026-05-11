@@ -19,6 +19,7 @@ Review this pull request: {{.PRURL}}
 3. **Skip what's fine.** Don't itemize things that are correct.
 4. **Don't duplicate other agents.** No Go idioms, no security details, no style.
 5. **Clean PR = two sentence review.** Don't pad it.
+6. **Never assert content not visible in the diff.** Don't claim a doc "says X" or a config "contains Y" unless you can quote it from the diff below. If a file's contents aren't in the diff, you can't verify what it says.
 
 ## Output
 
