@@ -9,11 +9,13 @@ Slack bot that watches a channel for GitHub PR links, runs parallel Claude-power
 ```sh
 go build -o pr-review-bot .    # build
 go test ./...                  # run tests
-task deploy                    # git pull + rebuild + restart tmux session
-task build                     # build only
-task restart                   # restart bot in tmux
-task logs                      # tail bot.log
-task status                    # last 20 lines from tmux pane
+task deploy                    # git pull + docker compose up --build
+task redeploy                  # docker compose up --build (no pull)
+task kill                      # docker compose down
+task logs                      # docker compose logs -f
+task status                    # container status + /metrics
+task post -- <pr-url> [flags]  # post review to running container
+task deploy-legacy             # old tmux-based deploy
 ```
 
 ## Architecture
