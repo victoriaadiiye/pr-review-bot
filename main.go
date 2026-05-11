@@ -760,7 +760,7 @@ type HealthServer struct {
 	Addr string
 }
 
-func startHealthServer(port string, queue *ReviewQueue) *HealthServer {
+func startHealthServer(port string, queue *ReviewQueue, reviewHandler func(prURL, flags string)) *HealthServer {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -780,6 +780,43 @@ func startHealthServer(port string, queue *ReviewQueue) *HealthServer {
 			"reviews_dropped": dropped,
 			"workers":        queue.maxWorkers,
 		})
+	})
+
+	mux.HandleFunc("/review", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			PRURL string `json:"pr_url"`
+			Flags string `json:"flags"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON"})
+			return
+		}
+		if req.PRURL == "" || !ghPRPattern.MatchString(req.PRURL) {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "pr_url must be a valid GitHub PR URL"})
+			return
+		}
+		if reviewHandler == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{"error": "review handler not configured"})
+			return
+		}
+		if !queue.Submit(func() {
+			reviewHandler(req.PRURL, req.Flags)
+			queue.completed.Add(1)
+		}) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{"error": "queue full"})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]string{"status": "queued", "pr_url": req.PRURL})
 	})
 
 	ln, err := net.Listen("tcp", ":"+port)
@@ -1054,6 +1091,49 @@ func runCLI(args []string) {
 	}
 }
 
+func runPost(args []string) {
+	input := strings.Join(args, " ")
+	m := ghPRPattern.FindStringSubmatch(input)
+	if m == nil {
+		fmt.Fprintf(os.Stderr, "Usage: pr-review-bot post <github-pr-url> [--quick|--initial|--re-review|--final] [--host HOST:PORT]\n")
+		os.Exit(1)
+	}
+	prURL := m[0]
+
+	host := "localhost:8080"
+	if i := strings.Index(input, "--host"); i >= 0 {
+		rest := strings.TrimSpace(input[i+len("--host"):])
+		if parts := strings.Fields(rest); len(parts) > 0 {
+			host = parts[0]
+		}
+	}
+
+	flags := ""
+	for _, f := range []string{"--quick", "--initial", "--re-review", "--final", "--bare-necessities", "--no-github", "--self"} {
+		if strings.Contains(input, f) {
+			flags += f + " "
+		}
+	}
+	flags = strings.TrimSpace(flags)
+
+	body, _ := json.Marshal(map[string]string{"pr_url": prURL, "flags": flags})
+	resp, err := http.Post("http://"+host+"/review", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to connect to %s: %v\n", host, err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	var result map[string]string
+	json.NewDecoder(resp.Body).Decode(&result)
+
+	if resp.StatusCode != http.StatusAccepted {
+		fmt.Fprintf(os.Stderr, "Error (%d): %s\n", resp.StatusCode, result["error"])
+		os.Exit(1)
+	}
+	fmt.Printf("Queued review for %s\n", result["pr_url"])
+}
+
 type nopSlack struct{}
 
 func (n *nopSlack) AddReaction(string, slack.ItemRef) error                { return nil }
@@ -1092,6 +1172,13 @@ func isWatchedChannel(channelID string, watched map[string]bool) bool {
 	return watched[channelID]
 }
 
+func firstChannel(watched map[string]bool) string {
+	for ch := range watched {
+		return ch
+	}
+	return ""
+}
+
 func envIntOr(key string, fallback int) int {
 	v := os.Getenv(key)
 	if v == "" {
@@ -1108,6 +1195,10 @@ func envIntOr(key string, fallback int) int {
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "review" {
 		runCLI(os.Args[2:])
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "post" {
+		runPost(os.Args[2:])
 		return
 	}
 
@@ -1142,10 +1233,27 @@ func main() {
 	api := slack.New(botToken, slack.OptionAppLevelToken(appToken))
 	client := socketmode.New(api)
 
-	healthSrv := startHealthServer(healthPort, queue)
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	reviewHandler := func(prURL, flags string) {
+		m := ghPRPattern.FindStringSubmatch(prURL)
+		if m == nil {
+			log.Printf("http: invalid PR URL: %s", prURL)
+			return
+		}
+		owner, repo, prNum := m[1], m[2], m[3]
+		text := prURL + " " + flags
+		msgEv := &slackevents.MessageEvent{
+			Text:      text,
+			Channel:   firstChannel(watchedChannels),
+			TimeStamp: fmt.Sprintf("%d.000000", time.Now().UnixMilli()),
+		}
+		rCtx, cancel := context.WithCancel(ctx)
+		trackReview(msgEv.TimeStamp, prURL, cancel)
+		handlePR(rCtx, api, msgEv, prURL, owner, repo, prNum, msgEv.Channel, notifyUserID, reviewQuestions)
+	}
+	healthSrv := startHealthServer(healthPort, queue, reviewHandler)
 
 	go func() {
 		for evt := range client.Events {

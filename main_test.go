@@ -2511,11 +2511,174 @@ func TestEnvIntOr_InvalidFallback(t *testing.T) {
 
 // --- Health server tests ---
 
+func TestPostReviewEndpoint_QueuesReview(t *testing.T) {
+	q := NewReviewQueue(1, 5)
+	defer q.Drain()
+
+	var called atomic.Bool
+	handler := func(pr string, flags string) {
+		called.Store(true)
+		if pr != "https://github.com/org/repo/pull/42" {
+			t.Errorf("pr = %q, want https://github.com/org/repo/pull/42", pr)
+		}
+		if flags != "--quick" {
+			t.Errorf("flags = %q, want --quick", flags)
+		}
+	}
+
+	srv := startHealthServer("0", q, handler)
+	defer srv.Close()
+
+	body := `{"pr_url":"https://github.com/org/repo/pull/42","flags":"--quick"}`
+	resp, err := http.Post("http://"+srv.Addr+"/review", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /review: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusAccepted {
+		t.Errorf("status = %d, want 202", resp.StatusCode)
+	}
+
+	var result map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if result["status"] != "queued" {
+		t.Errorf("status = %v, want queued", result["status"])
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	if !called.Load() {
+		t.Error("handler was not called")
+	}
+}
+
+func TestPostReviewEndpoint_RejectsBadJSON(t *testing.T) {
+	q := NewReviewQueue(1, 5)
+	defer q.Drain()
+
+	srv := startHealthServer("0", q, nil)
+	defer srv.Close()
+
+	resp, err := http.Post("http://"+srv.Addr+"/review", "application/json", strings.NewReader("not json"))
+	if err != nil {
+		t.Fatalf("POST /review: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestPostReviewEndpoint_RejectsMissingURL(t *testing.T) {
+	q := NewReviewQueue(1, 5)
+	defer q.Drain()
+
+	srv := startHealthServer("0", q, nil)
+	defer srv.Close()
+
+	resp, err := http.Post("http://"+srv.Addr+"/review", "application/json", strings.NewReader(`{"flags":"--quick"}`))
+	if err != nil {
+		t.Fatalf("POST /review: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestPostReviewEndpoint_RejectsInvalidURL(t *testing.T) {
+	q := NewReviewQueue(1, 5)
+	defer q.Drain()
+
+	srv := startHealthServer("0", q, nil)
+	defer srv.Close()
+
+	resp, err := http.Post("http://"+srv.Addr+"/review", "application/json",
+		strings.NewReader(`{"pr_url":"https://example.com/not-a-pr"}`))
+	if err != nil {
+		t.Fatalf("POST /review: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestPostReviewEndpoint_RejectsGET(t *testing.T) {
+	q := NewReviewQueue(1, 5)
+	defer q.Drain()
+
+	srv := startHealthServer("0", q, nil)
+	defer srv.Close()
+
+	resp, err := http.Get("http://" + srv.Addr + "/review")
+	if err != nil {
+		t.Fatalf("GET /review: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405", resp.StatusCode)
+	}
+}
+
+func TestPostReviewEndpoint_QueueFull(t *testing.T) {
+	q := NewReviewQueue(1, 1)
+
+	blocker := make(chan struct{})
+	workerBusy := make(chan struct{})
+	q.Submit(func() { close(workerBusy); <-blocker })
+	<-workerBusy
+	q.Submit(func() { <-blocker })
+
+	handler := func(string, string) {}
+	srv := startHealthServer("0", q, handler)
+	defer srv.Close()
+
+	resp, err := http.Post("http://"+srv.Addr+"/review", "application/json",
+		strings.NewReader(`{"pr_url":"https://github.com/org/repo/pull/1"}`))
+	if err != nil {
+		t.Fatalf("POST /review: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", resp.StatusCode)
+	}
+
+	close(blocker)
+	q.Drain()
+}
+
+func TestPostReviewEndpoint_NoHandler(t *testing.T) {
+	q := NewReviewQueue(1, 5)
+	defer q.Drain()
+
+	srv := startHealthServer("0", q, nil)
+	defer srv.Close()
+
+	resp, err := http.Post("http://"+srv.Addr+"/review", "application/json",
+		strings.NewReader(`{"pr_url":"https://github.com/org/repo/pull/1"}`))
+	if err != nil {
+		t.Fatalf("POST /review: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", resp.StatusCode)
+	}
+}
+
 func TestHealthEndpoint(t *testing.T) {
 	q := NewReviewQueue(1, 5)
 	defer q.Drain()
 
-	srv := startHealthServer("0", q)
+	srv := startHealthServer("0", q, nil)
 	defer srv.Close()
 
 	resp, err := http.Get("http://" + srv.Addr + "/health")
@@ -2539,7 +2702,7 @@ func TestMetricsEndpoint(t *testing.T) {
 	q.dropped.Store(1)
 	defer q.Drain()
 
-	srv := startHealthServer("0", q)
+	srv := startHealthServer("0", q, nil)
 	defer srv.Close()
 
 	resp, err := http.Get("http://" + srv.Addr + "/metrics")
