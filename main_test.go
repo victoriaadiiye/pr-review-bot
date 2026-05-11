@@ -4,11 +4,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2294,5 +2297,223 @@ diff --git a/internal/storage/migrations/001.sql b/internal/storage/migrations/0
 				t.Errorf("line = %d, want >= 1", line)
 			}
 		})
+	}
+}
+
+// --- ReviewQueue tests ---
+
+func TestReviewQueue_ExecutesJobs(t *testing.T) {
+	q := NewReviewQueue(2, 5)
+	var count atomic.Int64
+
+	for range 5 {
+		q.Submit(func() {
+			count.Add(1)
+		})
+	}
+
+	q.Drain()
+	if got := count.Load(); got != 5 {
+		t.Errorf("executed %d jobs, want 5", got)
+	}
+}
+
+func TestReviewQueue_RespectsWorkerLimit(t *testing.T) {
+	q := NewReviewQueue(2, 10)
+	var concurrent atomic.Int64
+	var maxConcurrent atomic.Int64
+
+	for range 6 {
+		q.Submit(func() {
+			cur := concurrent.Add(1)
+			for {
+				old := maxConcurrent.Load()
+				if cur <= old || maxConcurrent.CompareAndSwap(old, cur) {
+					break
+				}
+			}
+			time.Sleep(50 * time.Millisecond)
+			concurrent.Add(-1)
+		})
+	}
+
+	q.Drain()
+	if got := maxConcurrent.Load(); got > 2 {
+		t.Errorf("max concurrent = %d, want <= 2", got)
+	}
+}
+
+func TestReviewQueue_DropsWhenFull(t *testing.T) {
+	q := NewReviewQueue(1, 2)
+	blocker := make(chan struct{})
+
+	q.Submit(func() { <-blocker })
+	q.Submit(func() { <-blocker })
+	q.Submit(func() { <-blocker })
+
+	ok := q.Submit(func() {})
+	if ok {
+		t.Error("expected Submit to return false when queue full")
+	}
+
+	_, _, _, dropped := q.Stats()
+	if dropped < 1 {
+		t.Errorf("dropped = %d, want >= 1", dropped)
+	}
+
+	close(blocker)
+	q.Drain()
+}
+
+func TestReviewQueue_Stats(t *testing.T) {
+	q := NewReviewQueue(1, 5)
+	done := make(chan struct{})
+
+	q.Submit(func() {
+		q.completed.Add(1)
+		<-done
+	})
+	q.Submit(func() {
+		q.completed.Add(1)
+	})
+
+	time.Sleep(20 * time.Millisecond)
+	pending, _, _, _ := q.Stats()
+	if pending < 1 {
+		t.Errorf("pending = %d, want >= 1", pending)
+	}
+
+	close(done)
+	q.Drain()
+
+	_, _, completed, _ := q.Stats()
+	if completed != 2 {
+		t.Errorf("completed = %d, want 2", completed)
+	}
+}
+
+// --- parseWatchedChannels tests ---
+
+func TestParseWatchedChannels_Single(t *testing.T) {
+	got := parseWatchedChannels("C123")
+	if !got["C123"] || len(got) != 1 {
+		t.Errorf("got %v, want {C123: true}", got)
+	}
+}
+
+func TestParseWatchedChannels_Multiple(t *testing.T) {
+	got := parseWatchedChannels("C123,C456,C789")
+	if len(got) != 3 || !got["C123"] || !got["C456"] || !got["C789"] {
+		t.Errorf("got %v, want 3 channels", got)
+	}
+}
+
+func TestParseWatchedChannels_Wildcard(t *testing.T) {
+	got := parseWatchedChannels("*")
+	if got != nil {
+		t.Errorf("got %v, want nil (all channels)", got)
+	}
+}
+
+func TestParseWatchedChannels_TrimSpaces(t *testing.T) {
+	got := parseWatchedChannels(" C123 , C456 ")
+	if len(got) != 2 || !got["C123"] || !got["C456"] {
+		t.Errorf("got %v, want {C123, C456}", got)
+	}
+}
+
+// --- isWatchedChannel tests ---
+
+func TestIsWatchedChannel_NilAllowsAll(t *testing.T) {
+	if !isWatchedChannel("C999", nil) {
+		t.Error("nil map should allow all channels")
+	}
+}
+
+func TestIsWatchedChannel_InSet(t *testing.T) {
+	m := map[string]bool{"C123": true}
+	if !isWatchedChannel("C123", m) {
+		t.Error("should match channel in set")
+	}
+}
+
+func TestIsWatchedChannel_NotInSet(t *testing.T) {
+	m := map[string]bool{"C123": true}
+	if isWatchedChannel("C999", m) {
+		t.Error("should not match channel outside set")
+	}
+}
+
+// --- envIntOr tests ---
+
+func TestEnvIntOr_Fallback(t *testing.T) {
+	os.Unsetenv("TEST_ENVINT_UNSET")
+	if got := envIntOr("TEST_ENVINT_UNSET", 42); got != 42 {
+		t.Errorf("got %d, want 42", got)
+	}
+}
+
+func TestEnvIntOr_ValidValue(t *testing.T) {
+	t.Setenv("TEST_ENVINT_VALID", "7")
+	if got := envIntOr("TEST_ENVINT_VALID", 42); got != 7 {
+		t.Errorf("got %d, want 7", got)
+	}
+}
+
+func TestEnvIntOr_InvalidFallback(t *testing.T) {
+	t.Setenv("TEST_ENVINT_BAD", "notanumber")
+	if got := envIntOr("TEST_ENVINT_BAD", 42); got != 42 {
+		t.Errorf("got %d, want 42 (fallback)", got)
+	}
+}
+
+// --- Health server tests ---
+
+func TestHealthEndpoint(t *testing.T) {
+	q := NewReviewQueue(1, 5)
+	defer q.Drain()
+
+	srv := startHealthServer("0", q)
+	defer srv.Close()
+
+	resp, err := http.Get("http://" + srv.Addr + "/health")
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), `"status":"ok"`) {
+		t.Errorf("body = %s, want status ok", body)
+	}
+}
+
+func TestMetricsEndpoint(t *testing.T) {
+	q := NewReviewQueue(1, 5)
+	q.completed.Store(3)
+	q.dropped.Store(1)
+	defer q.Drain()
+
+	srv := startHealthServer("0", q)
+	defer srv.Close()
+
+	resp, err := http.Get("http://" + srv.Addr + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var data map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got := data["reviews_done"]; got != float64(3) {
+		t.Errorf("reviews_done = %v, want 3", got)
+	}
+	if got := data["reviews_dropped"]; got != float64(1) {
+		t.Errorf("reviews_dropped = %v, want 1", got)
 	}
 }
