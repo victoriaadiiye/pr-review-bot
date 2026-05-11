@@ -175,6 +175,7 @@ type agentFile struct {
 }
 
 type promptData struct {
+	Ethos        string
 	ModePreamble string
 	PRURL        string
 	ContextBlock string
@@ -459,7 +460,7 @@ func loadAgents() ([]agentFile, error) {
 	}
 	var agents []agentFile
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") || e.Name() == "ethos.md" {
 			continue
 		}
 		path := filepath.Join(agentsDir, e.Name())
@@ -509,6 +510,17 @@ func loadAgents() ([]agentFile, error) {
 	return agents, nil
 }
 
+func loadEthos() string {
+	path := filepath.Join(agentsDir, "ethos.md")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("ethos: not found at %s, proceeding without", path)
+		return ""
+	}
+	log.Printf("ethos: loaded from %s", path)
+	return string(raw)
+}
+
 func agentNames(agents []agentFile) string {
 	names := make([]string, len(agents))
 	for i, a := range agents {
@@ -519,6 +531,10 @@ func agentNames(agents []agentFile) string {
 
 func renderAgent(a agentFile, data promptData) (string, error) {
 	var buf strings.Builder
+	if data.Ethos != "" {
+		buf.WriteString(data.Ethos)
+		buf.WriteString("\n\n")
+	}
 	if err := a.template.Execute(&buf, data); err != nil {
 		return "", fmt.Errorf("render agent %s: %w", a.name, err)
 	}
@@ -2306,7 +2322,10 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 		}
 	}
 
+	ethos := loadEthos()
+
 	data := promptData{
+		Ethos:        ethos,
 		ModePreamble: modePreamble(req.Mode),
 		PRURL:        req.PRURL,
 		ContextBlock: contextBlock,
@@ -2693,7 +2712,11 @@ func runScorer(ctx context.Context, perspectiveScores []PerspectiveScore, valida
 		perspectiveBlock = sb.String()
 	}
 
+	ethos := loadEthos()
+
 	prompt := fmt.Sprintf(`You are a code quality scorer. Evaluate this PR diff and produce a comprehensive quality score.
+
+%s
 %s
 Score each dimension 0-10 (10 = excellent, 0 = critical problems):
 - correctness: Logic errors, bugs, edge cases, error handling
@@ -2714,7 +2737,7 @@ When reviewer perspective scores are provided, critically evaluate each one:
 Respond with ONLY this JSON object, no markdown fences, no other text:
 {"correctness":N,"security":N,"design":N,"go_quality":N,"testing":N,"production_readiness":N%s,"overall":N,"summary":"one sentence"}
 
-`+"```diff\n%s\n```", perspectiveBlock, specDimension, validatorBlock, specBlock, ackBlock, specJSON, diff)
+`+"```diff\n%s\n```", ethos, perspectiveBlock, specDimension, validatorBlock, specBlock, ackBlock, specJSON, diff)
 
 	text, resp, err := runClaude(ctx, prompt)
 	if err != nil {
@@ -2842,7 +2865,11 @@ RE-REVIEW RULES:
 		manifestFileList = mfb.String()
 	}
 
+	ethos := loadEthos()
+
 	text, resp, err := runClaude(ctx, fmt.Sprintf(`You are a review synthesizer. You have 4 independent code reviews and a validation report.
+
+%s
 
 Merge them into ONE cohesive, comprehensive review. Structure:
 
@@ -2870,7 +2897,7 @@ Rules:
 %s
 
 ## Validation Report
-%s%s%s%s`, specSection, ackSection, specRule, ackRule, modeRules, allReviews, validated, specContext, coverageNote, manifestFileList))
+%s%s%s%s`, ethos, specSection, ackSection, specRule, ackRule, modeRules, allReviews, validated, specContext, coverageNote, manifestFileList))
 	if err != nil {
 		return "", claudeResponse{}, fmt.Errorf("merger failed: %w", err)
 	}
