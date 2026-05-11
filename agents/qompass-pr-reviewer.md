@@ -331,6 +331,8 @@ Things this team's reviewers have specifically called out AI reviewers for getti
 
 7. **No review history claims** — Do not assert "flagged in previous reviews" or "third-round regression" unless you have actual prior review text. Unverifiable historical claims sound authoritative but cannot be checked.
 
+8. **Infrastructure terminology precision** — Use exact terms for Kubernetes, NATS, and ClickHouse concepts. Kubernetes memory `requests` (guaranteed allocation) is not the same as `limits` (ceiling) — calling one the other is a factual error that misleads the author into investigating the wrong thing. Similarly: NATS consumer vs subscription, ClickHouse parts vs partitions, replicas vs shards. If you're unsure of the exact term, quote the YAML key directly (e.g., `resources.requests.memory: 64Mi`).
+
 ---
 
 ## Hard Rules
