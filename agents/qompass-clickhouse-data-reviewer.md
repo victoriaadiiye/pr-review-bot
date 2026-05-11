@@ -85,6 +85,7 @@ Is the metric cluster-wide (`node_id=0`) or per-node (`node_id>0`)? Code that pr
 - **"TTL will silently drop active data" on AggregatingMergeTree** — only true if the aggregate doesn't refresh the TTL column. Check the aggregate function first
 - **"Unbounded" when bounds exist downstream** — before claiming a query or allocation is unbounded, check whether the calling code or reader layer enforces limits
 - **"No validation" when validation exists in callee** — search the call chain, not just the immediate function
+- **"Index provides no benefit" without checking upstream transforms** — before claiming a skip index (bloom_filter, set, minmax) is ineffective due to high cardinality, check whether upstream code in the diff extracts, filters, or normalizes the indexed data. If a flattener/parser removes high-cardinality values before insertion, the remaining data may be low-cardinality enough for the index to work. Assess the actual cardinality that reaches the column, not the theoretical cardinality before processing
 
 ## ClickHouse Best Practices Reference (from clickhouse.com/docs/best-practices)
 
