@@ -1185,6 +1185,7 @@ func handleReactionReview(api SlackAPI, rev *slackevents.ReactionAddedEvent, cha
 	}
 
 	ev := &slackevents.MessageEvent{
+		User:      rev.User,
 		Text:      msg.Text,
 		Channel:   channelID,
 		TimeStamp: rev.Item.Timestamp,
@@ -1587,6 +1588,7 @@ func main() {
 
 				if len(refs) > 0 && isReviewRequest {
 					msgEv := &slackevents.MessageEvent{
+						User:      ev.User,
 						Text:      ev.Text,
 						Channel:   ev.Channel,
 						TimeStamp: ev.TimeStamp,
@@ -1627,6 +1629,7 @@ func main() {
 							text += " --spec " + specPath
 						}
 						msgEv := &slackevents.MessageEvent{
+							User:      ev.User,
 							Text:      text,
 							Channel:   ev.Channel,
 							TimeStamp: ev.TimeStamp,
