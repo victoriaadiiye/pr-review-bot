@@ -2296,3 +2296,45 @@ diff --git a/internal/storage/migrations/001.sql b/internal/storage/migrations/0
 		})
 	}
 }
+
+func TestPRBase_ParsesJSON(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    prBase
+		wantErr bool
+	}{
+		{
+			name:  "main branch",
+			input: `{"baseRefName":"main","baseRefOid":"abc123def456"}`,
+			want:  prBase{Name: "main", OID: "abc123def456"},
+		},
+		{
+			name:  "feature branch (stacked PR)",
+			input: `{"baseRefName":"feat/parent-branch","baseRefOid":"deadbeef0123456789"}`,
+			want:  prBase{Name: "feat/parent-branch", OID: "deadbeef0123456789"},
+		},
+		{
+			name:    "invalid JSON",
+			input:   `not json`,
+			wantErr: true,
+		},
+		{
+			name:  "empty fields",
+			input: `{"baseRefName":"","baseRefOid":""}`,
+			want:  prBase{Name: "", OID: ""},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got prBase
+			err := json.Unmarshal([]byte(tt.input), &got)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr = %v", err, tt.wantErr)
+			}
+			if err == nil && got != tt.want {
+				t.Errorf("got %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}

@@ -1555,16 +1555,23 @@ func (c *RepoCache) EnsureRepo(ctx context.Context, owner, repo string) (string,
 	return gd, nil
 }
 
-func (c *RepoCache) FetchPR(ctx context.Context, gitDir, owner, repo, prNum string) error {
+func (c *RepoCache) FetchPR(ctx context.Context, gitDir, owner, repo, prNum string, base prBase) error {
 	slug := owner + "/" + repo
 	mu := c.repoLock(slug)
 	mu.Lock()
 	defer mu.Unlock()
 
-	ref := fmt.Sprintf("+pull/%s/head:refs/prs/%s", prNum, prNum)
-	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "fetch", "origin", ref)
+	prRef := fmt.Sprintf("+pull/%s/head:refs/prs/%s", prNum, prNum)
+	baseRef := fmt.Sprintf("+%s:refs/prs/%s-base", base.OID, prNum)
+	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "fetch", "origin", prRef, baseRef)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("fetch PR %s#%s: %s", slug, prNum, string(out))
+		// Fallback: server may not allow fetching by SHA — fetch by branch name instead
+		log.Printf("repo-cache: fetch by SHA failed for %s#%s base, retrying by branch name: %s", slug, prNum, string(out))
+		baseRef = fmt.Sprintf("+refs/heads/%s:refs/prs/%s-base", base.Name, prNum)
+		cmd = exec.CommandContext(ctx, "git", "--git-dir", gitDir, "fetch", "origin", prRef, baseRef)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("fetch PR %s#%s: %s", slug, prNum, string(out))
+		}
 	}
 	return nil
 }
@@ -1918,17 +1925,17 @@ func fetchDiff(ctx context.Context, owner, repo, prNum string) (string, error) {
 		return "", fmt.Errorf("repo cache: %w", err)
 	}
 
-	baseRef, err := getPRBaseRef(ctx, owner, repo, prNum)
+	base, err := getPRBase(ctx, owner, repo, prNum)
 	if err != nil {
 		return "", err
 	}
 
-	if err := repoCache.FetchPR(ctx, gitDir, owner, repo, prNum); err != nil {
+	if err := repoCache.FetchPR(ctx, gitDir, owner, repo, prNum, base); err != nil {
 		return "", err
 	}
 
 	prRef := "refs/prs/" + prNum
-	baseRefFull := "refs/heads/" + baseRef
+	baseRefFull := "refs/prs/" + prNum + "-base"
 
 	mergeBase, err := gitMergeBase(ctx, gitDir, baseRefFull, prRef)
 	if err != nil {
@@ -1964,18 +1971,27 @@ func getPRFiles(ctx context.Context, owner, repo, prNum string) (map[string]bool
 	return files, nil
 }
 
-func getPRBaseRef(ctx context.Context, owner, repo, prNum string) (string, error) {
+type prBase struct {
+	Name string `json:"baseRefName"`
+	OID  string `json:"baseRefOid"`
+}
+
+func getPRBase(ctx context.Context, owner, repo, prNum string) (prBase, error) {
 	cmd := exec.CommandContext(ctx, "gh", "pr", "view", prNum,
 		"--repo", fmt.Sprintf("%s/%s", owner, repo),
-		"--json", "baseRefName", "--jq", ".baseRefName")
+		"--json", "baseRefName,baseRefOid")
 	out, err := cmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			return "", fmt.Errorf("get PR base ref: %w; stderr: %s", err, string(exitErr.Stderr))
+			return prBase{}, fmt.Errorf("get PR base: %w; stderr: %s", err, string(exitErr.Stderr))
 		}
-		return "", fmt.Errorf("get PR base ref: %w", err)
+		return prBase{}, fmt.Errorf("get PR base: %w", err)
 	}
-	return strings.TrimSpace(string(out)), nil
+	var base prBase
+	if err := json.Unmarshal(out, &base); err != nil {
+		return prBase{}, fmt.Errorf("parse PR base: %w", err)
+	}
+	return base, nil
 }
 
 func gitMergeBase(ctx context.Context, gitDir, ref1, ref2 string) (string, error) {
@@ -2302,13 +2318,18 @@ func reviewWithClaude(ctx context.Context, api SlackAPI, notifyUserID string, re
 		}
 
 		gitDir := repoCache.gitDir(req.Owner, req.Repo)
-		baseRef, baseErr := getPRBaseRef(ctx, req.Owner, req.Repo, req.PRNum)
+		base, baseErr := getPRBase(ctx, req.Owner, req.Repo, req.PRNum)
 		if baseErr == nil {
-			prRef := "refs/prs/" + req.PRNum
-			mergeBase, mbErr := gitMergeBase(ctx, gitDir, "refs/heads/"+baseRef, prRef)
-			if mbErr == nil {
-				manifest = buildDiffManifest(ctx, gitDir, mergeBase, prRef)
-				log.Printf("diff-manifest: %d commits, %d files for %s", len(manifest.Commits), len(manifest.Files), req.PRURL)
+			if fetchErr := repoCache.FetchPR(ctx, gitDir, req.Owner, req.Repo, req.PRNum, base); fetchErr != nil {
+				log.Printf("diff-manifest: fetch failed, skipping manifest: %v", fetchErr)
+			} else {
+				prRef := "refs/prs/" + req.PRNum
+				baseRefFull := "refs/prs/" + req.PRNum + "-base"
+				mergeBase, mbErr := gitMergeBase(ctx, gitDir, baseRefFull, prRef)
+				if mbErr == nil {
+					manifest = buildDiffManifest(ctx, gitDir, mergeBase, prRef)
+					log.Printf("diff-manifest: %d commits, %d files for %s", len(manifest.Commits), len(manifest.Files), req.PRURL)
+				}
 			}
 		}
 	}
