@@ -763,7 +763,7 @@ Answer the question concisely based on the diff and thread context. Be specific 
 	dmUser(api, notifyUserID, fmt.Sprintf("Answered follow-up question in thread for <%s>", prURL))
 }
 
-func handleReactionReview(api SlackAPI, rev *slackevents.ReactionAddedEvent, channelID, notifyUserID, reviewQuestions string) {
+func handleReactionReview(api SlackAPI, rev *slackevents.ReactionAddedEvent, channelID, notifyUserID, reviewQuestions string, watchedChannels map[string]bool, botUserID string) {
 	resp, err := api.GetConversationHistory(&slack.GetConversationHistoryParameters{
 		ChannelID: channelID,
 		Latest:    rev.Item.Timestamp,
@@ -775,6 +775,11 @@ func handleReactionReview(api SlackAPI, rev *slackevents.ReactionAddedEvent, cha
 		return
 	}
 	msg := resp.Messages[0]
+
+	if !watchedChannels[channelID] && !strings.Contains(msg.Text, "<@"+botUserID+">") {
+		log.Printf("ignoring :claude_it: in unwatched channel %s (no bot mention)", channelID)
+		return
+	}
 
 	matches := ghPRPattern.FindAllStringSubmatch(msg.Text, -1)
 	if len(matches) == 0 {
@@ -958,6 +963,16 @@ func (n *nopSlack) GetConversationReplies(*slack.GetConversationRepliesParameter
 	return nil, false, "", nil
 }
 
+func parseChannelList(raw string) map[string]bool {
+	m := make(map[string]bool)
+	for _, ch := range strings.Split(raw, ",") {
+		if ch = strings.TrimSpace(ch); ch != "" {
+			m[ch] = true
+		}
+	}
+	return m
+}
+
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "review" {
 		runCLI(os.Args[2:])
@@ -970,11 +985,17 @@ func main() {
 
 	botToken := mustEnv("SLACK_BOT_TOKEN")
 	appToken := mustEnv("SLACK_APP_TOKEN")
-	channelID := mustEnv("WATCHED_CHANNEL_ID")
+	watchedChannels := parseChannelList(mustEnv("WATCHED_CHANNEL_ID"))
 	notifyUserID := mustEnv("NOTIFY_USER_ID")
 	reviewQuestions := os.Getenv("REVIEW_QUESTIONS")
 
 	api := slack.New(botToken, slack.OptionAppLevelToken(appToken))
+	authResp, err := api.AuthTest()
+	if err != nil {
+		log.Fatalf("Slack AuthTest failed: %v", err)
+	}
+	botUserID := authResp.UserID
+	log.Printf("bot user ID: %s", botUserID)
 	client := socketmode.New(api)
 
 	go func() {
@@ -1000,12 +1021,15 @@ func main() {
 					}
 				}
 				if rev.Reaction == "claude_it" {
-					go handleReactionReview(api, rev, rev.Item.Channel, notifyUserID, reviewQuestions)
+					go handleReactionReview(api, rev, rev.Item.Channel, notifyUserID, reviewQuestions, watchedChannels, botUserID)
 				}
 
 			case string(slackevents.AppMention):
 				ev, ok := outer.InnerEvent.Data.(*slackevents.AppMentionEvent)
 				if !ok {
+					continue
+				}
+				if !watchedChannels[ev.Channel] {
 					continue
 				}
 
@@ -1074,7 +1098,7 @@ func main() {
 				if !ok || ev.BotID != "" || ev.SubType != "" {
 					continue
 				}
-				if ev.Channel != channelID {
+				if !watchedChannels[ev.Channel] {
 					continue
 				}
 
@@ -1092,7 +1116,7 @@ func main() {
 					}
 					ctx, cancel := context.WithCancel(context.Background())
 					trackReview(ev.TimeStamp, prURL, cancel)
-					go handlePR(ctx, api, ev, prURL, owner, repo, prNum, channelID, notifyUserID, reviewQuestions)
+					go handlePR(ctx, api, ev, prURL, owner, repo, prNum, ev.Channel, notifyUserID, reviewQuestions)
 				}
 			}
 		}
