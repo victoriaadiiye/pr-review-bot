@@ -1025,7 +1025,7 @@ Answer the question concisely based on the diff and thread context. Be specific 
 	dmUser(api, notifyUserID, fmt.Sprintf("Answered follow-up question in thread for <%s>", prURL))
 }
 
-func handleReactionReview(api SlackAPI, rev *slackevents.ReactionAddedEvent, channelID, notifyUserID, reviewQuestions string) {
+func handleReactionReview(api SlackAPI, rev *slackevents.ReactionAddedEvent, channelID, notifyUserID, reviewQuestions string, watchedChannels map[string]bool, botUserID string) {
 	resp, err := api.GetConversationHistory(&slack.GetConversationHistoryParameters{
 		ChannelID: channelID,
 		Latest:    rev.Item.Timestamp,
@@ -1037,6 +1037,11 @@ func handleReactionReview(api SlackAPI, rev *slackevents.ReactionAddedEvent, cha
 		return
 	}
 	msg := resp.Messages[0]
+
+	if !watchedChannels[channelID] && !strings.Contains(msg.Text, "<@"+botUserID+">") {
+		log.Printf("ignoring :claude_it: in unwatched channel %s (no bot mention)", channelID)
+		return
+	}
 
 	matches := ghPRPattern.FindAllStringSubmatch(msg.Text, -1)
 	if len(matches) == 0 {
@@ -1345,6 +1350,12 @@ func main() {
 	}
 
 	api := slack.New(botToken, slack.OptionAppLevelToken(appToken))
+	authResp, err := api.AuthTest()
+	if err != nil {
+		log.Fatalf("Slack AuthTest failed: %v", err)
+	}
+	botUserID := authResp.UserID
+	log.Printf("bot user ID: %s", botUserID)
 	client := socketmode.New(api)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -1396,13 +1407,16 @@ func main() {
 				}
 				if rev.Reaction == "claude_it" {
 					submitReview(api, rev.Item.Channel, func() {
-						handleReactionReview(api, rev, rev.Item.Channel, notifyUserID, reviewQuestions)
+						handleReactionReview(api, rev, rev.Item.Channel, notifyUserID, reviewQuestions, watchedChannels, botUserID)
 					})
 				}
 
 			case string(slackevents.AppMention):
 				ev, ok := outer.InnerEvent.Data.(*slackevents.AppMentionEvent)
 				if !ok {
+					continue
+				}
+				if !watchedChannels[ev.Channel] {
 					continue
 				}
 
