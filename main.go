@@ -694,6 +694,22 @@ func cancelReview(ts string) bool {
 	return cancelled
 }
 
+func cancelReviewByURL(prURL string) bool {
+	activeReviewsMu.Lock()
+	defer activeReviewsMu.Unlock()
+	suffix := "|" + prURL
+	cancelled := false
+	for key, cancel := range activeReviews {
+		if strings.HasSuffix(key, suffix) {
+			cancel()
+			delete(activeReviews, key)
+			cancelled = true
+			log.Printf("cancelled review %s (via HTTP)", key)
+		}
+	}
+	return cancelled
+}
+
 // --- Review Queue ---
 
 type ReviewJob struct {
@@ -891,6 +907,28 @@ func startHealthServer(port string, queue *ReviewQueue, logBuf *LogBuffer, revie
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
 		json.NewEncoder(w).Encode(map[string]string{"status": "queued", "pr_url": req.PRURL})
+	})
+
+	mux.HandleFunc("/cancel", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			PRURL string `json:"pr_url"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PRURL == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "pr_url required"})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if cancelReviewByURL(req.PRURL) {
+			json.NewEncoder(w).Encode(map[string]string{"status": "cancelled", "pr_url": req.PRURL})
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "no active review for that URL"})
+		}
 	})
 
 	ln, err := net.Listen("tcp", ":"+port)
@@ -3208,8 +3246,10 @@ h1{font-size:1.4rem;margin-bottom:16px;color:#58a6ff}
 .card.good .value{color:#3fb950}
 .section{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:16px}
 .section h2{font-size:.9rem;color:#8b949e;margin-bottom:8px;text-transform:uppercase}
-.active-item{padding:8px 12px;border-bottom:1px solid #21262d;font-family:monospace;font-size:.85rem}
+.active-item{padding:8px 12px;border-bottom:1px solid #21262d;font-family:monospace;font-size:.85rem;display:flex;justify-content:space-between;align-items:center}
 .active-item:last-child{border-bottom:none}
+.cancel-btn{background:#da3633;color:#fff;border:none;border-radius:4px;padding:2px 10px;font-size:.75rem;cursor:pointer}
+.cancel-btn:hover{background:#f85149}
 .empty{color:#484f58;font-style:italic;padding:8px 0}
 .bar{height:6px;background:#21262d;border-radius:3px;margin-top:8px;overflow:hidden}
 .bar .fill{height:100%;background:#58a6ff;border-radius:3px;transition:width .3s}
@@ -3270,7 +3310,7 @@ async function poll() {
     if (a.active && a.active.length > 0) {
       list.innerHTML = a.active.map(k => {
         const parts = k.split("|"); const pr = parts.length > 1 ? parts[1] : k;
-        return '<div class="active-item">' + pr.replace(/</g,"&lt;") + '</div>';
+        return '<div class="active-item"><span>' + pr.replace(/</g,"&lt;") + '</span><button class="cancel-btn" onclick="cancelReview(\'' + pr.replace(/'/g,"\\'") + '\')">Cancel</button></div>';
       }).join("");
     } else { list.innerHTML = '<div class="empty">No active reviews</div>'; }
     $("dot").className = "status ok"; $("conn-text").textContent = "live";
@@ -3291,6 +3331,14 @@ async function pollLogs() {
       if (atBottom) box.scrollTop = box.scrollHeight;
     }
   } catch(e) {}
+}
+async function cancelReview(prURL) {
+  if (!confirm("Cancel review for " + prURL + "?")) return;
+  try {
+    const res = await fetch("/cancel", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({pr_url:prURL})});
+    const d = await res.json();
+    if (res.ok) { poll(); } else { alert(d.error || "Cancel failed"); }
+  } catch(e) { alert("Failed to reach server"); }
 }
 poll(); pollLogs(); setInterval(poll, 3000); setInterval(pollLogs, 2000);
 </script></body></html>`
