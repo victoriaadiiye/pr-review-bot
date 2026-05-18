@@ -2,9 +2,12 @@ services:
   bot:
     build: .
     env_file: .env
+    environment:
+      - GITHUB_PRIVATE_KEY_FILE=/app/private-key.pem
     volumes:
       - cache:/data/cache
-      - ~/.claude:/root/.claude:ro
+      - ${HOST_HOME:-/home/vuifhaolain}/.claude:/root/.claude:ro
+      - ${HOST_HOME:-/home/vuifhaolain}/private-key.pem:/app/private-key.pem:ro
     ports:
       - "${HEALTH_PORT:-8080}:8080"
     restart: unless-stopped

@@ -21,7 +21,12 @@ RUN npm install -g @anthropic-ai/claude-code
 
 COPY --from=builder /pr-review-bot /usr/local/bin/pr-review-bot
 COPY agents/ /app/agents/
+COPY projects.json /app/projects.json
 WORKDIR /app
+
+RUN printf '#!/bin/sh\necho "username=x-access-token"\necho "password=${GITHUB_TOKEN}"\n' > /usr/local/bin/git-credential-env && \
+    chmod +x /usr/local/bin/git-credential-env && \
+    git config --global credential.https://github.com.helper env
 
 VOLUME ["/data/cache"]
 ENV HOME=/root

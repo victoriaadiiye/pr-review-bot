@@ -2,7 +2,13 @@ package main
 
 import (
 	"context"
+	"crypto"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
@@ -953,6 +959,7 @@ func handleReactionReview(api SlackAPI, rev *slackevents.ReactionAddedEvent, cha
 
 func runCLI(args []string) {
 	_ = godotenv.Load()
+	initGitHubAuth()
 	repoCache = NewRepoCache()
 	sessionStore = NewSessionStore()
 
@@ -1203,6 +1210,7 @@ func main() {
 	}
 
 	_ = godotenv.Load()
+	initGitHubAuth()
 	repoCache = NewRepoCache()
 	sessionStore = NewSessionStore()
 
@@ -1785,6 +1793,175 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 	_ = api.AddReaction("white_check_mark", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 
 	dmUser(api, notifyUserID, fmt.Sprintf("Done! %s review for <%s> posted on GitHub and in <#%s>.%s\nUsage: %s\n\n%s", modeLabel, prURL, channelID, scoreMsg, stats, metrics))
+}
+
+// --- GitHub App Auth ---
+
+type GitHubAppAuth struct {
+	appID      string
+	privateKey *rsa.PrivateKey
+	mu         sync.Mutex
+	token      string
+	expiresAt  time.Time
+}
+
+func NewGitHubAppAuth() *GitHubAppAuth {
+	appID := os.Getenv("GITHUB_APP_ID")
+	keyFile := os.Getenv("GITHUB_PRIVATE_KEY_FILE")
+	if appID == "" || keyFile == "" {
+		return nil
+	}
+	keyPEM, err := os.ReadFile(keyFile)
+	if err != nil {
+		log.Fatalf("github-app: failed to read private key %s: %v", keyFile, err)
+	}
+	block, _ := pem.Decode(keyPEM)
+	if block == nil {
+		log.Fatalf("github-app: no PEM block found in %s", keyFile)
+	}
+	key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	if err != nil {
+		// Try PKCS8 format
+		k, err2 := x509.ParsePKCS8PrivateKey(block.Bytes)
+		if err2 != nil {
+			log.Fatalf("github-app: failed to parse private key: %v / %v", err, err2)
+		}
+		var ok bool
+		key, ok = k.(*rsa.PrivateKey)
+		if !ok {
+			log.Fatalf("github-app: private key is not RSA")
+		}
+	}
+	log.Printf("github-app: configured for app %s", appID)
+	return &GitHubAppAuth{appID: appID, privateKey: key}
+}
+
+func (g *GitHubAppAuth) signJWT() (string, error) {
+	now := time.Now()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT"}`))
+	payload := fmt.Sprintf(`{"iat":%d,"exp":%d,"iss":%s}`, now.Add(-60*time.Second).Unix(), now.Add(10*time.Minute).Unix(), g.appID)
+	payload64 := base64.RawURLEncoding.EncodeToString([]byte(payload))
+	sigInput := header + "." + payload64
+	h := sha256.Sum256([]byte(sigInput))
+	sig, err := rsa.SignPKCS1v15(nil, g.privateKey, crypto.SHA256, h[:])
+	if err != nil {
+		return "", fmt.Errorf("sign JWT: %w", err)
+	}
+	return sigInput + "." + base64.RawURLEncoding.EncodeToString(sig), nil
+}
+
+func (g *GitHubAppAuth) findInstallationID(jwt string) (int64, error) {
+	req, _ := http.NewRequest("GET", "https://api.github.com/app/installations", nil)
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("list installations: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return 0, fmt.Errorf("list installations: %s %s", resp.Status, body)
+	}
+	var installations []struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&installations); err != nil {
+		return 0, fmt.Errorf("decode installations: %w", err)
+	}
+	if len(installations) == 0 {
+		return 0, fmt.Errorf("no installations found for app %s", g.appID)
+	}
+	return installations[0].ID, nil
+}
+
+func (g *GitHubAppAuth) createInstallationToken(jwt string, installID int64) (string, time.Time, error) {
+	url := fmt.Sprintf("https://api.github.com/app/installations/%d/access_tokens", installID)
+	req, _ := http.NewRequest("POST", url, nil)
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("create installation token: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 201 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", time.Time{}, fmt.Errorf("create installation token: %s %s", resp.Status, body)
+	}
+	var result struct {
+		Token     string    `json:"token"`
+		ExpiresAt time.Time `json:"expires_at"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", time.Time{}, fmt.Errorf("decode token response: %w", err)
+	}
+	return result.Token, result.ExpiresAt, nil
+}
+
+func (g *GitHubAppAuth) Token() (string, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.token != "" && time.Now().Before(g.expiresAt.Add(-5*time.Minute)) {
+		return g.token, nil
+	}
+
+	jwt, err := g.signJWT()
+	if err != nil {
+		return "", err
+	}
+	installID, err := g.findInstallationID(jwt)
+	if err != nil {
+		return "", err
+	}
+	token, expiresAt, err := g.createInstallationToken(jwt, installID)
+	if err != nil {
+		return "", err
+	}
+	g.token = token
+	g.expiresAt = expiresAt
+	log.Printf("github-app: minted installation token (expires %s)", expiresAt.Format(time.RFC3339))
+	return token, nil
+}
+
+func (g *GitHubAppAuth) Env() error {
+	token, err := g.Token()
+	if err != nil {
+		return fmt.Errorf("github-app: %w", err)
+	}
+	os.Setenv("GITHUB_TOKEN", token)
+	os.Setenv("GH_TOKEN", token)
+	return nil
+}
+
+func initGitHubAuth() {
+	app := NewGitHubAppAuth()
+	if app == nil {
+		if os.Getenv("GITHUB_TOKEN") == "" && os.Getenv("GH_TOKEN") == "" {
+			log.Println("warning: no GitHub auth configured (set GITHUB_APP_ID+GITHUB_PRIVATE_KEY_FILE or GITHUB_TOKEN)")
+		}
+		return
+	}
+	if err := app.Env(); err != nil {
+		log.Fatalf("%v", err)
+	}
+	// Refresh token in background before it expires
+	go func() {
+		for {
+			app.mu.Lock()
+			sleepUntil := app.expiresAt.Add(-10 * time.Minute)
+			app.mu.Unlock()
+			delay := time.Until(sleepUntil)
+			if delay < time.Minute {
+				delay = time.Minute
+			}
+			time.Sleep(delay)
+			if err := app.Env(); err != nil {
+				log.Printf("github-app: token refresh failed: %v", err)
+			}
+		}
+	}()
 }
 
 // --- Repo Cache ---
