@@ -759,6 +759,48 @@ func (q *ReviewQueue) Stats() (pending int, active int, completed int64, dropped
 	return
 }
 
+// --- Log Buffer ---
+
+type LogBuffer struct {
+	mu    sync.Mutex
+	lines []string
+	max   int
+}
+
+func NewLogBuffer(max int) *LogBuffer {
+	return &LogBuffer{lines: make([]string, 0, max), max: max}
+}
+
+func (lb *LogBuffer) Write(p []byte) (n int, err error) {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	for _, line := range strings.Split(strings.TrimRight(string(p), "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		if len(lb.lines) >= lb.max {
+			copy(lb.lines, lb.lines[1:])
+			lb.lines = lb.lines[:lb.max-1]
+		}
+		lb.lines = append(lb.lines, line)
+	}
+	return len(p), nil
+}
+
+func (lb *LogBuffer) Lines(after int) ([]string, int) {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	if after >= len(lb.lines) {
+		return nil, len(lb.lines)
+	}
+	if after < 0 {
+		after = 0
+	}
+	result := make([]string, len(lb.lines)-after)
+	copy(result, lb.lines[after:])
+	return result, len(lb.lines)
+}
+
 // --- Health Server ---
 
 type HealthServer struct {
@@ -766,7 +808,7 @@ type HealthServer struct {
 	Addr string
 }
 
-func startHealthServer(port string, queue *ReviewQueue, reviewHandler func(prURL, flags string)) *HealthServer {
+func startHealthServer(port string, queue *ReviewQueue, logBuf *LogBuffer, reviewHandler func(prURL, flags string)) *HealthServer {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -797,6 +839,16 @@ func startHealthServer(port string, queue *ReviewQueue, reviewHandler func(prURL
 		activeReviewsMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"active": keys})
+	})
+
+	mux.HandleFunc("/logs", func(w http.ResponseWriter, r *http.Request) {
+		after := 0
+		if v := r.URL.Query().Get("after"); v != "" {
+			after, _ = strconv.Atoi(v)
+		}
+		lines, cursor := logBuf.Lines(after)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"lines": lines, "cursor": cursor})
 	})
 
 	mux.HandleFunc("/dashboard", func(w http.ResponseWriter, r *http.Request) {
@@ -1277,7 +1329,10 @@ func main() {
 		trackReview(msgEv.TimeStamp, prURL, cancel)
 		handlePR(rCtx, api, msgEv, prURL, owner, repo, prNum, msgEv.Channel, notifyUserID, reviewQuestions)
 	}
-	healthSrv := startHealthServer(healthPort, queue, reviewHandler)
+	logBuf := NewLogBuffer(500)
+	log.SetOutput(io.MultiWriter(os.Stderr, logBuf))
+
+	healthSrv := startHealthServer(healthPort, queue, logBuf, reviewHandler)
 
 	go func() {
 		for evt := range client.Events {
@@ -3183,6 +3238,10 @@ footer{margin-top:24px;font-size:.7rem;color:#484f58;text-align:center}
   <h2>Active Reviews</h2>
   <div id="active-list"><div class="empty">No active reviews</div></div>
 </div>
+<div class="section">
+  <h2>Logs</h2>
+  <div id="log-box" style="max-height:400px;overflow-y:auto;font-family:monospace;font-size:.8rem;line-height:1.5;white-space:pre-wrap;word-break:break-all;color:#8b949e"></div>
+</div>
 <footer>Polling every 3s</footer>
 <script>
 const $ = id => document.getElementById(id);
@@ -3219,7 +3278,21 @@ async function poll() {
     $("dot").className = "status down"; $("conn-text").textContent = "disconnected";
   }
 }
-poll(); setInterval(poll, 3000);
+let logCursor = 0;
+async function pollLogs() {
+  try {
+    const res = await fetch("/logs?after=" + logCursor);
+    const d = await res.json();
+    if (d.lines && d.lines.length > 0) {
+      const box = $("log-box");
+      const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+      box.innerHTML += d.lines.map(l => '<div>' + l.replace(/</g,"&lt;") + '</div>').join("");
+      logCursor = d.cursor;
+      if (atBottom) box.scrollTop = box.scrollHeight;
+    }
+  } catch(e) {}
+}
+poll(); pollLogs(); setInterval(poll, 3000); setInterval(pollLogs, 2000);
 </script></body></html>`
 
 const diffScopeRule = `IMPORTANT: Only raise issues about code that appears in the diff below. Do not speculate about code outside the diff, do not flag pre-existing issues in unchanged code, and do not hallucinate file contents you cannot see. Every finding must quote the exact code from the diff. If the diff is clean, say so.

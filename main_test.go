@@ -2526,7 +2526,7 @@ func TestPostReviewEndpoint_QueuesReview(t *testing.T) {
 		}
 	}
 
-	srv := startHealthServer("0", q, handler)
+	srv := startHealthServer("0", q, NewLogBuffer(100), handler)
 	defer srv.Close()
 
 	body := `{"pr_url":"https://github.com/org/repo/pull/42","flags":"--quick"}`
@@ -2558,7 +2558,7 @@ func TestPostReviewEndpoint_RejectsBadJSON(t *testing.T) {
 	q := NewReviewQueue(1, 5)
 	defer q.Drain()
 
-	srv := startHealthServer("0", q, nil)
+	srv := startHealthServer("0", q, NewLogBuffer(100), nil)
 	defer srv.Close()
 
 	resp, err := http.Post("http://"+srv.Addr+"/review", "application/json", strings.NewReader("not json"))
@@ -2576,7 +2576,7 @@ func TestPostReviewEndpoint_RejectsMissingURL(t *testing.T) {
 	q := NewReviewQueue(1, 5)
 	defer q.Drain()
 
-	srv := startHealthServer("0", q, nil)
+	srv := startHealthServer("0", q, NewLogBuffer(100), nil)
 	defer srv.Close()
 
 	resp, err := http.Post("http://"+srv.Addr+"/review", "application/json", strings.NewReader(`{"flags":"--quick"}`))
@@ -2594,7 +2594,7 @@ func TestPostReviewEndpoint_RejectsInvalidURL(t *testing.T) {
 	q := NewReviewQueue(1, 5)
 	defer q.Drain()
 
-	srv := startHealthServer("0", q, nil)
+	srv := startHealthServer("0", q, NewLogBuffer(100), nil)
 	defer srv.Close()
 
 	resp, err := http.Post("http://"+srv.Addr+"/review", "application/json",
@@ -2613,7 +2613,7 @@ func TestPostReviewEndpoint_RejectsGET(t *testing.T) {
 	q := NewReviewQueue(1, 5)
 	defer q.Drain()
 
-	srv := startHealthServer("0", q, nil)
+	srv := startHealthServer("0", q, NewLogBuffer(100), nil)
 	defer srv.Close()
 
 	resp, err := http.Get("http://" + srv.Addr + "/review")
@@ -2637,7 +2637,7 @@ func TestPostReviewEndpoint_QueueFull(t *testing.T) {
 	q.Submit(func() { <-blocker })
 
 	handler := func(string, string) {}
-	srv := startHealthServer("0", q, handler)
+	srv := startHealthServer("0", q, NewLogBuffer(100), handler)
 	defer srv.Close()
 
 	resp, err := http.Post("http://"+srv.Addr+"/review", "application/json",
@@ -2659,7 +2659,7 @@ func TestPostReviewEndpoint_NoHandler(t *testing.T) {
 	q := NewReviewQueue(1, 5)
 	defer q.Drain()
 
-	srv := startHealthServer("0", q, nil)
+	srv := startHealthServer("0", q, NewLogBuffer(100), nil)
 	defer srv.Close()
 
 	resp, err := http.Post("http://"+srv.Addr+"/review", "application/json",
@@ -2678,7 +2678,7 @@ func TestHealthEndpoint(t *testing.T) {
 	q := NewReviewQueue(1, 5)
 	defer q.Drain()
 
-	srv := startHealthServer("0", q, nil)
+	srv := startHealthServer("0", q, NewLogBuffer(100), nil)
 	defer srv.Close()
 
 	resp, err := http.Get("http://" + srv.Addr + "/health")
@@ -2702,7 +2702,7 @@ func TestMetricsEndpoint(t *testing.T) {
 	q.dropped.Store(1)
 	defer q.Drain()
 
-	srv := startHealthServer("0", q, nil)
+	srv := startHealthServer("0", q, NewLogBuffer(100), nil)
 	defer srv.Close()
 
 	resp, err := http.Get("http://" + srv.Addr + "/metrics")
