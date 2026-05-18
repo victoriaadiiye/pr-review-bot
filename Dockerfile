@@ -32,7 +32,7 @@ RUN printf '#!/bin/sh\necho "username=x-access-token"\necho "password=${GITHUB_T
 
 VOLUME ["/data/cache"]
 ENV HOME=/root
-ENV PR_REVIEW_CACHE_DIR=/data/cache
+ENV REPO_CACHE_DIR=/data/cache
 
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s CMD curl -f http://localhost:8080/health || exit 1
