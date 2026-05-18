@@ -22,6 +22,8 @@ RUN npm install -g @anthropic-ai/claude-code
 COPY --from=builder /pr-review-bot /usr/local/bin/pr-review-bot
 COPY agents/ /app/agents/
 COPY projects.json /app/projects.json
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 WORKDIR /app
 
 RUN printf '#!/bin/sh\necho "username=x-access-token"\necho "password=${GITHUB_TOKEN}"\n' > /usr/local/bin/git-credential-env && \
@@ -35,4 +37,4 @@ ENV PR_REVIEW_CACHE_DIR=/data/cache
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s CMD curl -f http://localhost:8080/health || exit 1
 
-ENTRYPOINT ["pr-review-bot"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

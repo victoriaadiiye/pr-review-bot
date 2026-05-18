@@ -788,6 +788,22 @@ func startHealthServer(port string, queue *ReviewQueue, reviewHandler func(prURL
 		})
 	})
 
+	mux.HandleFunc("/active", func(w http.ResponseWriter, r *http.Request) {
+		activeReviewsMu.Lock()
+		keys := make([]string, 0, len(activeReviews))
+		for key := range activeReviews {
+			keys = append(keys, key)
+		}
+		activeReviewsMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"active": keys})
+	})
+
+	mux.HandleFunc("/dashboard", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, dashboardHTML)
+	})
+
 	mux.HandleFunc("/review", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -3119,6 +3135,92 @@ Be specific about what changed. Reference files and lines.
 	log.Printf("delta-re-review: done for %s ($%.4f)", req.PRURL, resp.TotalCostUSD)
 	return text, resp, nil
 }
+
+const dashboardHTML = `<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PR Review Bot</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:system-ui,-apple-system,sans-serif;background:#0d1117;color:#c9d1d9;padding:24px}
+h1{font-size:1.4rem;margin-bottom:16px;color:#58a6ff}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:24px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;text-align:center}
+.card .value{font-size:2rem;font-weight:700;color:#58a6ff}
+.card .label{font-size:.75rem;color:#8b949e;text-transform:uppercase;margin-top:4px}
+.card.warn .value{color:#d29922}
+.card.bad .value{color:#f85149}
+.card.good .value{color:#3fb950}
+.section{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:16px}
+.section h2{font-size:.9rem;color:#8b949e;margin-bottom:8px;text-transform:uppercase}
+.active-item{padding:8px 12px;border-bottom:1px solid #21262d;font-family:monospace;font-size:.85rem}
+.active-item:last-child{border-bottom:none}
+.empty{color:#484f58;font-style:italic;padding:8px 0}
+.bar{height:6px;background:#21262d;border-radius:3px;margin-top:8px;overflow:hidden}
+.bar .fill{height:100%;background:#58a6ff;border-radius:3px;transition:width .3s}
+.status{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px}
+.status.ok{background:#3fb950}.status.down{background:#f85149}
+footer{margin-top:24px;font-size:.7rem;color:#484f58;text-align:center}
+#conn{position:fixed;top:12px;right:16px;font-size:.75rem}
+</style></head>
+<body>
+<div id="conn"><span class="status down" id="dot"></span><span id="conn-text">connecting...</span></div>
+<h1>PR Review Bot</h1>
+<div class="grid">
+  <div class="card" id="c-workers"><div class="value" id="v-workers">-</div><div class="label">Workers</div></div>
+  <div class="card" id="c-active"><div class="value" id="v-active">-</div><div class="label">Active</div></div>
+  <div class="card" id="c-pending"><div class="value" id="v-pending">-</div><div class="label">Queued</div></div>
+  <div class="card good" id="c-done"><div class="value" id="v-done">-</div><div class="label">Completed</div></div>
+  <div class="card" id="c-dropped"><div class="value" id="v-dropped">-</div><div class="label">Dropped</div></div>
+  <div class="card" id="c-uptime"><div class="value" id="v-uptime">-</div><div class="label">Uptime</div></div>
+</div>
+<div class="section">
+  <h2>Worker Utilization</h2>
+  <div class="bar"><div class="fill" id="util-bar"></div></div>
+  <div style="text-align:right;font-size:.75rem;color:#8b949e;margin-top:4px" id="util-text">-</div>
+</div>
+<div class="section">
+  <h2>Active Reviews</h2>
+  <div id="active-list"><div class="empty">No active reviews</div></div>
+</div>
+<footer>Polling every 3s</footer>
+<script>
+const $ = id => document.getElementById(id);
+function fmtUptime(s) {
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s/60) + "m " + (s%60) + "s";
+  const h = Math.floor(s/3600); return h + "h " + Math.floor((s%3600)/60) + "m";
+}
+async function poll() {
+  try {
+    const [mRes, aRes] = await Promise.all([fetch("/metrics"), fetch("/active")]);
+    const m = await mRes.json(), a = await aRes.json();
+    $("v-workers").textContent = m.workers;
+    $("v-active").textContent = m.reviews_active;
+    $("v-pending").textContent = m.queue_pending;
+    $("v-done").textContent = m.reviews_done;
+    $("v-dropped").textContent = m.reviews_dropped;
+    $("v-uptime").textContent = fmtUptime(m.uptime_seconds);
+    $("c-dropped").className = "card" + (m.reviews_dropped > 0 ? " bad" : "");
+    $("c-active").className = "card" + (m.reviews_active > 0 ? " warn" : "");
+    $("c-pending").className = "card" + (m.queue_pending > 0 ? " warn" : "");
+    const pct = m.workers > 0 ? Math.round((m.reviews_active / m.workers) * 100) : 0;
+    $("util-bar").style.width = pct + "%";
+    $("util-text").textContent = m.reviews_active + "/" + m.workers + " (" + pct + "%)";
+    const list = $("active-list");
+    if (a.active && a.active.length > 0) {
+      list.innerHTML = a.active.map(k => {
+        const parts = k.split("|"); const pr = parts.length > 1 ? parts[1] : k;
+        return '<div class="active-item">' + pr.replace(/</g,"&lt;") + '</div>';
+      }).join("");
+    } else { list.innerHTML = '<div class="empty">No active reviews</div>'; }
+    $("dot").className = "status ok"; $("conn-text").textContent = "live";
+  } catch(e) {
+    $("dot").className = "status down"; $("conn-text").textContent = "disconnected";
+  }
+}
+poll(); setInterval(poll, 3000);
+</script></body></html>`
 
 const diffScopeRule = `IMPORTANT: Only raise issues about code that appears in the diff below. Do not speculate about code outside the diff, do not flag pre-existing issues in unchanged code, and do not hallucinate file contents you cannot see. Every finding must quote the exact code from the diff. If the diff is clean, say so.
 
