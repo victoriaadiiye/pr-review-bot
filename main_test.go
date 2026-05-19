@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2720,5 +2721,266 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 	if got := data["reviews_dropped"]; got != float64(1) {
 		t.Errorf("reviews_dropped = %v, want 1", got)
+	}
+}
+
+func TestParsePRRef(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantOK  bool
+		wantRef prRef
+	}{
+		{
+			name:    "github PR URL",
+			input:   "https://github.com/Qumulo/qompass/pull/316",
+			wantOK:  true,
+			wantRef: prRef{URL: "https://github.com/Qumulo/qompass/pull/316", Owner: "Qumulo", Repo: "qompass", Num: "316"},
+		},
+		{
+			name:    "graphite PR URL",
+			input:   "https://app.graphite.com/github/pr/Qumulo/qompass/316",
+			wantOK:  true,
+			wantRef: prRef{URL: "https://app.graphite.com/github/pr/Qumulo/qompass/316", Owner: "Qumulo", Repo: "qompass", Num: "316"},
+		},
+		{
+			name:    "github and graphite produce same owner/repo/num",
+			input:   "https://app.graphite.com/github/pr/org/repo/42",
+			wantOK:  true,
+			wantRef: prRef{URL: "https://app.graphite.com/github/pr/org/repo/42", Owner: "org", Repo: "repo", Num: "42"},
+		},
+		{
+			name:    "slack-wrapped github URL",
+			input:   "<https://github.com/org/repo/pull/99>",
+			wantOK:  true,
+			wantRef: prRef{URL: "<https://github.com/org/repo/pull/99>", Owner: "org", Repo: "repo", Num: "99"},
+		},
+		{
+			name:    "slack-wrapped graphite URL",
+			input:   "<https://app.graphite.com/github/pr/org/repo/99>",
+			wantOK:  true,
+			wantRef: prRef{URL: "<https://app.graphite.com/github/pr/org/repo/99>", Owner: "org", Repo: "repo", Num: "99"},
+		},
+		{
+			name:    "graphite URL with trailing path segments",
+			input:   "https://app.graphite.com/github/pr/Qumulo/qompass/316/some-branch-name",
+			wantOK:  true,
+			wantRef: prRef{URL: "https://app.graphite.com/github/pr/Qumulo/qompass/316/some-branch-name", Owner: "Qumulo", Repo: "qompass", Num: "316"},
+		},
+		{
+			name:   "not a PR URL",
+			input:  "https://example.com/foo/bar",
+			wantOK: false,
+		},
+		{
+			name:   "empty string",
+			input:  "",
+			wantOK: false,
+		},
+		{
+			name:    "URL embedded in text",
+			input:   "please review https://github.com/org/repo/pull/5 thanks",
+			wantOK:  true,
+			wantRef: prRef{URL: "https://github.com/org/repo/pull/5", Owner: "org", Repo: "repo", Num: "5"},
+		},
+		{
+			name:    "graphite URL embedded in text",
+			input:   "check https://app.graphite.com/github/pr/org/repo/5 please",
+			wantOK:  true,
+			wantRef: prRef{URL: "https://app.graphite.com/github/pr/org/repo/5", Owner: "org", Repo: "repo", Num: "5"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ref, ok := parsePRRef(tt.input)
+			if ok != tt.wantOK {
+				t.Fatalf("parsePRRef(%q) ok = %v, want %v", tt.input, ok, tt.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if ref.Owner != tt.wantRef.Owner || ref.Repo != tt.wantRef.Repo || ref.Num != tt.wantRef.Num {
+				t.Errorf("parsePRRef(%q) = {Owner:%q Repo:%q Num:%q}, want {Owner:%q Repo:%q Num:%q}",
+					tt.input, ref.Owner, ref.Repo, ref.Num, tt.wantRef.Owner, tt.wantRef.Repo, tt.wantRef.Num)
+			}
+			if ref.URL != tt.wantRef.URL {
+				t.Errorf("parsePRRef(%q) URL = %q, want %q", tt.input, ref.URL, tt.wantRef.URL)
+			}
+		})
+	}
+}
+
+func TestFindPRRefs(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		wantLen  int
+		wantNums []string
+	}{
+		{
+			name:     "two github URLs",
+			input:    "review https://github.com/org/repo/pull/1 and https://github.com/org/repo/pull/2",
+			wantLen:  2,
+			wantNums: []string{"1", "2"},
+		},
+		{
+			name:     "mixed github and graphite URLs",
+			input:    "https://github.com/org/repo/pull/1 https://app.graphite.com/github/pr/org/repo/2",
+			wantLen:  2,
+			wantNums: []string{"1", "2"},
+		},
+		{
+			name:     "only graphite URLs",
+			input:    "https://app.graphite.com/github/pr/org/repo/10 https://app.graphite.com/github/pr/org/repo/11",
+			wantLen:  2,
+			wantNums: []string{"10", "11"},
+		},
+		{
+			name:    "no URLs",
+			input:   "just some text",
+			wantLen: 0,
+		},
+		{
+			name:     "duplicate PR via both URL formats deduped",
+			input:    "https://github.com/org/repo/pull/5 https://app.graphite.com/github/pr/org/repo/5",
+			wantLen:  1,
+			wantNums: []string{"5"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			refs := findPRRefs(tt.input)
+			if len(refs) != tt.wantLen {
+				t.Fatalf("findPRRefs(%q) returned %d refs, want %d: %+v", tt.input, len(refs), tt.wantLen, refs)
+			}
+			for i, wantNum := range tt.wantNums {
+				if refs[i].Num != wantNum {
+					t.Errorf("refs[%d].Num = %q, want %q", i, refs[i].Num, wantNum)
+				}
+			}
+		})
+	}
+}
+
+func TestDiscoverStack(t *testing.T) {
+	tests := []struct {
+		name     string
+		startNum int
+		prs      map[int]ghPull
+		wantNums []int
+		wantErr  bool
+	}{
+		{
+			name:     "linear 3-PR stack",
+			startNum: 3,
+			prs: map[int]ghPull{
+				3: {Number: 3, BaseRefName: "feat/step-2", HeadRefName: "feat/step-3"},
+				2: {Number: 2, BaseRefName: "feat/step-1", HeadRefName: "feat/step-2"},
+				1: {Number: 1, BaseRefName: "main", HeadRefName: "feat/step-1"},
+			},
+			wantNums: []int{1, 2, 3},
+		},
+		{
+			name:     "single PR off main",
+			startNum: 10,
+			prs: map[int]ghPull{
+				10: {Number: 10, BaseRefName: "main", HeadRefName: "feat/only"},
+			},
+			wantNums: []int{10},
+		},
+		{
+			name:     "stack with merged middle PR",
+			startNum: 3,
+			prs: map[int]ghPull{
+				3: {Number: 3, BaseRefName: "feat/step-2", HeadRefName: "feat/step-3"},
+				// PR 2 is merged/deleted — no open PR with head=feat/step-2
+				// so lookup for base "feat/step-2" finds nothing
+			},
+			wantNums: []int{3},
+		},
+		{
+			name:     "start from middle of stack",
+			startNum: 2,
+			prs: map[int]ghPull{
+				3: {Number: 3, BaseRefName: "feat/step-2", HeadRefName: "feat/step-3"},
+				2: {Number: 2, BaseRefName: "feat/step-1", HeadRefName: "feat/step-2"},
+				1: {Number: 1, BaseRefName: "main", HeadRefName: "feat/step-1"},
+			},
+			wantNums: []int{1, 2},
+		},
+		{
+			name:     "default branch is master",
+			startNum: 1,
+			prs: map[int]ghPull{
+				1: {Number: 1, BaseRefName: "master", HeadRefName: "feat/thing"},
+			},
+			wantNums: []int{1},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fetcher := &mockPRFetcher{prs: tt.prs}
+			nums, err := discoverStack(context.Background(), fetcher, "org", "repo", tt.startNum)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("discoverStack() err = %v, wantErr = %v", err, tt.wantErr)
+			}
+			if !tt.wantErr && !equalInts(nums, tt.wantNums) {
+				t.Errorf("discoverStack() = %v, want %v", nums, tt.wantNums)
+			}
+		})
+	}
+}
+
+type mockPRFetcher struct {
+	prs map[int]ghPull
+}
+
+func (m *mockPRFetcher) fetchPR(_ context.Context, _, _ string, num int) (ghPull, error) {
+	pr, ok := m.prs[num]
+	if !ok {
+		return ghPull{}, fmt.Errorf("PR #%d not found", num)
+	}
+	return pr, nil
+}
+
+func (m *mockPRFetcher) findPRByHead(_ context.Context, _, _, headRef string) (int, bool) {
+	for _, pr := range m.prs {
+		if pr.HeadRefName == headRef {
+			return pr.Number, true
+		}
+	}
+	return 0, false
+}
+
+func equalInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestIsPRURL(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		{"https://github.com/org/repo/pull/1", true},
+		{"https://app.graphite.com/github/pr/org/repo/1", true},
+		{"<https://github.com/org/repo/pull/1>", true},
+		{"<https://app.graphite.com/github/pr/org/repo/1>", true},
+		{"https://example.com/foo", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			if got := isPRURL(tt.input); got != tt.want {
+				t.Errorf("isPRURL(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
 	}
 }

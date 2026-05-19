@@ -625,11 +625,113 @@ func extractPerspectiveScore(agentName, text string) (review string, ps Perspect
 	return review, ps
 }
 
+type prRef struct {
+	URL   string
+	Owner string
+	Repo  string
+	Num   string
+}
+
+func (r prRef) key() string {
+	return r.Owner + "/" + r.Repo + "/" + r.Num
+}
+
+func (r prRef) githubURL() string {
+	return fmt.Sprintf("https://github.com/%s/%s/pull/%s", r.Owner, r.Repo, r.Num)
+}
+
+type ghPull struct {
+	Number      int    `json:"number"`
+	BaseRefName string `json:"baseRefName"`
+	HeadRefName string `json:"headRefName"`
+}
+
+type PRFetcher interface {
+	fetchPR(ctx context.Context, owner, repo string, num int) (ghPull, error)
+	findPRByHead(ctx context.Context, owner, repo, headRef string) (int, bool)
+}
+
+type ghPRFetcher struct{}
+
+func (g *ghPRFetcher) fetchPR(ctx context.Context, owner, repo string, num int) (ghPull, error) {
+	cmd := exec.CommandContext(ctx, "gh", "pr", "view", strconv.Itoa(num),
+		"--repo", fmt.Sprintf("%s/%s", owner, repo),
+		"--json", "number,baseRefName,headRefName")
+	out, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return ghPull{}, fmt.Errorf("gh pr view #%d: %s", num, string(exitErr.Stderr))
+		}
+		return ghPull{}, fmt.Errorf("gh pr view #%d: %w", num, err)
+	}
+	var pr ghPull
+	if err := json.Unmarshal(out, &pr); err != nil {
+		return ghPull{}, fmt.Errorf("parse PR #%d: %w", num, err)
+	}
+	return pr, nil
+}
+
+func (g *ghPRFetcher) findPRByHead(ctx context.Context, owner, repo, headRef string) (int, bool) {
+	cmd := exec.CommandContext(ctx, "gh", "pr", "list",
+		"--repo", fmt.Sprintf("%s/%s", owner, repo),
+		"--head", headRef,
+		"--state", "open",
+		"--json", "number",
+		"--limit", "1")
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, false
+	}
+	var prs []struct {
+		Number int `json:"number"`
+	}
+	if err := json.Unmarshal(out, &prs); err != nil || len(prs) == 0 {
+		return 0, false
+	}
+	return prs[0].Number, true
+}
+
+var defaultBranches = map[string]bool{"main": true, "master": true, "develop": true}
+
+func discoverStack(ctx context.Context, fetcher PRFetcher, owner, repo string, startNum int) ([]int, error) {
+	var chain []int
+	visited := map[int]bool{}
+	current := startNum
+	for {
+		if visited[current] {
+			break
+		}
+		visited[current] = true
+		pr, err := fetcher.fetchPR(ctx, owner, repo, current)
+		if err != nil {
+			if len(chain) > 0 {
+				break
+			}
+			return nil, fmt.Errorf("discover stack: %w", err)
+		}
+		chain = append(chain, current)
+		if defaultBranches[pr.BaseRefName] {
+			break
+		}
+		below, found := fetcher.findPRByHead(ctx, owner, repo, pr.BaseRefName)
+		if !found {
+			break
+		}
+		current = below
+	}
+	for i, j := 0, len(chain)-1; i < j; i, j = i+1, j-1 {
+		chain[i], chain[j] = chain[j], chain[i]
+	}
+	return chain, nil
+}
+
 var (
-	ghPRPattern          = regexp.MustCompile(`<?https://github\.com/([^/>\s]+)/([^/>\s]+)/pull/(\d+)[^>\s]*>?`)
-	jiraTicketPattern    = regexp.MustCompile(`\b[A-Z]{2,}-\d+\b`)
+	ghPRPattern       = regexp.MustCompile(`<?https://github\.com/([^/>\s]+)/([^/>\s]+)/pull/(\d+)[^>\s]*>?`)
+	graphitePRPattern = regexp.MustCompile(`<?https://app\.graphite\.com/github/pr/([^/>\s]+)/([^/>\s]+)/(\d+)[^>\s]*>?`)
+	jiraTicketPattern = regexp.MustCompile(`\b[A-Z]{2,}-\d+\b`)
 	modePattern          = regexp.MustCompile(`--(initial|re-review|quick|final)\b`)
 	selfPattern          = regexp.MustCompile(`--self\b`)
+	stackPattern         = regexp.MustCompile(`--stack\b`)
 	testPattern          = regexp.MustCompile(`--test\b`)
 	specPattern          = regexp.MustCompile(`--spec\s+(\S+)`)
 	flagPattern          = regexp.MustCompile(`--([a-z][-a-z0-9]*)\b`)
@@ -645,6 +747,39 @@ var (
 	activeReviews   = make(map[string]context.CancelFunc)
 	activeReviewsMu sync.Mutex
 )
+
+func matchToRef(m []string) prRef {
+	return prRef{URL: m[0], Owner: m[1], Repo: m[2], Num: m[3]}
+}
+
+func parsePRRef(text string) (prRef, bool) {
+	for _, pat := range []*regexp.Regexp{ghPRPattern, graphitePRPattern} {
+		if m := pat.FindStringSubmatch(text); m != nil {
+			return matchToRef(m), true
+		}
+	}
+	return prRef{}, false
+}
+
+func findPRRefs(text string) []prRef {
+	seen := map[string]bool{}
+	var refs []prRef
+	for _, pat := range []*regexp.Regexp{ghPRPattern, graphitePRPattern} {
+		for _, m := range pat.FindAllStringSubmatch(text, -1) {
+			ref := matchToRef(m)
+			if !seen[ref.key()] {
+				seen[ref.key()] = true
+				refs = append(refs, ref)
+			}
+		}
+	}
+	return refs
+}
+
+func isPRURL(text string) bool {
+	_, ok := parsePRRef(text)
+	return ok
+}
 
 func reviewKey(ts, id string) string {
 	return ts + "|" + id
@@ -886,9 +1021,9 @@ func startHealthServer(port string, queue *ReviewQueue, logBuf *LogBuffer, revie
 			json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON"})
 			return
 		}
-		if req.PRURL == "" || !ghPRPattern.MatchString(req.PRURL) {
+		if req.PRURL == "" || !isPRURL(req.PRURL) {
 			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]string{"error": "pr_url must be a valid GitHub PR URL"})
+			json.NewEncoder(w).Encode(map[string]string{"error": "pr_url must be a valid GitHub or Graphite PR URL"})
 			return
 		}
 		if reviewHandler == nil {
@@ -957,8 +1092,8 @@ func findPRInThread(api SlackAPI, channelID, threadTS string) (owner, repo, prNu
 		return "", "", "", "", false
 	}
 	for _, msg := range msgs {
-		if m := ghPRPattern.FindStringSubmatch(msg.Text); m != nil {
-			return m[1], m[2], m[3], msg.Text, true
+		if ref, ok := parsePRRef(msg.Text); ok {
+			return ref.Owner, ref.Repo, ref.Num, msg.Text, true
 		}
 	}
 	return "", "", "", "", false
@@ -1043,8 +1178,8 @@ func handleReactionReview(api SlackAPI, rev *slackevents.ReactionAddedEvent, cha
 		return
 	}
 
-	matches := ghPRPattern.FindAllStringSubmatch(msg.Text, -1)
-	if len(matches) == 0 {
+	refs := findPRRefs(msg.Text)
+	if len(refs) == 0 {
 		log.Printf("no PR URL found in message %s for :claude_it: reaction", rev.Item.Timestamp)
 		return
 	}
@@ -1055,9 +1190,9 @@ func handleReactionReview(api SlackAPI, rev *slackevents.ReactionAddedEvent, cha
 		TimeStamp: rev.Item.Timestamp,
 	}
 
-	for _, m := range matches {
-		owner, repo, prNum := m[1], m[2], m[3]
-		prURL := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, prNum)
+	for _, ref := range refs {
+		owner, repo, prNum := ref.Owner, ref.Repo, ref.Num
+		prURL := ref.githubURL()
 		if isReviewActive(prURL) {
 			log.Printf("skipping duplicate :claude_it: review for %s (already in progress)", prURL)
 			continue
@@ -1075,14 +1210,42 @@ func runCLI(args []string) {
 	sessionStore = NewSessionStore()
 
 	input := strings.Join(args, " ")
-	m := ghPRPattern.FindStringSubmatch(input)
-	if m == nil {
-		fmt.Fprintf(os.Stderr, "Usage: pr-review-bot review <github-pr-url> [--initial|--quick|--re-review|--final] [--test] [--bare-necessities] [--no-github]\n")
+	ref, ok := parsePRRef(input)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "Usage: pr-review-bot review <pr-url> [--initial|--quick|--re-review|--final] [--test] [--bare-necessities] [--no-github]\n")
 		os.Exit(1)
 	}
-	owner, repo, prNum := m[1], m[2], m[3]
-	prURL := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, prNum)
+	owner, repo, prNum := ref.Owner, ref.Repo, ref.Num
+	prURL := ref.githubURL()
 
+	ctx := context.Background()
+
+	if stackPattern.MatchString(input) {
+		prNumInt, _ := strconv.Atoi(prNum)
+		log.Printf("cli: discovering stack from %s#%d...", repo, prNumInt)
+		fetcher := &ghPRFetcher{}
+		stackNums, err := discoverStack(ctx, fetcher, owner, repo, prNumInt)
+		if err != nil {
+			log.Fatalf("cli: stack discovery failed: %v", err)
+		}
+		log.Printf("cli: found %d PRs in stack: %v", len(stackNums), stackNums)
+
+		stackInput := stackPattern.ReplaceAllString(input, "")
+		for i, num := range stackNums {
+			numStr := strconv.Itoa(num)
+			thisPRURL := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, numStr)
+			thisInput := ghPRPattern.ReplaceAllString(stackInput, thisPRURL)
+			thisInput = graphitePRPattern.ReplaceAllString(thisInput, thisPRURL)
+			log.Printf("cli: === stack PR %d/%d: %s ===", i+1, len(stackNums), thisPRURL)
+			runCLISinglePR(ctx, thisInput, owner, repo, numStr, thisPRURL)
+		}
+		return
+	}
+
+	runCLISinglePR(ctx, input, owner, repo, prNum, prURL)
+}
+
+func runCLISinglePR(ctx context.Context, input, owner, repo, prNum, prURL string) {
 	mode, modeExplicit := parseMode(input)
 	flags := parseFlags(input)
 	onlyAgents := parseOnlyAgents(input)
@@ -1097,8 +1260,6 @@ func runCLI(args []string) {
 	if model == "" {
 		model = "claude-opus-4-6"
 	}
-
-	ctx := context.Background()
 
 	log.Printf("cli: fetching diff for %s", prURL)
 	diff, err := fetchDiff(ctx, owner, repo, prNum)
@@ -1211,12 +1372,12 @@ func runCLI(args []string) {
 
 func runPost(args []string) {
 	input := strings.Join(args, " ")
-	m := ghPRPattern.FindStringSubmatch(input)
-	if m == nil {
-		fmt.Fprintf(os.Stderr, "Usage: pr-review-bot post <github-pr-url> [--quick|--initial|--re-review|--final] [--host HOST:PORT]\n")
+	ref, ok := parsePRRef(input)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "Usage: pr-review-bot post <pr-url> [--quick|--initial|--re-review|--final] [--host HOST:PORT]\n")
 		os.Exit(1)
 	}
-	prURL := m[0]
+	prURL := ref.githubURL()
 
 	host := "localhost:8080"
 	if i := strings.Index(input, "--host"); i >= 0 {
@@ -1227,7 +1388,7 @@ func runPost(args []string) {
 	}
 
 	flags := ""
-	for _, f := range []string{"--quick", "--initial", "--re-review", "--final", "--bare-necessities", "--no-github", "--self"} {
+	for _, f := range []string{"--quick", "--initial", "--re-review", "--final", "--bare-necessities", "--no-github", "--self", "--stack"} {
 		if strings.Contains(input, f) {
 			flags += f + " "
 		}
@@ -1362,12 +1523,12 @@ func main() {
 	defer stop()
 
 	reviewHandler := func(prURL, flags string) {
-		m := ghPRPattern.FindStringSubmatch(prURL)
-		if m == nil {
+		ref, ok := parsePRRef(prURL)
+		if !ok {
 			log.Printf("http: invalid PR URL: %s", prURL)
 			return
 		}
-		owner, repo, prNum := m[1], m[2], m[3]
+		owner, repo, prNum := ref.Owner, ref.Repo, ref.Num
 		text := prURL + " " + flags
 		msgEv := &slackevents.MessageEvent{
 			Text:      text,
@@ -1420,19 +1581,19 @@ func main() {
 					continue
 				}
 
-				matches := ghPRPattern.FindAllStringSubmatch(ev.Text, -1)
+				refs := findPRRefs(ev.Text)
 				isReviewRequest := reviewRequestPattern.MatchString(ev.Text)
 				inThread := ev.ThreadTimeStamp != ""
 
-				if len(matches) > 0 && isReviewRequest {
+				if len(refs) > 0 && isReviewRequest {
 					msgEv := &slackevents.MessageEvent{
 						Text:      ev.Text,
 						Channel:   ev.Channel,
 						TimeStamp: ev.TimeStamp,
 					}
-					for _, m := range matches {
-						owner, repo, prNum := m[1], m[2], m[3]
-						prURL := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, prNum)
+					for _, ref := range refs {
+						owner, repo, prNum := ref.Owner, ref.Repo, ref.Num
+						prURL := ref.githubURL()
 						if isReviewActive(prURL) {
 							log.Printf("skipping duplicate @mention review for %s (already in progress)", prURL)
 							continue
@@ -1497,14 +1658,14 @@ func main() {
 					continue
 				}
 
-				matches := ghPRPattern.FindAllStringSubmatch(ev.Text, -1)
-				if len(matches) == 0 {
+				refs := findPRRefs(ev.Text)
+				if len(refs) == 0 {
 					continue
 				}
 
-				for _, m := range matches {
-					owner, repo, prNum := m[1], m[2], m[3]
-					prURL := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, prNum)
+				for _, ref := range refs {
+					owner, repo, prNum := ref.Owner, ref.Repo, ref.Num
+					prURL := ref.githubURL()
 					if isReviewActive(prURL) {
 						log.Printf("skipping duplicate auto-review for %s (already in progress)", prURL)
 						continue
@@ -1554,7 +1715,7 @@ func parseSpecPath(text string) string {
 func parseFlags(text string) map[string]bool {
 	reserved := map[string]bool{
 		"initial": true, "re-review": true, "quick": true, "final": true,
-		"self": true, "spec": true, "test": true, "no-github": true, "only": true,
+		"self": true, "spec": true, "test": true, "no-github": true, "only": true, "stack": true,
 	}
 	flags := make(map[string]bool)
 	for _, m := range flagPattern.FindAllStringSubmatch(text, -1) {
@@ -1659,6 +1820,7 @@ func resolveMaxTurns(agent agentFile, thorough bool) int {
 
 func parseJiraTicket(text string) string {
 	cleaned := ghPRPattern.ReplaceAllString(text, "")
+	cleaned = graphitePRPattern.ReplaceAllString(cleaned, "")
 	cleaned = modePattern.ReplaceAllString(cleaned, "")
 	cleaned = selfPattern.ReplaceAllString(cleaned, "")
 	cleaned = specPattern.ReplaceAllString(cleaned, "")
@@ -1671,6 +1833,32 @@ func parseJiraTicket(text string) string {
 func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, prURL, owner, repo, prNum, channelID, notifyUserID, reviewQuestions string) {
 	defer untrackReview(ev.TimeStamp, prURL)
 
+	if stackPattern.MatchString(ev.Text) {
+		prNumInt, _ := strconv.Atoi(prNum)
+		dmUser(api, notifyUserID, fmt.Sprintf("Discovering stack from <%s>...", prURL))
+		fetcher := &ghPRFetcher{}
+		stackNums, err := discoverStack(ctx, fetcher, owner, repo, prNumInt)
+		if err != nil {
+			postError(api, ev, prURL, channelID, notifyUserID, fmt.Errorf("stack discovery: %w", err))
+			return
+		}
+		dmUser(api, notifyUserID, fmt.Sprintf("Found %d PRs in stack: %v — reviewing each...", len(stackNums), stackNums))
+		cleanText := stackPattern.ReplaceAllString(ev.Text, "")
+		for i, num := range stackNums {
+			numStr := strconv.Itoa(num)
+			thisPRURL := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, numStr)
+			log.Printf("stack: reviewing PR %d/%d: %s", i+1, len(stackNums), thisPRURL)
+			stackEv := *ev
+			stackEv.Text = cleanText
+			handleSinglePR(ctx, api, &stackEv, thisPRURL, owner, repo, numStr, channelID, notifyUserID, reviewQuestions)
+		}
+		return
+	}
+
+	handleSinglePR(ctx, api, ev, prURL, owner, repo, prNum, channelID, notifyUserID, reviewQuestions)
+}
+
+func handleSinglePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, prURL, owner, repo, prNum, channelID, notifyUserID, reviewQuestions string) {
 	mode, modeExplicit := parseMode(ev.Text)
 	selfReview := selfPattern.MatchString(ev.Text)
 	jiraTicket := parseJiraTicket(ev.Text)
