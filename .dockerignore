@@ -1,0 +1,8 @@
+bot.log
+*.env
+.env.*
+!.env.example
+.git
+.claude
+.planning
+diagrams

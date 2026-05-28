@@ -1,14 +1,18 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2334,6 +2338,648 @@ func TestPRBase_ParsesJSON(t *testing.T) {
 			}
 			if err == nil && got != tt.want {
 				t.Errorf("got %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+// --- ReviewQueue tests ---
+
+func TestReviewQueue_ExecutesJobs(t *testing.T) {
+	q := NewReviewQueue(2, 5)
+	var count atomic.Int64
+
+	for range 5 {
+		q.Submit(func() {
+			count.Add(1)
+		})
+	}
+
+	q.Drain()
+	if got := count.Load(); got != 5 {
+		t.Errorf("executed %d jobs, want 5", got)
+	}
+}
+
+func TestReviewQueue_RespectsWorkerLimit(t *testing.T) {
+	q := NewReviewQueue(2, 10)
+	var concurrent atomic.Int64
+	var maxConcurrent atomic.Int64
+
+	for range 6 {
+		q.Submit(func() {
+			cur := concurrent.Add(1)
+			for {
+				old := maxConcurrent.Load()
+				if cur <= old || maxConcurrent.CompareAndSwap(old, cur) {
+					break
+				}
+			}
+			time.Sleep(50 * time.Millisecond)
+			concurrent.Add(-1)
+		})
+	}
+
+	q.Drain()
+	if got := maxConcurrent.Load(); got > 2 {
+		t.Errorf("max concurrent = %d, want <= 2", got)
+	}
+}
+
+func TestReviewQueue_DropsWhenFull(t *testing.T) {
+	q := NewReviewQueue(1, 2)
+	blocker := make(chan struct{})
+
+	q.Submit(func() { <-blocker })
+	q.Submit(func() { <-blocker })
+	q.Submit(func() { <-blocker })
+
+	ok := q.Submit(func() {})
+	if ok {
+		t.Error("expected Submit to return false when queue full")
+	}
+
+	_, _, _, dropped := q.Stats()
+	if dropped < 1 {
+		t.Errorf("dropped = %d, want >= 1", dropped)
+	}
+
+	close(blocker)
+	q.Drain()
+}
+
+func TestReviewQueue_Stats(t *testing.T) {
+	q := NewReviewQueue(1, 5)
+	done := make(chan struct{})
+
+	q.Submit(func() {
+		q.completed.Add(1)
+		<-done
+	})
+	q.Submit(func() {
+		q.completed.Add(1)
+	})
+
+	time.Sleep(20 * time.Millisecond)
+	pending, _, _, _ := q.Stats()
+	if pending < 1 {
+		t.Errorf("pending = %d, want >= 1", pending)
+	}
+
+	close(done)
+	q.Drain()
+
+	_, _, completed, _ := q.Stats()
+	if completed != 2 {
+		t.Errorf("completed = %d, want 2", completed)
+	}
+}
+
+// --- parseWatchedChannels tests ---
+
+func TestParseWatchedChannels_Single(t *testing.T) {
+	got := parseWatchedChannels("C123")
+	if !got["C123"] || len(got) != 1 {
+		t.Errorf("got %v, want {C123: true}", got)
+	}
+}
+
+func TestParseWatchedChannels_Multiple(t *testing.T) {
+	got := parseWatchedChannels("C123,C456,C789")
+	if len(got) != 3 || !got["C123"] || !got["C456"] || !got["C789"] {
+		t.Errorf("got %v, want 3 channels", got)
+	}
+}
+
+func TestParseWatchedChannels_Wildcard(t *testing.T) {
+	got := parseWatchedChannels("*")
+	if got != nil {
+		t.Errorf("got %v, want nil (all channels)", got)
+	}
+}
+
+func TestParseWatchedChannels_TrimSpaces(t *testing.T) {
+	got := parseWatchedChannels(" C123 , C456 ")
+	if len(got) != 2 || !got["C123"] || !got["C456"] {
+		t.Errorf("got %v, want {C123, C456}", got)
+	}
+}
+
+// --- isWatchedChannel tests ---
+
+func TestIsWatchedChannel_NilAllowsAll(t *testing.T) {
+	if !isWatchedChannel("C999", nil) {
+		t.Error("nil map should allow all channels")
+	}
+}
+
+func TestIsWatchedChannel_InSet(t *testing.T) {
+	m := map[string]bool{"C123": true}
+	if !isWatchedChannel("C123", m) {
+		t.Error("should match channel in set")
+	}
+}
+
+func TestIsWatchedChannel_NotInSet(t *testing.T) {
+	m := map[string]bool{"C123": true}
+	if isWatchedChannel("C999", m) {
+		t.Error("should not match channel outside set")
+	}
+}
+
+// --- envIntOr tests ---
+
+func TestEnvIntOr_Fallback(t *testing.T) {
+	os.Unsetenv("TEST_ENVINT_UNSET")
+	if got := envIntOr("TEST_ENVINT_UNSET", 42); got != 42 {
+		t.Errorf("got %d, want 42", got)
+	}
+}
+
+func TestEnvIntOr_ValidValue(t *testing.T) {
+	t.Setenv("TEST_ENVINT_VALID", "7")
+	if got := envIntOr("TEST_ENVINT_VALID", 42); got != 7 {
+		t.Errorf("got %d, want 7", got)
+	}
+}
+
+func TestEnvIntOr_InvalidFallback(t *testing.T) {
+	t.Setenv("TEST_ENVINT_BAD", "notanumber")
+	if got := envIntOr("TEST_ENVINT_BAD", 42); got != 42 {
+		t.Errorf("got %d, want 42 (fallback)", got)
+	}
+}
+
+// --- Health server tests ---
+
+func TestPostReviewEndpoint_QueuesReview(t *testing.T) {
+	q := NewReviewQueue(1, 5)
+	defer q.Drain()
+
+	var called atomic.Bool
+	handler := func(pr string, flags string) {
+		called.Store(true)
+		if pr != "https://github.com/org/repo/pull/42" {
+			t.Errorf("pr = %q, want https://github.com/org/repo/pull/42", pr)
+		}
+		if flags != "--quick" {
+			t.Errorf("flags = %q, want --quick", flags)
+		}
+	}
+
+	srv := startHealthServer("0", q, NewLogBuffer(100), handler)
+	defer srv.Close()
+
+	body := `{"pr_url":"https://github.com/org/repo/pull/42","flags":"--quick"}`
+	resp, err := http.Post("http://"+srv.Addr+"/review", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /review: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusAccepted {
+		t.Errorf("status = %d, want 202", resp.StatusCode)
+	}
+
+	var result map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if result["status"] != "queued" {
+		t.Errorf("status = %v, want queued", result["status"])
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	if !called.Load() {
+		t.Error("handler was not called")
+	}
+}
+
+func TestPostReviewEndpoint_RejectsBadJSON(t *testing.T) {
+	q := NewReviewQueue(1, 5)
+	defer q.Drain()
+
+	srv := startHealthServer("0", q, NewLogBuffer(100), nil)
+	defer srv.Close()
+
+	resp, err := http.Post("http://"+srv.Addr+"/review", "application/json", strings.NewReader("not json"))
+	if err != nil {
+		t.Fatalf("POST /review: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestPostReviewEndpoint_RejectsMissingURL(t *testing.T) {
+	q := NewReviewQueue(1, 5)
+	defer q.Drain()
+
+	srv := startHealthServer("0", q, NewLogBuffer(100), nil)
+	defer srv.Close()
+
+	resp, err := http.Post("http://"+srv.Addr+"/review", "application/json", strings.NewReader(`{"flags":"--quick"}`))
+	if err != nil {
+		t.Fatalf("POST /review: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestPostReviewEndpoint_RejectsInvalidURL(t *testing.T) {
+	q := NewReviewQueue(1, 5)
+	defer q.Drain()
+
+	srv := startHealthServer("0", q, NewLogBuffer(100), nil)
+	defer srv.Close()
+
+	resp, err := http.Post("http://"+srv.Addr+"/review", "application/json",
+		strings.NewReader(`{"pr_url":"https://example.com/not-a-pr"}`))
+	if err != nil {
+		t.Fatalf("POST /review: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestPostReviewEndpoint_RejectsGET(t *testing.T) {
+	q := NewReviewQueue(1, 5)
+	defer q.Drain()
+
+	srv := startHealthServer("0", q, NewLogBuffer(100), nil)
+	defer srv.Close()
+
+	resp, err := http.Get("http://" + srv.Addr + "/review")
+	if err != nil {
+		t.Fatalf("GET /review: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405", resp.StatusCode)
+	}
+}
+
+func TestPostReviewEndpoint_QueueFull(t *testing.T) {
+	q := NewReviewQueue(1, 1)
+
+	blocker := make(chan struct{})
+	workerBusy := make(chan struct{})
+	q.Submit(func() { close(workerBusy); <-blocker })
+	<-workerBusy
+	q.Submit(func() { <-blocker })
+
+	handler := func(string, string) {}
+	srv := startHealthServer("0", q, NewLogBuffer(100), handler)
+	defer srv.Close()
+
+	resp, err := http.Post("http://"+srv.Addr+"/review", "application/json",
+		strings.NewReader(`{"pr_url":"https://github.com/org/repo/pull/1"}`))
+	if err != nil {
+		t.Fatalf("POST /review: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", resp.StatusCode)
+	}
+
+	close(blocker)
+	q.Drain()
+}
+
+func TestPostReviewEndpoint_NoHandler(t *testing.T) {
+	q := NewReviewQueue(1, 5)
+	defer q.Drain()
+
+	srv := startHealthServer("0", q, NewLogBuffer(100), nil)
+	defer srv.Close()
+
+	resp, err := http.Post("http://"+srv.Addr+"/review", "application/json",
+		strings.NewReader(`{"pr_url":"https://github.com/org/repo/pull/1"}`))
+	if err != nil {
+		t.Fatalf("POST /review: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", resp.StatusCode)
+	}
+}
+
+func TestHealthEndpoint(t *testing.T) {
+	q := NewReviewQueue(1, 5)
+	defer q.Drain()
+
+	srv := startHealthServer("0", q, NewLogBuffer(100), nil)
+	defer srv.Close()
+
+	resp, err := http.Get("http://" + srv.Addr + "/health")
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), `"status":"ok"`) {
+		t.Errorf("body = %s, want status ok", body)
+	}
+}
+
+func TestMetricsEndpoint(t *testing.T) {
+	q := NewReviewQueue(1, 5)
+	q.completed.Store(3)
+	q.dropped.Store(1)
+	defer q.Drain()
+
+	srv := startHealthServer("0", q, NewLogBuffer(100), nil)
+	defer srv.Close()
+
+	resp, err := http.Get("http://" + srv.Addr + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var data map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got := data["reviews_done"]; got != float64(3) {
+		t.Errorf("reviews_done = %v, want 3", got)
+	}
+	if got := data["reviews_dropped"]; got != float64(1) {
+		t.Errorf("reviews_dropped = %v, want 1", got)
+	}
+}
+
+func TestParsePRRef(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantOK  bool
+		wantRef prRef
+	}{
+		{
+			name:    "github PR URL",
+			input:   "https://github.com/Qumulo/qompass/pull/316",
+			wantOK:  true,
+			wantRef: prRef{URL: "https://github.com/Qumulo/qompass/pull/316", Owner: "Qumulo", Repo: "qompass", Num: "316"},
+		},
+		{
+			name:    "graphite PR URL",
+			input:   "https://app.graphite.com/github/pr/Qumulo/qompass/316",
+			wantOK:  true,
+			wantRef: prRef{URL: "https://app.graphite.com/github/pr/Qumulo/qompass/316", Owner: "Qumulo", Repo: "qompass", Num: "316"},
+		},
+		{
+			name:    "github and graphite produce same owner/repo/num",
+			input:   "https://app.graphite.com/github/pr/org/repo/42",
+			wantOK:  true,
+			wantRef: prRef{URL: "https://app.graphite.com/github/pr/org/repo/42", Owner: "org", Repo: "repo", Num: "42"},
+		},
+		{
+			name:    "slack-wrapped github URL",
+			input:   "<https://github.com/org/repo/pull/99>",
+			wantOK:  true,
+			wantRef: prRef{URL: "<https://github.com/org/repo/pull/99>", Owner: "org", Repo: "repo", Num: "99"},
+		},
+		{
+			name:    "slack-wrapped graphite URL",
+			input:   "<https://app.graphite.com/github/pr/org/repo/99>",
+			wantOK:  true,
+			wantRef: prRef{URL: "<https://app.graphite.com/github/pr/org/repo/99>", Owner: "org", Repo: "repo", Num: "99"},
+		},
+		{
+			name:    "graphite URL with trailing path segments",
+			input:   "https://app.graphite.com/github/pr/Qumulo/qompass/316/some-branch-name",
+			wantOK:  true,
+			wantRef: prRef{URL: "https://app.graphite.com/github/pr/Qumulo/qompass/316/some-branch-name", Owner: "Qumulo", Repo: "qompass", Num: "316"},
+		},
+		{
+			name:   "not a PR URL",
+			input:  "https://example.com/foo/bar",
+			wantOK: false,
+		},
+		{
+			name:   "empty string",
+			input:  "",
+			wantOK: false,
+		},
+		{
+			name:    "URL embedded in text",
+			input:   "please review https://github.com/org/repo/pull/5 thanks",
+			wantOK:  true,
+			wantRef: prRef{URL: "https://github.com/org/repo/pull/5", Owner: "org", Repo: "repo", Num: "5"},
+		},
+		{
+			name:    "graphite URL embedded in text",
+			input:   "check https://app.graphite.com/github/pr/org/repo/5 please",
+			wantOK:  true,
+			wantRef: prRef{URL: "https://app.graphite.com/github/pr/org/repo/5", Owner: "org", Repo: "repo", Num: "5"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ref, ok := parsePRRef(tt.input)
+			if ok != tt.wantOK {
+				t.Fatalf("parsePRRef(%q) ok = %v, want %v", tt.input, ok, tt.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if ref.Owner != tt.wantRef.Owner || ref.Repo != tt.wantRef.Repo || ref.Num != tt.wantRef.Num {
+				t.Errorf("parsePRRef(%q) = {Owner:%q Repo:%q Num:%q}, want {Owner:%q Repo:%q Num:%q}",
+					tt.input, ref.Owner, ref.Repo, ref.Num, tt.wantRef.Owner, tt.wantRef.Repo, tt.wantRef.Num)
+			}
+			if ref.URL != tt.wantRef.URL {
+				t.Errorf("parsePRRef(%q) URL = %q, want %q", tt.input, ref.URL, tt.wantRef.URL)
+			}
+		})
+	}
+}
+
+func TestFindPRRefs(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		wantLen  int
+		wantNums []string
+	}{
+		{
+			name:     "two github URLs",
+			input:    "review https://github.com/org/repo/pull/1 and https://github.com/org/repo/pull/2",
+			wantLen:  2,
+			wantNums: []string{"1", "2"},
+		},
+		{
+			name:     "mixed github and graphite URLs",
+			input:    "https://github.com/org/repo/pull/1 https://app.graphite.com/github/pr/org/repo/2",
+			wantLen:  2,
+			wantNums: []string{"1", "2"},
+		},
+		{
+			name:     "only graphite URLs",
+			input:    "https://app.graphite.com/github/pr/org/repo/10 https://app.graphite.com/github/pr/org/repo/11",
+			wantLen:  2,
+			wantNums: []string{"10", "11"},
+		},
+		{
+			name:    "no URLs",
+			input:   "just some text",
+			wantLen: 0,
+		},
+		{
+			name:     "duplicate PR via both URL formats deduped",
+			input:    "https://github.com/org/repo/pull/5 https://app.graphite.com/github/pr/org/repo/5",
+			wantLen:  1,
+			wantNums: []string{"5"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			refs := findPRRefs(tt.input)
+			if len(refs) != tt.wantLen {
+				t.Fatalf("findPRRefs(%q) returned %d refs, want %d: %+v", tt.input, len(refs), tt.wantLen, refs)
+			}
+			for i, wantNum := range tt.wantNums {
+				if refs[i].Num != wantNum {
+					t.Errorf("refs[%d].Num = %q, want %q", i, refs[i].Num, wantNum)
+				}
+			}
+		})
+	}
+}
+
+func TestDiscoverStack(t *testing.T) {
+	tests := []struct {
+		name     string
+		startNum int
+		prs      map[int]ghPull
+		wantNums []int
+		wantErr  bool
+	}{
+		{
+			name:     "linear 3-PR stack",
+			startNum: 3,
+			prs: map[int]ghPull{
+				3: {Number: 3, BaseRefName: "feat/step-2", HeadRefName: "feat/step-3"},
+				2: {Number: 2, BaseRefName: "feat/step-1", HeadRefName: "feat/step-2"},
+				1: {Number: 1, BaseRefName: "main", HeadRefName: "feat/step-1"},
+			},
+			wantNums: []int{1, 2, 3},
+		},
+		{
+			name:     "single PR off main",
+			startNum: 10,
+			prs: map[int]ghPull{
+				10: {Number: 10, BaseRefName: "main", HeadRefName: "feat/only"},
+			},
+			wantNums: []int{10},
+		},
+		{
+			name:     "stack with merged middle PR",
+			startNum: 3,
+			prs: map[int]ghPull{
+				3: {Number: 3, BaseRefName: "feat/step-2", HeadRefName: "feat/step-3"},
+				// PR 2 is merged/deleted — no open PR with head=feat/step-2
+				// so lookup for base "feat/step-2" finds nothing
+			},
+			wantNums: []int{3},
+		},
+		{
+			name:     "start from middle of stack",
+			startNum: 2,
+			prs: map[int]ghPull{
+				3: {Number: 3, BaseRefName: "feat/step-2", HeadRefName: "feat/step-3"},
+				2: {Number: 2, BaseRefName: "feat/step-1", HeadRefName: "feat/step-2"},
+				1: {Number: 1, BaseRefName: "main", HeadRefName: "feat/step-1"},
+			},
+			wantNums: []int{1, 2},
+		},
+		{
+			name:     "default branch is master",
+			startNum: 1,
+			prs: map[int]ghPull{
+				1: {Number: 1, BaseRefName: "master", HeadRefName: "feat/thing"},
+			},
+			wantNums: []int{1},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fetcher := &mockPRFetcher{prs: tt.prs}
+			nums, err := discoverStack(context.Background(), fetcher, "org", "repo", tt.startNum)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("discoverStack() err = %v, wantErr = %v", err, tt.wantErr)
+			}
+			if !tt.wantErr && !equalInts(nums, tt.wantNums) {
+				t.Errorf("discoverStack() = %v, want %v", nums, tt.wantNums)
+			}
+		})
+	}
+}
+
+type mockPRFetcher struct {
+	prs map[int]ghPull
+}
+
+func (m *mockPRFetcher) fetchPR(_ context.Context, _, _ string, num int) (ghPull, error) {
+	pr, ok := m.prs[num]
+	if !ok {
+		return ghPull{}, fmt.Errorf("PR #%d not found", num)
+	}
+	return pr, nil
+}
+
+func (m *mockPRFetcher) findPRByHead(_ context.Context, _, _, headRef string) (int, bool) {
+	for _, pr := range m.prs {
+		if pr.HeadRefName == headRef {
+			return pr.Number, true
+		}
+	}
+	return 0, false
+}
+
+func equalInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestIsPRURL(t *testing.T) {
+	tests := []struct {
+		input string
+		want  bool
+	}{
+		{"https://github.com/org/repo/pull/1", true},
+		{"https://app.graphite.com/github/pr/org/repo/1", true},
+		{"<https://github.com/org/repo/pull/1>", true},
+		{"<https://app.graphite.com/github/pr/org/repo/1>", true},
+		{"https://example.com/foo", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			if got := isPRURL(tt.input); got != tt.want {
+				t.Errorf("isPRURL(%q) = %v, want %v", tt.input, got, tt.want)
 			}
 		})
 	}

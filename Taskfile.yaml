@@ -20,31 +20,46 @@ tasks:
       - tmux new-session -d -s {{.TMUX_SESSION}} -c {{.ROOT_DIR}} "./{{.BINARY}}"
 
   deploy:
-    desc: Pull latest code, rebuild, and restart the bot
+    desc: Pull latest code, build and start via Docker Compose
+    cmds:
+      - git pull
+      - sudo docker compose up -d --build
+
+  redeploy:
+    desc: Rebuild from local code and restart via Docker Compose (no git pull)
+    cmds:
+      - sudo docker compose up -d --build
+
+  kill:
+    desc: Stop the bot container
+    cmds:
+      - sudo docker compose down
+
+  logs:
+    desc: Tail live bot output from Docker
+    cmds:
+      - sudo docker compose logs -f
+
+  status:
+    desc: Show container status
+    cmds:
+      - sudo docker compose ps
+      - 'curl -s http://localhost:${HEALTH_PORT:-8080}/metrics | python3 -m json.tool 2>/dev/null || echo "container not responding"'
+
+  post:
+    desc: Post a review request to the running container
+    cmds:
+      - './{{.BINARY}} post {{.CLI_ARGS}}'
+
+  post-remote:
+    desc: Post a review request to a remote container (task post-remote -- <host:port> <pr-url> [flags])
+    cmds:
+      - './{{.BINARY}} post --host {{.CLI_ARGS}}'
+
+  deploy-legacy:
+    desc: "Legacy: Pull, rebuild, restart in tmux (no Docker)"
     cmds:
       - git pull
       - "{{.GO}} build -o {{.BINARY}} ."
       - tmux kill-session -t {{.TMUX_SESSION}} 2>/dev/null || true
       - tmux new-session -d -s {{.TMUX_SESSION}} -c {{.ROOT_DIR}} "./{{.BINARY}}"
-
-  redeploy:
-    desc: Rebuild from local code and restart the bot (no git pull)
-    cmds:
-      - "{{.GO}} build -o {{.BINARY}} ."
-      - tmux kill-session -t {{.TMUX_SESSION}} 2>/dev/null || true
-      - tmux new-session -d -s {{.TMUX_SESSION}} -c {{.ROOT_DIR}} "./{{.BINARY}}"
-
-  kill:
-    desc: Kill the bot tmux session
-    cmds:
-      - tmux kill-session -t {{.TMUX_SESSION}}
-
-  logs:
-    desc: Tail live bot output from tmux
-    cmds:
-      - tmux pipe-pane -t {{.TMUX_SESSION}} -o 'cat >> {{.ROOT_DIR}}/bot.log' && tail -f {{.ROOT_DIR}}/bot.log
-
-  status:
-    desc: Show tmux session status
-    cmds:
-      - tmux capture-pane -t {{.TMUX_SESSION}} -p | tail -20

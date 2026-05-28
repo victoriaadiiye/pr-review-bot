@@ -2,19 +2,29 @@ package main
 
 import (
 	"context"
+	"crypto"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"text/template"
 	"time"
 
@@ -615,11 +625,113 @@ func extractPerspectiveScore(agentName, text string) (review string, ps Perspect
 	return review, ps
 }
 
+type prRef struct {
+	URL   string
+	Owner string
+	Repo  string
+	Num   string
+}
+
+func (r prRef) key() string {
+	return r.Owner + "/" + r.Repo + "/" + r.Num
+}
+
+func (r prRef) githubURL() string {
+	return fmt.Sprintf("https://github.com/%s/%s/pull/%s", r.Owner, r.Repo, r.Num)
+}
+
+type ghPull struct {
+	Number      int    `json:"number"`
+	BaseRefName string `json:"baseRefName"`
+	HeadRefName string `json:"headRefName"`
+}
+
+type PRFetcher interface {
+	fetchPR(ctx context.Context, owner, repo string, num int) (ghPull, error)
+	findPRByHead(ctx context.Context, owner, repo, headRef string) (int, bool)
+}
+
+type ghPRFetcher struct{}
+
+func (g *ghPRFetcher) fetchPR(ctx context.Context, owner, repo string, num int) (ghPull, error) {
+	cmd := exec.CommandContext(ctx, "gh", "pr", "view", strconv.Itoa(num),
+		"--repo", fmt.Sprintf("%s/%s", owner, repo),
+		"--json", "number,baseRefName,headRefName")
+	out, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return ghPull{}, fmt.Errorf("gh pr view #%d: %s", num, string(exitErr.Stderr))
+		}
+		return ghPull{}, fmt.Errorf("gh pr view #%d: %w", num, err)
+	}
+	var pr ghPull
+	if err := json.Unmarshal(out, &pr); err != nil {
+		return ghPull{}, fmt.Errorf("parse PR #%d: %w", num, err)
+	}
+	return pr, nil
+}
+
+func (g *ghPRFetcher) findPRByHead(ctx context.Context, owner, repo, headRef string) (int, bool) {
+	cmd := exec.CommandContext(ctx, "gh", "pr", "list",
+		"--repo", fmt.Sprintf("%s/%s", owner, repo),
+		"--head", headRef,
+		"--state", "open",
+		"--json", "number",
+		"--limit", "1")
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, false
+	}
+	var prs []struct {
+		Number int `json:"number"`
+	}
+	if err := json.Unmarshal(out, &prs); err != nil || len(prs) == 0 {
+		return 0, false
+	}
+	return prs[0].Number, true
+}
+
+var defaultBranches = map[string]bool{"main": true, "master": true, "develop": true}
+
+func discoverStack(ctx context.Context, fetcher PRFetcher, owner, repo string, startNum int) ([]int, error) {
+	var chain []int
+	visited := map[int]bool{}
+	current := startNum
+	for {
+		if visited[current] {
+			break
+		}
+		visited[current] = true
+		pr, err := fetcher.fetchPR(ctx, owner, repo, current)
+		if err != nil {
+			if len(chain) > 0 {
+				break
+			}
+			return nil, fmt.Errorf("discover stack: %w", err)
+		}
+		chain = append(chain, current)
+		if defaultBranches[pr.BaseRefName] {
+			break
+		}
+		below, found := fetcher.findPRByHead(ctx, owner, repo, pr.BaseRefName)
+		if !found {
+			break
+		}
+		current = below
+	}
+	for i, j := 0, len(chain)-1; i < j; i, j = i+1, j-1 {
+		chain[i], chain[j] = chain[j], chain[i]
+	}
+	return chain, nil
+}
+
 var (
-	ghPRPattern          = regexp.MustCompile(`<?https://github\.com/([^/>\s]+)/([^/>\s]+)/pull/(\d+)[^>\s]*>?`)
-	jiraTicketPattern    = regexp.MustCompile(`\b[A-Z]{2,}-\d+\b`)
+	ghPRPattern       = regexp.MustCompile(`<?https://github\.com/([^/>\s]+)/([^/>\s]+)/pull/(\d+)[^>\s]*>?`)
+	graphitePRPattern = regexp.MustCompile(`<?https://app\.graphite\.com/github/pr/([^/>\s]+)/([^/>\s]+)/(\d+)[^>\s]*>?`)
+	jiraTicketPattern = regexp.MustCompile(`\b[A-Z]{2,}-\d+\b`)
 	modePattern          = regexp.MustCompile(`--(initial|re-review|quick|final)\b`)
 	selfPattern          = regexp.MustCompile(`--self\b`)
+	stackPattern         = regexp.MustCompile(`--stack\b`)
 	testPattern          = regexp.MustCompile(`--test\b`)
 	specPattern          = regexp.MustCompile(`--spec\s+(\S+)`)
 	flagPattern          = regexp.MustCompile(`--([a-z][-a-z0-9]*)\b`)
@@ -635,6 +747,39 @@ var (
 	activeReviews   = make(map[string]context.CancelFunc)
 	activeReviewsMu sync.Mutex
 )
+
+func matchToRef(m []string) prRef {
+	return prRef{URL: m[0], Owner: m[1], Repo: m[2], Num: m[3]}
+}
+
+func parsePRRef(text string) (prRef, bool) {
+	for _, pat := range []*regexp.Regexp{ghPRPattern, graphitePRPattern} {
+		if m := pat.FindStringSubmatch(text); m != nil {
+			return matchToRef(m), true
+		}
+	}
+	return prRef{}, false
+}
+
+func findPRRefs(text string) []prRef {
+	seen := map[string]bool{}
+	var refs []prRef
+	for _, pat := range []*regexp.Regexp{ghPRPattern, graphitePRPattern} {
+		for _, m := range pat.FindAllStringSubmatch(text, -1) {
+			ref := matchToRef(m)
+			if !seen[ref.key()] {
+				seen[ref.key()] = true
+				refs = append(refs, ref)
+			}
+		}
+	}
+	return refs
+}
+
+func isPRURL(text string) bool {
+	_, ok := parsePRRef(text)
+	return ok
+}
 
 func reviewKey(ts, id string) string {
 	return ts + "|" + id
@@ -684,6 +829,258 @@ func cancelReview(ts string) bool {
 	return cancelled
 }
 
+func cancelReviewByURL(prURL string) bool {
+	activeReviewsMu.Lock()
+	defer activeReviewsMu.Unlock()
+	suffix := "|" + prURL
+	cancelled := false
+	for key, cancel := range activeReviews {
+		if strings.HasSuffix(key, suffix) {
+			cancel()
+			delete(activeReviews, key)
+			cancelled = true
+			log.Printf("cancelled review %s (via HTTP)", key)
+		}
+	}
+	return cancelled
+}
+
+// --- Review Queue ---
+
+type ReviewJob struct {
+	Fn func()
+}
+
+type ReviewQueue struct {
+	jobs       chan ReviewJob
+	maxWorkers int
+	wg         sync.WaitGroup
+	startTime  time.Time
+	queued     atomic.Int64
+	completed  atomic.Int64
+	dropped    atomic.Int64
+}
+
+func NewReviewQueue(workers, queueSize int) *ReviewQueue {
+	q := &ReviewQueue{
+		jobs:       make(chan ReviewJob, queueSize),
+		maxWorkers: workers,
+		startTime:  time.Now(),
+	}
+	for i := range workers {
+		q.wg.Add(1)
+		go func(id int) {
+			defer q.wg.Done()
+			log.Printf("worker %d started", id)
+			for job := range q.jobs {
+				job.Fn()
+			}
+			log.Printf("worker %d stopped", id)
+		}(i)
+	}
+	log.Printf("review queue: %d workers, %d queue depth", workers, queueSize)
+	return q
+}
+
+func (q *ReviewQueue) Submit(fn func()) bool {
+	q.queued.Add(1)
+	select {
+	case q.jobs <- ReviewJob{Fn: fn}:
+		return true
+	default:
+		q.queued.Add(-1)
+		q.dropped.Add(1)
+		log.Printf("review queue full, dropping job")
+		return false
+	}
+}
+
+func (q *ReviewQueue) Drain() {
+	close(q.jobs)
+	q.wg.Wait()
+}
+
+func (q *ReviewQueue) Stats() (pending int, active int, completed int64, dropped int64) {
+	pending = len(q.jobs)
+	completed = q.completed.Load()
+	dropped = q.dropped.Load()
+	activeReviewsMu.Lock()
+	active = len(activeReviews)
+	activeReviewsMu.Unlock()
+	return
+}
+
+// --- Log Buffer ---
+
+type LogBuffer struct {
+	mu    sync.Mutex
+	lines []string
+	max   int
+}
+
+func NewLogBuffer(max int) *LogBuffer {
+	return &LogBuffer{lines: make([]string, 0, max), max: max}
+}
+
+func (lb *LogBuffer) Write(p []byte) (n int, err error) {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	for _, line := range strings.Split(strings.TrimRight(string(p), "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		if len(lb.lines) >= lb.max {
+			copy(lb.lines, lb.lines[1:])
+			lb.lines = lb.lines[:lb.max-1]
+		}
+		lb.lines = append(lb.lines, line)
+	}
+	return len(p), nil
+}
+
+func (lb *LogBuffer) Lines(after int) ([]string, int) {
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	if after >= len(lb.lines) {
+		return nil, len(lb.lines)
+	}
+	if after < 0 {
+		after = 0
+	}
+	result := make([]string, len(lb.lines)-after)
+	copy(result, lb.lines[after:])
+	return result, len(lb.lines)
+}
+
+// --- Health Server ---
+
+type HealthServer struct {
+	*http.Server
+	Addr string
+}
+
+func startHealthServer(port string, queue *ReviewQueue, logBuf *LogBuffer, reviewHandler func(prURL, flags string)) *HealthServer {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{"status":"ok","uptime":"%s"}`, time.Since(queue.startTime).Round(time.Second))
+	})
+
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		pending, active, completed, dropped := queue.Stats()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"uptime_seconds": int(time.Since(queue.startTime).Seconds()),
+			"queue_pending":  pending,
+			"reviews_active": active,
+			"reviews_done":   completed,
+			"reviews_dropped": dropped,
+			"workers":        queue.maxWorkers,
+		})
+	})
+
+	mux.HandleFunc("/active", func(w http.ResponseWriter, r *http.Request) {
+		activeReviewsMu.Lock()
+		keys := make([]string, 0, len(activeReviews))
+		for key := range activeReviews {
+			keys = append(keys, key)
+		}
+		activeReviewsMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"active": keys})
+	})
+
+	mux.HandleFunc("/logs", func(w http.ResponseWriter, r *http.Request) {
+		after := 0
+		if v := r.URL.Query().Get("after"); v != "" {
+			after, _ = strconv.Atoi(v)
+		}
+		lines, cursor := logBuf.Lines(after)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"lines": lines, "cursor": cursor})
+	})
+
+	mux.HandleFunc("/dashboard", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, dashboardHTML)
+	})
+
+	mux.HandleFunc("/review", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			PRURL string `json:"pr_url"`
+			Flags string `json:"flags"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON"})
+			return
+		}
+		if req.PRURL == "" || !isPRURL(req.PRURL) {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "pr_url must be a valid GitHub or Graphite PR URL"})
+			return
+		}
+		if reviewHandler == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{"error": "review handler not configured"})
+			return
+		}
+		if !queue.Submit(func() {
+			reviewHandler(req.PRURL, req.Flags)
+			queue.completed.Add(1)
+		}) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{"error": "queue full"})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]string{"status": "queued", "pr_url": req.PRURL})
+	})
+
+	mux.HandleFunc("/cancel", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			PRURL string `json:"pr_url"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PRURL == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "pr_url required"})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if cancelReviewByURL(req.PRURL) {
+			json.NewEncoder(w).Encode(map[string]string{"status": "cancelled", "pr_url": req.PRURL})
+		} else {
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]string{"error": "no active review for that URL"})
+		}
+	})
+
+	ln, err := net.Listen("tcp", ":"+port)
+	if err != nil {
+		log.Fatalf("health server listen: %v", err)
+	}
+	srv := &http.Server{Handler: mux}
+	hs := &HealthServer{Server: srv, Addr: ln.Addr().String()}
+	go func() {
+		log.Printf("health server listening on %s", hs.Addr)
+		if err := srv.Serve(ln); err != http.ErrServerClosed {
+			log.Printf("health server error: %v", err)
+		}
+	}()
+	return hs
+}
+
 func findPRInThread(api SlackAPI, channelID, threadTS string) (owner, repo, prNum string, fullText string, ok bool) {
 	msgs, _, _, err := api.GetConversationReplies(&slack.GetConversationRepliesParameters{
 		ChannelID: channelID,
@@ -695,8 +1092,8 @@ func findPRInThread(api SlackAPI, channelID, threadTS string) (owner, repo, prNu
 		return "", "", "", "", false
 	}
 	for _, msg := range msgs {
-		if m := ghPRPattern.FindStringSubmatch(msg.Text); m != nil {
-			return m[1], m[2], m[3], msg.Text, true
+		if ref, ok := parsePRRef(msg.Text); ok {
+			return ref.Owner, ref.Repo, ref.Num, msg.Text, true
 		}
 	}
 	return "", "", "", "", false
@@ -781,8 +1178,8 @@ func handleReactionReview(api SlackAPI, rev *slackevents.ReactionAddedEvent, cha
 		return
 	}
 
-	matches := ghPRPattern.FindAllStringSubmatch(msg.Text, -1)
-	if len(matches) == 0 {
+	refs := findPRRefs(msg.Text)
+	if len(refs) == 0 {
 		log.Printf("no PR URL found in message %s for :claude_it: reaction", rev.Item.Timestamp)
 		return
 	}
@@ -793,9 +1190,9 @@ func handleReactionReview(api SlackAPI, rev *slackevents.ReactionAddedEvent, cha
 		TimeStamp: rev.Item.Timestamp,
 	}
 
-	for _, m := range matches {
-		owner, repo, prNum := m[1], m[2], m[3]
-		prURL := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, prNum)
+	for _, ref := range refs {
+		owner, repo, prNum := ref.Owner, ref.Repo, ref.Num
+		prURL := ref.githubURL()
 		if isReviewActive(prURL) {
 			log.Printf("skipping duplicate :claude_it: review for %s (already in progress)", prURL)
 			continue
@@ -808,18 +1205,47 @@ func handleReactionReview(api SlackAPI, rev *slackevents.ReactionAddedEvent, cha
 
 func runCLI(args []string) {
 	_ = godotenv.Load()
+	initGitHubAuth()
 	repoCache = NewRepoCache()
 	sessionStore = NewSessionStore()
 
 	input := strings.Join(args, " ")
-	m := ghPRPattern.FindStringSubmatch(input)
-	if m == nil {
-		fmt.Fprintf(os.Stderr, "Usage: pr-review-bot review <github-pr-url> [--initial|--quick|--re-review|--final] [--test] [--bare-necessities] [--no-github]\n")
+	ref, ok := parsePRRef(input)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "Usage: pr-review-bot review <pr-url> [--initial|--quick|--re-review|--final] [--test] [--bare-necessities] [--no-github]\n")
 		os.Exit(1)
 	}
-	owner, repo, prNum := m[1], m[2], m[3]
-	prURL := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, prNum)
+	owner, repo, prNum := ref.Owner, ref.Repo, ref.Num
+	prURL := ref.githubURL()
 
+	ctx := context.Background()
+
+	if stackPattern.MatchString(input) {
+		prNumInt, _ := strconv.Atoi(prNum)
+		log.Printf("cli: discovering stack from %s#%d...", repo, prNumInt)
+		fetcher := &ghPRFetcher{}
+		stackNums, err := discoverStack(ctx, fetcher, owner, repo, prNumInt)
+		if err != nil {
+			log.Fatalf("cli: stack discovery failed: %v", err)
+		}
+		log.Printf("cli: found %d PRs in stack: %v", len(stackNums), stackNums)
+
+		stackInput := stackPattern.ReplaceAllString(input, "")
+		for i, num := range stackNums {
+			numStr := strconv.Itoa(num)
+			thisPRURL := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, numStr)
+			thisInput := ghPRPattern.ReplaceAllString(stackInput, thisPRURL)
+			thisInput = graphitePRPattern.ReplaceAllString(thisInput, thisPRURL)
+			log.Printf("cli: === stack PR %d/%d: %s ===", i+1, len(stackNums), thisPRURL)
+			runCLISinglePR(ctx, thisInput, owner, repo, numStr, thisPRURL)
+		}
+		return
+	}
+
+	runCLISinglePR(ctx, input, owner, repo, prNum, prURL)
+}
+
+func runCLISinglePR(ctx context.Context, input, owner, repo, prNum, prURL string) {
 	mode, modeExplicit := parseMode(input)
 	flags := parseFlags(input)
 	onlyAgents := parseOnlyAgents(input)
@@ -834,8 +1260,6 @@ func runCLI(args []string) {
 	if model == "" {
 		model = "claude-opus-4-6"
 	}
-
-	ctx := context.Background()
 
 	log.Printf("cli: fetching diff for %s", prURL)
 	diff, err := fetchDiff(ctx, owner, repo, prNum)
@@ -946,6 +1370,49 @@ func runCLI(args []string) {
 	}
 }
 
+func runPost(args []string) {
+	input := strings.Join(args, " ")
+	ref, ok := parsePRRef(input)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "Usage: pr-review-bot post <pr-url> [--quick|--initial|--re-review|--final] [--host HOST:PORT]\n")
+		os.Exit(1)
+	}
+	prURL := ref.githubURL()
+
+	host := "localhost:8080"
+	if i := strings.Index(input, "--host"); i >= 0 {
+		rest := strings.TrimSpace(input[i+len("--host"):])
+		if parts := strings.Fields(rest); len(parts) > 0 {
+			host = parts[0]
+		}
+	}
+
+	flags := ""
+	for _, f := range []string{"--quick", "--initial", "--re-review", "--final", "--bare-necessities", "--no-github", "--self", "--stack"} {
+		if strings.Contains(input, f) {
+			flags += f + " "
+		}
+	}
+	flags = strings.TrimSpace(flags)
+
+	body, _ := json.Marshal(map[string]string{"pr_url": prURL, "flags": flags})
+	resp, err := http.Post("http://"+host+"/review", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to connect to %s: %v\n", host, err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+
+	var result map[string]string
+	json.NewDecoder(resp.Body).Decode(&result)
+
+	if resp.StatusCode != http.StatusAccepted {
+		fmt.Fprintf(os.Stderr, "Error (%d): %s\n", resp.StatusCode, result["error"])
+		os.Exit(1)
+	}
+	fmt.Printf("Queued review for %s\n", result["pr_url"])
+}
+
 type nopSlack struct{}
 
 func (n *nopSlack) AddReaction(string, slack.ItemRef) error                { return nil }
@@ -963,14 +1430,45 @@ func (n *nopSlack) GetConversationReplies(*slack.GetConversationRepliesParameter
 	return nil, false, "", nil
 }
 
-func parseChannelList(raw string) map[string]bool {
-	m := make(map[string]bool)
-	for _, ch := range strings.Split(raw, ",") {
-		if ch = strings.TrimSpace(ch); ch != "" {
-			m[ch] = true
+func parseWatchedChannels(env string) map[string]bool {
+	if env == "*" {
+		return nil
+	}
+	channels := make(map[string]bool)
+	for _, ch := range strings.Split(env, ",") {
+		ch = strings.TrimSpace(ch)
+		if ch != "" {
+			channels[ch] = true
 		}
 	}
-	return m
+	return channels
+}
+
+func isWatchedChannel(channelID string, watched map[string]bool) bool {
+	if watched == nil {
+		return true
+	}
+	return watched[channelID]
+}
+
+func firstChannel(watched map[string]bool) string {
+	for ch := range watched {
+		return ch
+	}
+	return ""
+}
+
+func envIntOr(key string, fallback int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		log.Printf("invalid %s=%q, using default %d", key, v, fallback)
+		return fallback
+	}
+	return n
 }
 
 func main() {
@@ -978,16 +1476,39 @@ func main() {
 		runCLI(os.Args[2:])
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "post" {
+		runPost(os.Args[2:])
+		return
+	}
 
 	_ = godotenv.Load()
+	initGitHubAuth()
 	repoCache = NewRepoCache()
 	sessionStore = NewSessionStore()
 
 	botToken := mustEnv("SLACK_BOT_TOKEN")
 	appToken := mustEnv("SLACK_APP_TOKEN")
-	watchedChannels := parseChannelList(mustEnv("WATCHED_CHANNEL_ID"))
+	watchedChannels := parseWatchedChannels(mustEnv("WATCHED_CHANNEL_ID"))
 	notifyUserID := mustEnv("NOTIFY_USER_ID")
 	reviewQuestions := os.Getenv("REVIEW_QUESTIONS")
+
+	workers := envIntOr("REVIEW_WORKERS", 3)
+	queueSize := envIntOr("REVIEW_QUEUE_SIZE", 10)
+	healthPort := os.Getenv("HEALTH_PORT")
+	if healthPort == "" {
+		healthPort = "8080"
+	}
+
+	queue := NewReviewQueue(workers, queueSize)
+
+	submitReview := func(api SlackAPI, channel string, fn func()) {
+		if !queue.Submit(func() {
+			fn()
+			queue.completed.Add(1)
+		}) {
+			api.PostMessage(channel, slack.MsgOptionText("Review queue full — try again shortly.", false))
+		}
+	}
 
 	api := slack.New(botToken, slack.OptionAppLevelToken(appToken))
 	authResp, err := api.AuthTest()
@@ -997,6 +1518,31 @@ func main() {
 	botUserID := authResp.UserID
 	log.Printf("bot user ID: %s", botUserID)
 	client := socketmode.New(api)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	reviewHandler := func(prURL, flags string) {
+		ref, ok := parsePRRef(prURL)
+		if !ok {
+			log.Printf("http: invalid PR URL: %s", prURL)
+			return
+		}
+		owner, repo, prNum := ref.Owner, ref.Repo, ref.Num
+		text := prURL + " " + flags
+		msgEv := &slackevents.MessageEvent{
+			Text:      text,
+			Channel:   firstChannel(watchedChannels),
+			TimeStamp: fmt.Sprintf("%d.000000", time.Now().UnixMilli()),
+		}
+		rCtx, cancel := context.WithCancel(ctx)
+		trackReview(msgEv.TimeStamp, prURL, cancel)
+		handlePR(rCtx, api, msgEv, prURL, owner, repo, prNum, msgEv.Channel, notifyUserID, reviewQuestions)
+	}
+	logBuf := NewLogBuffer(500)
+	log.SetOutput(io.MultiWriter(os.Stderr, logBuf))
+
+	healthSrv := startHealthServer(healthPort, queue, logBuf, reviewHandler)
 
 	go func() {
 		for evt := range client.Events {
@@ -1021,7 +1567,9 @@ func main() {
 					}
 				}
 				if rev.Reaction == "claude_it" {
-					go handleReactionReview(api, rev, rev.Item.Channel, notifyUserID, reviewQuestions, watchedChannels, botUserID)
+					submitReview(api, rev.Item.Channel, func() {
+						handleReactionReview(api, rev, rev.Item.Channel, notifyUserID, reviewQuestions, watchedChannels, botUserID)
+					})
 				}
 
 			case string(slackevents.AppMention):
@@ -1033,26 +1581,29 @@ func main() {
 					continue
 				}
 
-				matches := ghPRPattern.FindAllStringSubmatch(ev.Text, -1)
+				refs := findPRRefs(ev.Text)
 				isReviewRequest := reviewRequestPattern.MatchString(ev.Text)
 				inThread := ev.ThreadTimeStamp != ""
 
-				if len(matches) > 0 && isReviewRequest {
+				if len(refs) > 0 && isReviewRequest {
 					msgEv := &slackevents.MessageEvent{
 						Text:      ev.Text,
 						Channel:   ev.Channel,
 						TimeStamp: ev.TimeStamp,
 					}
-					for _, m := range matches {
-						owner, repo, prNum := m[1], m[2], m[3]
-						prURL := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, prNum)
+					for _, ref := range refs {
+						owner, repo, prNum := ref.Owner, ref.Repo, ref.Num
+						prURL := ref.githubURL()
 						if isReviewActive(prURL) {
 							log.Printf("skipping duplicate @mention review for %s (already in progress)", prURL)
 							continue
 						}
-						ctx, cancel := context.WithCancel(context.Background())
+						rCtx, cancel := context.WithCancel(ctx)
 						trackReview(msgEv.TimeStamp, prURL, cancel)
-						go handlePR(ctx, api, msgEv, prURL, owner, repo, prNum, ev.Channel, notifyUserID, reviewQuestions)
+						msgCopy, ownerC, repoC, prNumC, chC := *msgEv, owner, repo, prNum, ev.Channel
+						submitReview(api, ev.Channel, func() {
+							handlePR(rCtx, api, &msgCopy, prURL, ownerC, repoC, prNumC, chC, notifyUserID, reviewQuestions)
+						})
 					}
 					continue
 				}
@@ -1080,16 +1631,21 @@ func main() {
 							Channel:   ev.Channel,
 							TimeStamp: ev.TimeStamp,
 						}
-						ctx, cancel := context.WithCancel(context.Background())
+						rCtx, cancel := context.WithCancel(ctx)
 						trackReview(msgEv.TimeStamp, prURL, cancel)
-						go handlePR(ctx, api, msgEv, prURL, owner, repo, prNum, ev.Channel, notifyUserID, reviewQuestions)
+						msgCopy := *msgEv
+						ownerC, repoC, prNumC, chC := owner, repo, prNum, ev.Channel
+						submitReview(api, ev.Channel, func() {
+							handlePR(rCtx, api, &msgCopy, prURL, ownerC, repoC, prNumC, chC, notifyUserID, reviewQuestions)
+						})
 					} else {
-						ctx, cancel := context.WithCancel(context.Background())
+						rCtx, cancel := context.WithCancel(ctx)
 						trackReview(ev.TimeStamp, prURL, cancel)
-						go func() {
-							defer untrackReview(ev.TimeStamp, prURL)
-							handleThreadFollowup(ctx, api, ev, owner, repo, prNum, notifyUserID)
-						}()
+						evCopy := *ev
+						submitReview(api, ev.Channel, func() {
+							defer untrackReview(evCopy.TimeStamp, prURL)
+							handleThreadFollowup(rCtx, api, &evCopy, owner, repo, prNum, notifyUserID)
+						})
 					}
 				}
 
@@ -1098,34 +1654,48 @@ func main() {
 				if !ok || ev.BotID != "" || ev.SubType != "" {
 					continue
 				}
-				if !watchedChannels[ev.Channel] {
+				if !isWatchedChannel(ev.Channel, watchedChannels) {
 					continue
 				}
 
-				matches := ghPRPattern.FindAllStringSubmatch(ev.Text, -1)
-				if len(matches) == 0 {
+				refs := findPRRefs(ev.Text)
+				if len(refs) == 0 {
 					continue
 				}
 
-				for _, m := range matches {
-					owner, repo, prNum := m[1], m[2], m[3]
-					prURL := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, prNum)
+				for _, ref := range refs {
+					owner, repo, prNum := ref.Owner, ref.Repo, ref.Num
+					prURL := ref.githubURL()
 					if isReviewActive(prURL) {
 						log.Printf("skipping duplicate auto-review for %s (already in progress)", prURL)
 						continue
 					}
-					ctx, cancel := context.WithCancel(context.Background())
+					rCtx, cancel := context.WithCancel(ctx)
 					trackReview(ev.TimeStamp, prURL, cancel)
-					go handlePR(ctx, api, ev, prURL, owner, repo, prNum, ev.Channel, notifyUserID, reviewQuestions)
+					evCopy, ownerC, repoC, prNumC, chC := *ev, owner, repo, prNum, ev.Channel
+					submitReview(api, ev.Channel, func() {
+						handlePR(rCtx, api, &evCopy, prURL, ownerC, repoC, prNumC, chC, notifyUserID, reviewQuestions)
+					})
 				}
 			}
 		}
 	}()
 
 	log.Println("PR Review Bot running...")
-	if err := client.Run(); err != nil {
-		log.Fatal(err)
-	}
+
+	go func() {
+		if err := client.RunContext(ctx); err != nil && ctx.Err() == nil {
+			log.Fatalf("slack client error: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	log.Println("shutting down — draining active reviews...")
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	healthSrv.Shutdown(shutdownCtx)
+	queue.Drain()
+	log.Println("shutdown complete")
 }
 
 func parseMode(text string) (ReviewMode, bool) {
@@ -1145,7 +1715,7 @@ func parseSpecPath(text string) string {
 func parseFlags(text string) map[string]bool {
 	reserved := map[string]bool{
 		"initial": true, "re-review": true, "quick": true, "final": true,
-		"self": true, "spec": true, "test": true, "no-github": true, "only": true,
+		"self": true, "spec": true, "test": true, "no-github": true, "only": true, "stack": true,
 	}
 	flags := make(map[string]bool)
 	for _, m := range flagPattern.FindAllStringSubmatch(text, -1) {
@@ -1250,6 +1820,7 @@ func resolveMaxTurns(agent agentFile, thorough bool) int {
 
 func parseJiraTicket(text string) string {
 	cleaned := ghPRPattern.ReplaceAllString(text, "")
+	cleaned = graphitePRPattern.ReplaceAllString(cleaned, "")
 	cleaned = modePattern.ReplaceAllString(cleaned, "")
 	cleaned = selfPattern.ReplaceAllString(cleaned, "")
 	cleaned = specPattern.ReplaceAllString(cleaned, "")
@@ -1262,6 +1833,32 @@ func parseJiraTicket(text string) string {
 func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, prURL, owner, repo, prNum, channelID, notifyUserID, reviewQuestions string) {
 	defer untrackReview(ev.TimeStamp, prURL)
 
+	if stackPattern.MatchString(ev.Text) {
+		prNumInt, _ := strconv.Atoi(prNum)
+		dmUser(api, notifyUserID, fmt.Sprintf("Discovering stack from <%s>...", prURL))
+		fetcher := &ghPRFetcher{}
+		stackNums, err := discoverStack(ctx, fetcher, owner, repo, prNumInt)
+		if err != nil {
+			postError(api, ev, prURL, channelID, notifyUserID, fmt.Errorf("stack discovery: %w", err))
+			return
+		}
+		dmUser(api, notifyUserID, fmt.Sprintf("Found %d PRs in stack: %v — reviewing each...", len(stackNums), stackNums))
+		cleanText := stackPattern.ReplaceAllString(ev.Text, "")
+		for i, num := range stackNums {
+			numStr := strconv.Itoa(num)
+			thisPRURL := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, numStr)
+			log.Printf("stack: reviewing PR %d/%d: %s", i+1, len(stackNums), thisPRURL)
+			stackEv := *ev
+			stackEv.Text = cleanText
+			handleSinglePR(ctx, api, &stackEv, thisPRURL, owner, repo, numStr, channelID, notifyUserID, reviewQuestions)
+		}
+		return
+	}
+
+	handleSinglePR(ctx, api, ev, prURL, owner, repo, prNum, channelID, notifyUserID, reviewQuestions)
+}
+
+func handleSinglePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, prURL, owner, repo, prNum, channelID, notifyUserID, reviewQuestions string) {
 	mode, modeExplicit := parseMode(ev.Text)
 	selfReview := selfPattern.MatchString(ev.Text)
 	jiraTicket := parseJiraTicket(ev.Text)
@@ -1507,6 +2104,175 @@ func handlePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEvent, p
 	_ = api.AddReaction("white_check_mark", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 
 	dmUser(api, notifyUserID, fmt.Sprintf("Done! %s review for <%s> posted on GitHub and in <#%s>.%s\nUsage: %s\n\n%s", modeLabel, prURL, channelID, scoreMsg, stats, metrics))
+}
+
+// --- GitHub App Auth ---
+
+type GitHubAppAuth struct {
+	appID      string
+	privateKey *rsa.PrivateKey
+	mu         sync.Mutex
+	token      string
+	expiresAt  time.Time
+}
+
+func NewGitHubAppAuth() *GitHubAppAuth {
+	appID := os.Getenv("GITHUB_APP_ID")
+	keyFile := os.Getenv("GITHUB_PRIVATE_KEY_FILE")
+	if appID == "" || keyFile == "" {
+		return nil
+	}
+	keyPEM, err := os.ReadFile(keyFile)
+	if err != nil {
+		log.Fatalf("github-app: failed to read private key %s: %v", keyFile, err)
+	}
+	block, _ := pem.Decode(keyPEM)
+	if block == nil {
+		log.Fatalf("github-app: no PEM block found in %s", keyFile)
+	}
+	key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	if err != nil {
+		// Try PKCS8 format
+		k, err2 := x509.ParsePKCS8PrivateKey(block.Bytes)
+		if err2 != nil {
+			log.Fatalf("github-app: failed to parse private key: %v / %v", err, err2)
+		}
+		var ok bool
+		key, ok = k.(*rsa.PrivateKey)
+		if !ok {
+			log.Fatalf("github-app: private key is not RSA")
+		}
+	}
+	log.Printf("github-app: configured for app %s", appID)
+	return &GitHubAppAuth{appID: appID, privateKey: key}
+}
+
+func (g *GitHubAppAuth) signJWT() (string, error) {
+	now := time.Now()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT"}`))
+	payload := fmt.Sprintf(`{"iat":%d,"exp":%d,"iss":%s}`, now.Add(-60*time.Second).Unix(), now.Add(10*time.Minute).Unix(), g.appID)
+	payload64 := base64.RawURLEncoding.EncodeToString([]byte(payload))
+	sigInput := header + "." + payload64
+	h := sha256.Sum256([]byte(sigInput))
+	sig, err := rsa.SignPKCS1v15(nil, g.privateKey, crypto.SHA256, h[:])
+	if err != nil {
+		return "", fmt.Errorf("sign JWT: %w", err)
+	}
+	return sigInput + "." + base64.RawURLEncoding.EncodeToString(sig), nil
+}
+
+func (g *GitHubAppAuth) findInstallationID(jwt string) (int64, error) {
+	req, _ := http.NewRequest("GET", "https://api.github.com/app/installations", nil)
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("list installations: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return 0, fmt.Errorf("list installations: %s %s", resp.Status, body)
+	}
+	var installations []struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&installations); err != nil {
+		return 0, fmt.Errorf("decode installations: %w", err)
+	}
+	if len(installations) == 0 {
+		return 0, fmt.Errorf("no installations found for app %s", g.appID)
+	}
+	return installations[0].ID, nil
+}
+
+func (g *GitHubAppAuth) createInstallationToken(jwt string, installID int64) (string, time.Time, error) {
+	url := fmt.Sprintf("https://api.github.com/app/installations/%d/access_tokens", installID)
+	req, _ := http.NewRequest("POST", url, nil)
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("create installation token: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 201 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", time.Time{}, fmt.Errorf("create installation token: %s %s", resp.Status, body)
+	}
+	var result struct {
+		Token     string    `json:"token"`
+		ExpiresAt time.Time `json:"expires_at"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", time.Time{}, fmt.Errorf("decode token response: %w", err)
+	}
+	return result.Token, result.ExpiresAt, nil
+}
+
+func (g *GitHubAppAuth) Token() (string, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.token != "" && time.Now().Before(g.expiresAt.Add(-5*time.Minute)) {
+		return g.token, nil
+	}
+
+	jwt, err := g.signJWT()
+	if err != nil {
+		return "", err
+	}
+	installID, err := g.findInstallationID(jwt)
+	if err != nil {
+		return "", err
+	}
+	token, expiresAt, err := g.createInstallationToken(jwt, installID)
+	if err != nil {
+		return "", err
+	}
+	g.token = token
+	g.expiresAt = expiresAt
+	log.Printf("github-app: minted installation token (expires %s)", expiresAt.Format(time.RFC3339))
+	return token, nil
+}
+
+func (g *GitHubAppAuth) Env() error {
+	token, err := g.Token()
+	if err != nil {
+		return fmt.Errorf("github-app: %w", err)
+	}
+	os.Setenv("GITHUB_TOKEN", token)
+	os.Setenv("GH_TOKEN", token)
+	return nil
+}
+
+func initGitHubAuth() {
+	app := NewGitHubAppAuth()
+	if app == nil {
+		if os.Getenv("GITHUB_TOKEN") == "" && os.Getenv("GH_TOKEN") == "" {
+			log.Println("warning: no GitHub auth configured (set GITHUB_APP_ID+GITHUB_PRIVATE_KEY_FILE or GITHUB_TOKEN)")
+		}
+		return
+	}
+	if err := app.Env(); err != nil {
+		log.Fatalf("%v", err)
+	}
+	// Refresh token in background before it expires
+	go func() {
+		for {
+			app.mu.Lock()
+			sleepUntil := app.expiresAt.Add(-10 * time.Minute)
+			app.mu.Unlock()
+			delay := time.Until(sleepUntil)
+			if delay < time.Minute {
+				delay = time.Minute
+			}
+			time.Sleep(delay)
+			if err := app.Env(); err != nil {
+				log.Printf("github-app: token refresh failed: %v", err)
+			}
+		}
+	}()
 }
 
 // --- Repo Cache ---
@@ -2664,6 +3430,120 @@ Be specific about what changed. Reference files and lines.
 	log.Printf("delta-re-review: done for %s ($%.4f)", req.PRURL, resp.TotalCostUSD)
 	return text, resp, nil
 }
+
+const dashboardHTML = `<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PR Review Bot</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:system-ui,-apple-system,sans-serif;background:#0d1117;color:#c9d1d9;padding:24px}
+h1{font-size:1.4rem;margin-bottom:16px;color:#58a6ff}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:24px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;text-align:center}
+.card .value{font-size:2rem;font-weight:700;color:#58a6ff}
+.card .label{font-size:.75rem;color:#8b949e;text-transform:uppercase;margin-top:4px}
+.card.warn .value{color:#d29922}
+.card.bad .value{color:#f85149}
+.card.good .value{color:#3fb950}
+.section{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:16px}
+.section h2{font-size:.9rem;color:#8b949e;margin-bottom:8px;text-transform:uppercase}
+.active-item{padding:8px 12px;border-bottom:1px solid #21262d;font-family:monospace;font-size:.85rem;display:flex;justify-content:space-between;align-items:center}
+.active-item:last-child{border-bottom:none}
+.cancel-btn{background:#da3633;color:#fff;border:none;border-radius:4px;padding:2px 10px;font-size:.75rem;cursor:pointer}
+.cancel-btn:hover{background:#f85149}
+.empty{color:#484f58;font-style:italic;padding:8px 0}
+.bar{height:6px;background:#21262d;border-radius:3px;margin-top:8px;overflow:hidden}
+.bar .fill{height:100%;background:#58a6ff;border-radius:3px;transition:width .3s}
+.status{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px}
+.status.ok{background:#3fb950}.status.down{background:#f85149}
+footer{margin-top:24px;font-size:.7rem;color:#484f58;text-align:center}
+#conn{position:fixed;top:12px;right:16px;font-size:.75rem}
+</style></head>
+<body>
+<div id="conn"><span class="status down" id="dot"></span><span id="conn-text">connecting...</span></div>
+<h1>PR Review Bot</h1>
+<div class="grid">
+  <div class="card" id="c-workers"><div class="value" id="v-workers">-</div><div class="label">Workers</div></div>
+  <div class="card" id="c-active"><div class="value" id="v-active">-</div><div class="label">Active</div></div>
+  <div class="card" id="c-pending"><div class="value" id="v-pending">-</div><div class="label">Queued</div></div>
+  <div class="card good" id="c-done"><div class="value" id="v-done">-</div><div class="label">Completed</div></div>
+  <div class="card" id="c-dropped"><div class="value" id="v-dropped">-</div><div class="label">Dropped</div></div>
+  <div class="card" id="c-uptime"><div class="value" id="v-uptime">-</div><div class="label">Uptime</div></div>
+</div>
+<div class="section">
+  <h2>Worker Utilization</h2>
+  <div class="bar"><div class="fill" id="util-bar"></div></div>
+  <div style="text-align:right;font-size:.75rem;color:#8b949e;margin-top:4px" id="util-text">-</div>
+</div>
+<div class="section">
+  <h2>Active Reviews</h2>
+  <div id="active-list"><div class="empty">No active reviews</div></div>
+</div>
+<div class="section">
+  <h2>Logs</h2>
+  <div id="log-box" style="max-height:400px;overflow-y:auto;font-family:monospace;font-size:.8rem;line-height:1.5;white-space:pre-wrap;word-break:break-all;color:#8b949e"></div>
+</div>
+<footer>Polling every 3s</footer>
+<script>
+const $ = id => document.getElementById(id);
+function fmtUptime(s) {
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s/60) + "m " + (s%60) + "s";
+  const h = Math.floor(s/3600); return h + "h " + Math.floor((s%3600)/60) + "m";
+}
+async function poll() {
+  try {
+    const [mRes, aRes] = await Promise.all([fetch("/metrics"), fetch("/active")]);
+    const m = await mRes.json(), a = await aRes.json();
+    $("v-workers").textContent = m.workers;
+    $("v-active").textContent = m.reviews_active;
+    $("v-pending").textContent = m.queue_pending;
+    $("v-done").textContent = m.reviews_done;
+    $("v-dropped").textContent = m.reviews_dropped;
+    $("v-uptime").textContent = fmtUptime(m.uptime_seconds);
+    $("c-dropped").className = "card" + (m.reviews_dropped > 0 ? " bad" : "");
+    $("c-active").className = "card" + (m.reviews_active > 0 ? " warn" : "");
+    $("c-pending").className = "card" + (m.queue_pending > 0 ? " warn" : "");
+    const pct = m.workers > 0 ? Math.round((m.reviews_active / m.workers) * 100) : 0;
+    $("util-bar").style.width = pct + "%";
+    $("util-text").textContent = m.reviews_active + "/" + m.workers + " (" + pct + "%)";
+    const list = $("active-list");
+    if (a.active && a.active.length > 0) {
+      list.innerHTML = a.active.map(k => {
+        const parts = k.split("|"); const pr = parts.length > 1 ? parts[1] : k;
+        return '<div class="active-item"><span>' + pr.replace(/</g,"&lt;") + '</span><button class="cancel-btn" onclick="cancelReview(\'' + pr.replace(/'/g,"\\'") + '\')">Cancel</button></div>';
+      }).join("");
+    } else { list.innerHTML = '<div class="empty">No active reviews</div>'; }
+    $("dot").className = "status ok"; $("conn-text").textContent = "live";
+  } catch(e) {
+    $("dot").className = "status down"; $("conn-text").textContent = "disconnected";
+  }
+}
+let logCursor = 0;
+async function pollLogs() {
+  try {
+    const res = await fetch("/logs?after=" + logCursor);
+    const d = await res.json();
+    if (d.lines && d.lines.length > 0) {
+      const box = $("log-box");
+      const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+      box.innerHTML += d.lines.map(l => '<div>' + l.replace(/</g,"&lt;") + '</div>').join("");
+      logCursor = d.cursor;
+      if (atBottom) box.scrollTop = box.scrollHeight;
+    }
+  } catch(e) {}
+}
+async function cancelReview(prURL) {
+  if (!confirm("Cancel review for " + prURL + "?")) return;
+  try {
+    const res = await fetch("/cancel", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({pr_url:prURL})});
+    const d = await res.json();
+    if (res.ok) { poll(); } else { alert(d.error || "Cancel failed"); }
+  } catch(e) { alert("Failed to reach server"); }
+}
+poll(); pollLogs(); setInterval(poll, 3000); setInterval(pollLogs, 2000);
+</script></body></html>`
 
 const diffScopeRule = `IMPORTANT: Only raise issues about code that appears in the diff below. Do not speculate about code outside the diff, do not flag pre-existing issues in unchanged code, and do not hallucinate file contents you cannot see. Every finding must quote the exact code from the diff. If the diff is clean, say so.
 
