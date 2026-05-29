@@ -338,21 +338,91 @@ func extractCriticalIssues(mergedText string) []string {
 	return issues
 }
 
-func computeDiffStats(diff string) ReviewMemoryDiffSt {
-	var additions, deletions int
-	for _, line := range strings.Split(diff, "\n") {
-		if strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++") {
-			additions++
-		} else if strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---") {
-			deletions++
+type FileDiffStat struct {
+	Path      string `json:"path"`
+	Additions int    `json:"additions"`
+	Deletions int    `json:"deletions"`
+}
+
+func computePerFileDiffStats(diff string) []FileDiffStat {
+	fileMap := splitDiffByFile(diff)
+	stats := make([]FileDiffStat, 0, len(fileMap))
+	for path, content := range fileMap {
+		var add, del int
+		for _, line := range strings.Split(content, "\n") {
+			if strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++") {
+				add++
+			} else if strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---") {
+				del++
+			}
 		}
+		stats = append(stats, FileDiffStat{Path: path, Additions: add, Deletions: del})
 	}
-	files := splitDiffByFile(diff)
+	sort.Slice(stats, func(i, j int) bool {
+		return (stats[i].Additions + stats[i].Deletions) > (stats[j].Additions + stats[j].Deletions)
+	})
+	return stats
+}
+
+func computeDiffStats(diff string) ReviewMemoryDiffSt {
+	perFile := computePerFileDiffStats(diff)
+	var additions, deletions int
+	for _, f := range perFile {
+		additions += f.Additions
+		deletions += f.Deletions
+	}
 	return ReviewMemoryDiffSt{
-		Files:     len(files),
+		Files:     len(perFile),
 		Additions: additions,
 		Deletions: deletions,
 	}
+}
+
+func formatDiffStats(diff string) string {
+	perFile := computePerFileDiffStats(diff)
+	if len(perFile) == 0 {
+		return "0 files changed"
+	}
+	var totalAdd, totalDel int
+	var lines []string
+	for _, f := range perFile {
+		totalAdd += f.Additions
+		totalDel += f.Deletions
+		lines = append(lines, fmt.Sprintf("  %s: +%d/-%d", f.Path, f.Additions, f.Deletions))
+	}
+	header := fmt.Sprintf("%d file(s), +%d/-%d LOC", len(perFile), totalAdd, totalDel)
+	return header + "\n" + strings.Join(lines, "\n")
+}
+
+func formatDiffStatsOneLine(diff string) string {
+	perFile := computePerFileDiffStats(diff)
+	if len(perFile) == 0 {
+		return "0 files changed"
+	}
+	var totalAdd, totalDel int
+	var parts []string
+	for _, f := range perFile {
+		totalAdd += f.Additions
+		totalDel += f.Deletions
+		parts = append(parts, fmt.Sprintf("%s +%d/-%d", filepath.Base(f.Path), f.Additions, f.Deletions))
+	}
+	return fmt.Sprintf("%d file(s), +%d/-%d LOC: %s", len(perFile), totalAdd, totalDel, strings.Join(parts, ", "))
+}
+
+func formatDiffStatsSlack(diff string) string {
+	perFile := computePerFileDiffStats(diff)
+	if len(perFile) == 0 {
+		return "0 files changed"
+	}
+	var totalAdd, totalDel int
+	var lines []string
+	for _, f := range perFile {
+		totalAdd += f.Additions
+		totalDel += f.Deletions
+		lines = append(lines, fmt.Sprintf(">   `%s` +%d/-%d", f.Path, f.Additions, f.Deletions))
+	}
+	header := fmt.Sprintf("*%d file(s), +%d/-%d LOC:*", len(perFile), totalAdd, totalDel)
+	return header + "\n" + strings.Join(lines, "\n")
 }
 
 func buildReviewMemory(req ReviewRequest, mergedText string, score *ScoreResult, perspectiveScores []PerspectiveScore) *ReviewMemory {
@@ -912,13 +982,18 @@ func (q *ReviewQueue) Stats() (pending int, active int, completed int64, dropped
 // --- Log Buffer ---
 
 type LogBuffer struct {
-	mu    sync.Mutex
-	lines []string
-	max   int
+	mu          sync.Mutex
+	lines       []string
+	max         int
+	subscribers map[chan string]struct{}
 }
 
 func NewLogBuffer(max int) *LogBuffer {
-	return &LogBuffer{lines: make([]string, 0, max), max: max}
+	return &LogBuffer{
+		lines:       make([]string, 0, max),
+		max:         max,
+		subscribers: make(map[chan string]struct{}),
+	}
 }
 
 func (lb *LogBuffer) Write(p []byte) (n int, err error) {
@@ -933,6 +1008,12 @@ func (lb *LogBuffer) Write(p []byte) (n int, err error) {
 			lb.lines = lb.lines[:lb.max-1]
 		}
 		lb.lines = append(lb.lines, line)
+		for ch := range lb.subscribers {
+			select {
+			case ch <- line:
+			default:
+			}
+		}
 	}
 	return len(p), nil
 }
@@ -949,6 +1030,21 @@ func (lb *LogBuffer) Lines(after int) ([]string, int) {
 	result := make([]string, len(lb.lines)-after)
 	copy(result, lb.lines[after:])
 	return result, len(lb.lines)
+}
+
+func (lb *LogBuffer) Subscribe() chan string {
+	ch := make(chan string, 64)
+	lb.mu.Lock()
+	lb.subscribers[ch] = struct{}{}
+	lb.mu.Unlock()
+	return ch
+}
+
+func (lb *LogBuffer) Unsubscribe(ch chan string) {
+	lb.mu.Lock()
+	delete(lb.subscribers, ch)
+	lb.mu.Unlock()
+	close(ch)
 }
 
 // --- Health Server ---
@@ -1004,6 +1100,34 @@ func startHealthServer(port string, queue *ReviewQueue, logBuf *LogBuffer, revie
 	mux.HandleFunc("/dashboard", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		fmt.Fprint(w, dashboardHTML)
+	})
+
+	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming not supported", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+
+		ch := logBuf.Subscribe()
+		defer logBuf.Unsubscribe(ch)
+
+		ctx := r.Context()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case line, ok := <-ch:
+				if !ok {
+					return
+				}
+				fmt.Fprintf(w, "data: %s\n\n", line)
+				flusher.Flush()
+			}
+		}
 	})
 
 	mux.HandleFunc("/review", func(w http.ResponseWriter, r *http.Request) {
@@ -1267,7 +1391,7 @@ func runCLISinglePR(ctx context.Context, input, owner, repo, prNum, prURL string
 	if err != nil {
 		log.Fatalf("cli: failed to fetch diff: %v", err)
 	}
-	log.Printf("cli: diff fetched (%d chars, %d lines)", len(diff), diffLines(diff))
+	log.Printf("cli: diff fetched:\n%s", formatDiffStats(diff))
 
 	if testPattern.MatchString(input) {
 		agents, _ := loadAgents()
@@ -1300,7 +1424,7 @@ func runCLISinglePR(ctx context.Context, input, owner, repo, prNum, prURL string
 		ghLatency := time.Since(ghStart).Round(time.Millisecond)
 
 		fmt.Printf("Test run for %s\n", prURL)
-		fmt.Printf("  Diff:       %d chars, %d lines\n", len(diff), diffLines(diff))
+		fmt.Printf("  Diff:\n%s\n", formatDiffStats(diff))
 		fmt.Printf("  Model:      %s\n", model)
 		fmt.Printf("  Mode:       %s\n", mode)
 		fmt.Printf("  Agents:     %s\n", strings.Join(names, ", "))
@@ -1919,7 +2043,7 @@ func handleSinglePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEv
 		for _, a := range filtered {
 			agentNames = append(agentNames, a.name)
 		}
-		lines := diffLines(diff)
+		diffStatsSlack := formatDiffStatsSlack(diff)
 
 		claudeStatus := "ok"
 		claudeStart := time.Now()
@@ -1941,7 +2065,7 @@ func handleSinglePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEv
 		ghLatency := time.Since(ghStart).Round(time.Millisecond)
 
 		msg := fmt.Sprintf("*Test run for <%s>*\n"+
-			"> *Diff:* %d chars, %d lines\n"+
+			"> *Diff:* %s\n"+
 			"> *Model:* `%s`\n"+
 			"> *Mode:* %s\n"+
 			"> *Agents:* %s\n"+
@@ -1954,7 +2078,7 @@ func handleSinglePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEv
 			">   • git diff: fetched (%s)\n"+
 			">\n"+
 			"> No agents were run. Use without `--test` to run a full review.",
-			prURL, len(diff), lines, model, mode,
+			prURL, diffStatsSlack, model, mode,
 			strings.Join(agentNames, ", "), ev.User, ev.Channel,
 			claudeStatus, claudeVersion, claudeLatency,
 			ghStatus, ghLatency,
@@ -1965,7 +2089,7 @@ func handleSinglePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEv
 			slack.MsgOptionText(msg, false),
 			slack.MsgOptionTS(ev.TimeStamp))
 		dmUser(api, notifyUserID, msg)
-		log.Printf("test run: completed for %s (claude=%s, gh=%s, diff=%d lines)", prURL, claudeStatus, ghStatus, lines)
+		log.Printf("test run: completed for %s (claude=%s, gh=%s, diff=%s)", prURL, claudeStatus, ghStatus, formatDiffStatsOneLine(diff))
 		return
 	}
 
@@ -2014,10 +2138,10 @@ func handleSinglePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEv
 	}
 
 	if mode == ModeReReview {
-		dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Running delta re-review...", len(diff)))
+		dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%s). Running delta re-review...", formatDiffStatsOneLine(diff)))
 	} else {
 		if mode == ModeQuick {
-			dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Launching 1 agent in %s mode...", len(diff), mode))
+			dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%s). Launching 1 agent in %s mode...", formatDiffStatsOneLine(diff), mode))
 		} else {
 			agents, agentErr := loadAgents()
 			agentCount := 0
@@ -2028,7 +2152,7 @@ func handleSinglePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEv
 				filtered = filterOnlyAgents(filtered, onlyAgents)
 				agentCount = len(filtered)
 			}
-			dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%d chars). Launching %d agent(s) in %s mode...", len(diff), agentCount, mode))
+			dmUser(api, notifyUserID, fmt.Sprintf("Diff fetched (%s). Launching %d agent(s) in %s mode...", formatDiffStatsOneLine(diff), agentCount, mode))
 		}
 	}
 
@@ -2625,8 +2749,7 @@ func buildSmartDiff(ctx context.Context, gitDir, mergeBase, prRef string, prFile
 	}
 	fullDiff := string(out)
 
-	fileCount := len(diffFilePattern.FindAllString(fullDiff, -1))
-	log.Printf("repo-cache: diff is %d chars, %d file(s)", len(fullDiff), fileCount)
+	log.Printf("repo-cache: diff fetched:\n%s", formatDiffStats(fullDiff))
 
 	if len(fullDiff) <= maxChars {
 		return fullDiff, nil
@@ -3353,10 +3476,10 @@ footer{margin-top:24px;font-size:.7rem;color:#484f58;text-align:center}
   <div id="active-list"><div class="empty">No active reviews</div></div>
 </div>
 <div class="section">
-  <h2>Logs</h2>
+  <h2>Logs <span id="log-mode" style="font-size:.7rem;color:#3fb950;font-weight:normal"></span></h2>
   <div id="log-box" style="max-height:400px;overflow-y:auto;font-family:monospace;font-size:.8rem;line-height:1.5;white-space:pre-wrap;word-break:break-all;color:#8b949e"></div>
 </div>
-<footer>Polling every 3s</footer>
+<footer>Metrics poll 3s · Logs stream via SSE</footer>
 <script>
 const $ = id => document.getElementById(id);
 function fmtUptime(s) {
@@ -3392,18 +3515,30 @@ async function poll() {
     $("dot").className = "status down"; $("conn-text").textContent = "disconnected";
   }
 }
-let logCursor = 0;
-async function pollLogs() {
+function appendLog(line) {
+  const box = $("log-box");
+  const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+  const div = document.createElement("div");
+  div.textContent = line;
+  box.appendChild(div);
+  while (box.children.length > 500) box.removeChild(box.firstChild);
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+function connectSSE() {
+  const es = new EventSource("/events");
+  es.onopen = () => { $("log-mode").textContent = "(live)"; };
+  es.onmessage = (e) => { appendLog(e.data); };
+  es.onerror = () => {
+    $("log-mode").textContent = "(reconnecting...)";
+    es.close();
+    setTimeout(connectSSE, 3000);
+  };
+}
+async function loadInitialLogs() {
   try {
-    const res = await fetch("/logs?after=" + logCursor);
+    const res = await fetch("/logs?after=0");
     const d = await res.json();
-    if (d.lines && d.lines.length > 0) {
-      const box = $("log-box");
-      const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
-      box.innerHTML += d.lines.map(l => '<div>' + l.replace(/</g,"&lt;") + '</div>').join("");
-      logCursor = d.cursor;
-      if (atBottom) box.scrollTop = box.scrollHeight;
-    }
+    if (d.lines) d.lines.forEach(l => appendLog(l));
   } catch(e) {}
 }
 async function cancelReview(prURL) {
@@ -3414,7 +3549,7 @@ async function cancelReview(prURL) {
     if (res.ok) { poll(); } else { alert(d.error || "Cancel failed"); }
   } catch(e) { alert("Failed to reach server"); }
 }
-poll(); pollLogs(); setInterval(poll, 3000); setInterval(pollLogs, 2000);
+poll(); setInterval(poll, 3000); loadInitialLogs().then(connectSSE);
 </script></body></html>`
 
 func runFlaggedAgents(ctx context.Context, req ReviewRequest, logDir, contextBlock, questionsStr string, stats *UsageStats) (string, bool) {
