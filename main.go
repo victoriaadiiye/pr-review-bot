@@ -1557,12 +1557,12 @@ func findPRInThread(api SlackAPI, channelID, threadTS string) (owner, repo, prNu
 func handleThreadFollowup(ctx context.Context, api SlackAPI, ev *slackevents.AppMentionEvent, owner, repo, prNum, notifyUserID string) {
 	prURL := fmt.Sprintf("https://github.com/%s/%s/pull/%s", owner, repo, prNum)
 
-	_ = api.AddReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+	_ = api.AddReaction("claude-intesifies", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 
 	diff, err := fetchDiff(ctx, owner, repo, prNum)
 	if err != nil {
-		_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
-		_ = api.AddReaction("x", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+		_ = api.RemoveReaction("claude-intesifies", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+		_ = api.AddReaction("qumulo-oh-no", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 		_, _, _ = api.PostMessage(ev.Channel,
 			slack.MsgOptionText(fmt.Sprintf("Failed to fetch diff for <%s>: %v", prURL, err), false),
 			slack.MsgOptionTS(ev.ThreadTimeStamp))
@@ -1600,8 +1600,8 @@ Answer the question concisely based on the diff and thread context. Be specific 
 
 	answer, _, err := runClaude(ctx, prompt)
 	if err != nil {
-		_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
-		_ = api.AddReaction("x", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+		_ = api.RemoveReaction("claude-intesifies", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+		_ = api.AddReaction("qumulo-oh-no", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 		_, _, _ = api.PostMessage(ev.Channel,
 			slack.MsgOptionText(fmt.Sprintf("Failed to answer: %v", err), false),
 			slack.MsgOptionTS(ev.ThreadTimeStamp))
@@ -1611,7 +1611,7 @@ Answer the question concisely based on the diff and thread context. Be specific 
 	_, _, _ = api.PostMessage(ev.Channel,
 		slack.MsgOptionText(answer, false),
 		slack.MsgOptionTS(ev.ThreadTimeStamp))
-	_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+	_ = api.RemoveReaction("claude-intesifies", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 	dmUser(api, notifyUserID, fmt.Sprintf("Answered follow-up question in thread for <%s>", prURL))
 }
 
@@ -1957,12 +1957,15 @@ func main() {
 
 	queue := NewReviewQueue(workers, queueSize)
 
-	submitReview := func(api SlackAPI, channel string, fn func()) {
+	submitReview := func(api SlackAPI, channel, ts string, fn func()) {
 		if !queue.Submit(func() {
+			_ = api.RemoveReaction("claude", slack.NewRefToMessage(channel, ts))
 			fn()
 			queue.completed.Add(1)
 		}) {
 			api.PostMessage(channel, slack.MsgOptionText("Review queue full — try again shortly.", false))
+		} else {
+			_ = api.AddReaction("claude", slack.NewRefToMessage(channel, ts))
 		}
 	}
 
@@ -2023,7 +2026,7 @@ func main() {
 					}
 				}
 				if rev.Reaction == "claude_it" {
-					submitReview(api, rev.Item.Channel, func() {
+					submitReview(api, rev.Item.Channel, rev.Item.Timestamp, func() {
 						handleReactionReview(api, rev, rev.Item.Channel, notifyUserID, reviewQuestions, watchedChannels, botUserID)
 					})
 				}
@@ -2054,7 +2057,7 @@ func main() {
 						rCtx, cancel := context.WithCancel(ctx)
 						trackReview(msgEv.TimeStamp, prURL, cancel)
 						msgCopy, ownerC, repoC, prNumC, chC := *msgEv, owner, repo, prNum, ev.Channel
-						submitReview(api, ev.Channel, func() {
+						submitReview(api, ev.Channel, ev.TimeStamp, func() {
 							handlePR(rCtx, api, &msgCopy, prURL, ownerC, repoC, prNumC, chC, notifyUserID, reviewQuestions)
 						})
 					}
@@ -2089,14 +2092,14 @@ func main() {
 						trackReview(msgEv.TimeStamp, prURL, cancel)
 						msgCopy := *msgEv
 						ownerC, repoC, prNumC, chC := owner, repo, prNum, ev.Channel
-						submitReview(api, ev.Channel, func() {
+						submitReview(api, ev.Channel, ev.TimeStamp, func() {
 							handlePR(rCtx, api, &msgCopy, prURL, ownerC, repoC, prNumC, chC, notifyUserID, reviewQuestions)
 						})
 					} else {
 						rCtx, cancel := context.WithCancel(ctx)
 						trackReview(ev.TimeStamp, prURL, cancel)
 						evCopy := *ev
-						submitReview(api, ev.Channel, func() {
+						submitReview(api, ev.Channel, ev.TimeStamp, func() {
 							defer untrackReview(evCopy.TimeStamp, prURL)
 							handleThreadFollowup(rCtx, api, &evCopy, owner, repo, prNum, notifyUserID)
 						})
@@ -2127,7 +2130,7 @@ func main() {
 					rCtx, cancel := context.WithCancel(ctx)
 					trackReview(ev.TimeStamp, prURL, cancel)
 					evCopy, ownerC, repoC, prNumC, chC := *ev, owner, repo, prNum, ev.Channel
-					submitReview(api, ev.Channel, func() {
+					submitReview(api, ev.Channel, ev.TimeStamp, func() {
 						handlePR(rCtx, api, &evCopy, prURL, ownerC, repoC, prNumC, chC, notifyUserID, reviewQuestions)
 					})
 				}
@@ -2350,7 +2353,7 @@ func handleSinglePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEv
 		}
 	}
 
-	_ = api.AddReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+	_ = api.AddReaction("claude-intesifies", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 
 	modeDesc := string(mode)
 	if selfReview {
@@ -2362,8 +2365,8 @@ func handleSinglePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEv
 	diff, err := fetchDiff(ctx, owner, repo, prNum)
 	if err != nil {
 		if selfReview {
-			_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
-			_ = api.AddReaction("x", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+			_ = api.RemoveReaction("claude-intesifies", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+			_ = api.AddReaction("qumulo-oh-no", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 			dmUser(api, notifyUserID, fmt.Sprintf("Failed to review <%s>: %v", prURL, err))
 		} else {
 			postError(api, ev, prURL, channelID, notifyUserID, err)
@@ -2425,7 +2428,7 @@ func handleSinglePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEv
 			claudeStatus, claudeVersion, claudeLatency,
 			ghStatus, ghLatency,
 			time.Duration(0)) // diff already fetched above
-		_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+		_ = api.RemoveReaction("claude-intesifies", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 		_ = api.AddReaction("white_check_mark", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 		_, _, _ = api.PostMessage(channelID,
 			slack.MsgOptionText(msg, false),
@@ -2527,8 +2530,8 @@ func handleSinglePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEv
 		if ctx.Err() != nil {
 			postCancelled(api, ev, prURL, channelID, notifyUserID)
 		} else if selfReview {
-			_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
-			_ = api.AddReaction("x", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+			_ = api.RemoveReaction("claude-intesifies", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+			_ = api.AddReaction("qumulo-oh-no", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 			dmUser(api, notifyUserID, fmt.Sprintf("Failed to review <%s>: %v", prURL, err))
 		} else {
 			postError(api, ev, prURL, channelID, notifyUserID, err)
@@ -2554,7 +2557,7 @@ func handleSinglePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEv
 
 	if selfReview {
 		dmUser(api, notifyUserID, fmt.Sprintf("*%s review for <%s>:*\n\n%s", modeLabel, prURL, review))
-		_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+		_ = api.RemoveReaction("claude-intesifies", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 		_ = api.AddReaction("white_check_mark", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 		dmUser(api, notifyUserID, fmt.Sprintf("Done! %s review for <%s> sent via DM only.%s\nUsage: %s\n\n%s", modeLabel, prURL, scoreMsg, stats, metrics))
 		return
@@ -2575,7 +2578,7 @@ func handleSinglePR(ctx context.Context, api SlackAPI, ev *slackevents.MessageEv
 		log.Printf("failed to post review in channel for %s: %v", prURL, err)
 	}
 
-	_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+	_ = api.RemoveReaction("claude-intesifies", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 	_ = api.AddReaction("white_check_mark", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 
 	dmUser(api, notifyUserID, fmt.Sprintf("Done! %s review for <%s> posted on GitHub and in <#%s>.%s\nUsage: %s\n\n%s", modeLabel, prURL, channelID, scoreMsg, stats, metrics))
@@ -4457,8 +4460,8 @@ func dmUser(api SlackAPI, userID, msg string) {
 
 func postError(api SlackAPI, ev *slackevents.MessageEvent, prURL, channelID, notifyUserID string, reviewErr error) {
 	log.Printf("failed to review %s: %v", prURL, reviewErr)
-	_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
-	_ = api.AddReaction("x", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+	_ = api.RemoveReaction("claude-intesifies", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+	_ = api.AddReaction("qumulo-oh-no", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 	_, _, _ = api.PostMessage(
 		channelID,
 		slack.MsgOptionText(fmt.Sprintf("Failed to review <%s>: %v", prURL, reviewErr), false),
@@ -4469,7 +4472,7 @@ func postError(api SlackAPI, ev *slackevents.MessageEvent, prURL, channelID, not
 
 func postCancelled(api SlackAPI, ev *slackevents.MessageEvent, prURL, channelID, notifyUserID string) {
 	log.Printf("review cancelled for %s", prURL)
-	_ = api.RemoveReaction("eyes", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
+	_ = api.RemoveReaction("claude-intesifies", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 	_ = api.AddReaction("no_entry_sign", slack.NewRefToMessage(ev.Channel, ev.TimeStamp))
 	_, _, _ = api.PostMessage(
 		channelID,

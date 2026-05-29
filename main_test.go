@@ -80,8 +80,8 @@ func TestPostError_RemovesEyesAndAddsX(t *testing.T) {
 	postError(mock, ev, "https://github.com/org/repo/pull/1", "C123", "U999", errors.New("something broke"))
 
 	wantReactions := []reactionCall{
-		{action: "remove", name: "eyes"},
-		{action: "add", name: "x"},
+		{action: "remove", name: "claude-intesifies"},
+		{action: "add", name: "qumulo-oh-no"},
 	}
 
 	if len(mock.reactions) != len(wantReactions) {
@@ -132,7 +132,7 @@ func TestPostCancelled_RemovesEyesAndAddsNoEntry(t *testing.T) {
 	postCancelled(mock, ev, "https://github.com/org/repo/pull/1", "C123", "U999")
 
 	wantReactions := []reactionCall{
-		{action: "remove", name: "eyes"},
+		{action: "remove", name: "claude-intesifies"},
 		{action: "add", name: "no_entry_sign"},
 	}
 
