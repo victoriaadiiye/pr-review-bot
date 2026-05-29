@@ -3196,3 +3196,102 @@ func TestTimeUntilNext(t *testing.T) {
 		})
 	}
 }
+
+func TestParseStalePRCandidates(t *testing.T) {
+	data := `[
+		{"number":10,"url":"https://github.com/O/R/pull/10","title":"old PR","author":{"login":"alice"},"updatedAt":"2026-05-01T00:00:00Z"},
+		{"number":20,"url":"https://github.com/O/R/pull/20","title":"fresh PR","author":{"login":"bob"},"updatedAt":"2026-05-28T00:00:00Z"},
+		{"number":30,"url":"https://github.com/O/R/pull/30","title":"ancient PR","author":{"login":"charlie"},"updatedAt":"2026-04-01T00:00:00Z"}
+	]`
+	prs, err := parseStalePRCandidates([]byte(data))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(prs) != 3 {
+		t.Fatalf("got %d PRs, want 3", len(prs))
+	}
+	if prs[0].Title != "old PR" || prs[0].Author != "alice" {
+		t.Errorf("pr[0] = %+v", prs[0])
+	}
+	if prs[1].UpdatedAt.IsZero() {
+		t.Error("updatedAt should be parsed")
+	}
+}
+
+func TestFilterStalePRs(t *testing.T) {
+	now := time.Date(2026, 5, 29, 0, 0, 0, 0, time.UTC)
+	prs := []stalePRCandidate{
+		{Number: 10, Title: "old", Author: "alice", UpdatedAt: now.Add(-15 * 24 * time.Hour)},
+		{Number: 20, Title: "fresh", Author: "bob", UpdatedAt: now.Add(-3 * 24 * time.Hour)},
+		{Number: 30, URL: "u", Title: "ancient", Author: "charlie", UpdatedAt: now.Add(-60 * 24 * time.Hour)},
+	}
+	stale := filterStalePRs(prs, 14, now)
+	if len(stale) != 2 {
+		t.Fatalf("got %d stale, want 2", len(stale))
+	}
+	if stale[0].Number != 30 {
+		t.Errorf("expected most stale first, got #%d", stale[0].Number)
+	}
+	if stale[1].Number != 10 {
+		t.Errorf("expected second most stale, got #%d", stale[1].Number)
+	}
+}
+
+func TestFilterStalePRs_NoneStale(t *testing.T) {
+	now := time.Date(2026, 5, 29, 0, 0, 0, 0, time.UTC)
+	prs := []stalePRCandidate{
+		{Number: 1, UpdatedAt: now.Add(-1 * 24 * time.Hour)},
+	}
+	stale := filterStalePRs(prs, 14, now)
+	if len(stale) != 0 {
+		t.Fatalf("got %d stale, want 0", len(stale))
+	}
+}
+
+func TestFormatStalePRReport(t *testing.T) {
+	now := time.Date(2026, 5, 29, 0, 0, 0, 0, time.UTC)
+	stale := []stalePR{
+		{Number: 10, URL: "https://github.com/O/R/pull/10", Title: "old PR", Author: "alice", DaysStale: 15},
+		{Number: 30, URL: "https://github.com/O/R/pull/30", Title: "ancient PR", Author: "charlie", DaysStale: 60},
+	}
+	report := formatStalePRReport("Org/Repo", stale, now)
+	if !strings.Contains(report, "Org/Repo") {
+		t.Error("report should contain repo name")
+	}
+	if !strings.Contains(report, "old PR") {
+		t.Error("report should contain PR title")
+	}
+	if !strings.Contains(report, "60d") {
+		t.Error("report should contain days stale")
+	}
+	if !strings.Contains(report, "2 stale") {
+		t.Error("report should contain count")
+	}
+}
+
+func TestFormatStalePRReport_Empty(t *testing.T) {
+	report := formatStalePRReport("Org/Repo", nil, time.Now())
+	if report != "" {
+		t.Errorf("empty stale list should produce empty report, got %q", report)
+	}
+}
+
+func TestParseStalePRDays(t *testing.T) {
+	tests := []struct {
+		input string
+		want  int
+	}{
+		{"", 14},
+		{"7", 7},
+		{"30", 30},
+		{"bad", 14},
+		{"0", 14},
+		{"-5", 14},
+	}
+	for _, tt := range tests {
+		got := parseStalePRDays(tt.input)
+		if got != tt.want {
+			t.Errorf("parseStalePRDays(%q) = %d, want %d", tt.input, got, tt.want)
+		}
+	}
+}

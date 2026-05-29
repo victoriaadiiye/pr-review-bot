@@ -903,13 +903,21 @@ func checkPRReviewedBy(ctx context.Context, owner, repo string, prNum int, botLo
 	return hasCommentByUser(out, botLogin)
 }
 
-func startAutoReviewPoller(ctx context.Context, repos []repoRef, botLogin string, submitFn func(prURL, flags string)) {
-	if len(repos) == 0 {
+type midnightJobConfig struct {
+	Repos         []repoRef
+	BotLogin      string
+	StaleDays     int
+	SubmitReview  func(prURL, flags string)
+	NotifyStale   func(msg string)
+}
+
+func startMidnightJobs(ctx context.Context, cfg midnightJobConfig) {
+	if len(cfg.Repos) == 0 {
 		return
 	}
 
-	poll := func() {
-		for _, r := range repos {
+	autoReview := func() {
+		for _, r := range cfg.Repos {
 			prs, err := listOpenPRs(ctx, r.Owner, r.Repo)
 			if err != nil {
 				log.Printf("auto-review: %v", err)
@@ -920,14 +928,14 @@ func startAutoReviewPoller(ctx context.Context, repos []repoRef, botLogin string
 			}
 			reviewed := make(map[int]bool)
 			for _, pr := range prs {
-				if checkPRReviewedBy(ctx, r.Owner, r.Repo, pr.Number, botLogin) {
+				if checkPRReviewedBy(ctx, r.Owner, r.Repo, pr.Number, cfg.BotLogin) {
 					reviewed[pr.Number] = true
 				}
 			}
 			unreviewed := filterUnreviewedPRs(prs, reviewed)
 			for _, pr := range unreviewed {
 				log.Printf("auto-review: queuing %s/%s#%d (%s)", r.Owner, r.Repo, pr.Number, pr.Author)
-				submitFn(pr.URL, "")
+				cfg.SubmitReview(pr.URL, "")
 			}
 			if len(unreviewed) > 0 {
 				log.Printf("auto-review: queued %d new review(s) for %s/%s", len(unreviewed), r.Owner, r.Repo)
@@ -936,19 +944,140 @@ func startAutoReviewPoller(ctx context.Context, repos []repoRef, botLogin string
 	}
 
 	wait := timeUntilNext(0, 0, time.Now())
-	log.Printf("auto-review: %d repo(s) as %q, next run in %s (midnight daily)", len(repos), botLogin, wait.Round(time.Minute))
+	log.Printf("midnight-jobs: %d repo(s), stale threshold %dd, next run in %s", len(cfg.Repos), cfg.StaleDays, wait.Round(time.Minute))
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("auto-review: stopped")
+			log.Println("midnight-jobs: stopped")
 			return
 		case <-timer.C:
-			log.Println("auto-review: midnight run starting")
-			poll()
+			log.Println("midnight-jobs: starting")
+			autoReview()
+			runStalePRCheck(ctx, cfg.Repos, cfg.StaleDays, cfg.NotifyStale)
 			timer.Reset(timeUntilNext(0, 0, time.Now()))
+		}
+	}
+}
+
+// --- Stale PR Detection ---
+
+type stalePRCandidate struct {
+	Number    int       `json:"number"`
+	URL       string    `json:"url"`
+	Title     string    `json:"title"`
+	Author    string
+	UpdatedAt time.Time
+}
+
+type stalePR struct {
+	Number    int
+	URL       string
+	Title     string
+	Author    string
+	DaysStale int
+}
+
+func parseStalePRDays(s string) int {
+	if s == "" {
+		return 14
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n <= 0 {
+		return 14
+	}
+	return n
+}
+
+func parseStalePRCandidates(data []byte) ([]stalePRCandidate, error) {
+	var raw []struct {
+		Number    int    `json:"number"`
+		URL       string `json:"url"`
+		Title     string `json:"title"`
+		UpdatedAt string `json:"updatedAt"`
+		Author    struct {
+			Login string `json:"login"`
+		} `json:"author"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+	prs := make([]stalePRCandidate, len(raw))
+	for i, r := range raw {
+		t, _ := time.Parse(time.RFC3339, r.UpdatedAt)
+		prs[i] = stalePRCandidate{
+			Number:    r.Number,
+			URL:       r.URL,
+			Title:     r.Title,
+			Author:    r.Author.Login,
+			UpdatedAt: t,
+		}
+	}
+	return prs, nil
+}
+
+func filterStalePRs(prs []stalePRCandidate, thresholdDays int, now time.Time) []stalePR {
+	var result []stalePR
+	cutoff := now.Add(-time.Duration(thresholdDays) * 24 * time.Hour)
+	for _, pr := range prs {
+		if pr.UpdatedAt.Before(cutoff) {
+			days := int(now.Sub(pr.UpdatedAt).Hours() / 24)
+			result = append(result, stalePR{
+				Number:    pr.Number,
+				URL:       pr.URL,
+				Title:     pr.Title,
+				Author:    pr.Author,
+				DaysStale: days,
+			})
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].DaysStale > result[j].DaysStale
+	})
+	return result
+}
+
+func formatStalePRReport(repoFullName string, stale []stalePR, now time.Time) string {
+	if len(stale) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, ":warning: *%d stale PR(s) in %s* (no activity >%dd)\n", len(stale), repoFullName, stale[len(stale)-1].DaysStale)
+	for _, pr := range stale {
+		fmt.Fprintf(&b, ">  • <%s|#%d> %s — @%s (%dd stale)\n", pr.URL, pr.Number, pr.Title, pr.Author, pr.DaysStale)
+	}
+	b.WriteString("> _Close or update these PRs to keep the backlog clean._")
+	return b.String()
+}
+
+func listStalePRCandidates(ctx context.Context, owner, repo string) ([]stalePRCandidate, error) {
+	cmd := exec.CommandContext(ctx, "gh", "pr", "list",
+		"--repo", fmt.Sprintf("%s/%s", owner, repo),
+		"--state", "open",
+		"--json", "number,url,title,author,updatedAt",
+		"--limit", "100")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("gh pr list %s/%s: %w", owner, repo, err)
+	}
+	return parseStalePRCandidates(out)
+}
+
+func runStalePRCheck(ctx context.Context, repos []repoRef, thresholdDays int, notify func(msg string)) {
+	now := time.Now()
+	for _, r := range repos {
+		candidates, err := listStalePRCandidates(ctx, r.Owner, r.Repo)
+		if err != nil {
+			log.Printf("stale-pr: %v", err)
+			continue
+		}
+		stale := filterStalePRs(candidates, thresholdDays, now)
+		report := formatStalePRReport(fmt.Sprintf("%s/%s", r.Owner, r.Repo), stale, now)
+		if report != "" {
+			log.Printf("stale-pr: found %d stale PR(s) in %s/%s", len(stale), r.Owner, r.Repo)
+			notify(report)
 		}
 	}
 }
@@ -1968,7 +2097,14 @@ func main() {
 	if autoReviewBotLogin == "" {
 		autoReviewBotLogin = "qompass-pr-review-bot"
 	}
-	go startAutoReviewPoller(ctx, autoReviewRepos, autoReviewBotLogin, reviewHandler)
+	staleDays := parseStalePRDays(os.Getenv("STALE_PR_DAYS"))
+	go startMidnightJobs(ctx, midnightJobConfig{
+		Repos:        autoReviewRepos,
+		BotLogin:     autoReviewBotLogin,
+		StaleDays:    staleDays,
+		SubmitReview: reviewHandler,
+		NotifyStale:  func(msg string) { dmUser(api, notifyUserID, msg) },
+	})
 
 	go func() {
 		if err := client.RunContext(ctx); err != nil && ctx.Err() == nil {
