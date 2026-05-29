@@ -56,6 +56,11 @@ tasks:
     cmds:
       - './{{.BINARY}} post --host {{.CLI_ARGS}}'
 
+  url:
+    desc: Print the dashboard URL
+    cmds:
+      - echo "$VSCODE_PROXY_URI/dashboard" | sed 's/{{"{{"}}port{{"}}"}}/8080/'
+
   deploy-legacy:
     desc: "Legacy: Pull, rebuild, restart in tmux (no Docker)"
     cmds:
