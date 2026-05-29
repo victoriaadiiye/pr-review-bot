@@ -795,6 +795,164 @@ func discoverStack(ctx context.Context, fetcher PRFetcher, owner, repo string, s
 	return chain, nil
 }
 
+// --- Auto-Review Poller ---
+
+type repoRef struct {
+	Owner string
+	Repo  string
+}
+
+type openPR struct {
+	Number int    `json:"number"`
+	URL    string `json:"url"`
+	Author string
+}
+
+func parseAutoReviewRepos(s string) []repoRef {
+	if s == "" {
+		return nil
+	}
+	var refs []repoRef
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		slash := strings.IndexByte(part, '/')
+		if slash <= 0 || slash >= len(part)-1 {
+			continue
+		}
+		refs = append(refs, repoRef{part[:slash], part[slash+1:]})
+	}
+	return refs
+}
+
+func parseAutoReviewInterval(s string) time.Duration {
+	if s == "" {
+		return 30 * time.Minute
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 30 * time.Minute
+	}
+	return d
+}
+
+func parseOpenPRsJSON(data []byte) ([]openPR, error) {
+	var raw []struct {
+		Number int    `json:"number"`
+		URL    string `json:"url"`
+		Author struct {
+			Login string `json:"login"`
+		} `json:"author"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+	prs := make([]openPR, len(raw))
+	for i, r := range raw {
+		prs[i] = openPR{Number: r.Number, URL: r.URL, Author: r.Author.Login}
+	}
+	return prs, nil
+}
+
+func hasCommentByUser(data []byte, login string) bool {
+	var pr struct {
+		Comments []struct {
+			Author struct {
+				Login string `json:"login"`
+			} `json:"author"`
+		} `json:"comments"`
+	}
+	if err := json.Unmarshal(data, &pr); err != nil {
+		return false
+	}
+	for _, c := range pr.Comments {
+		if c.Author.Login == login {
+			return true
+		}
+	}
+	return false
+}
+
+func filterUnreviewedPRs(prs []openPR, reviewed map[int]bool) []openPR {
+	var result []openPR
+	for _, pr := range prs {
+		if !reviewed[pr.Number] {
+			result = append(result, pr)
+		}
+	}
+	return result
+}
+
+func listOpenPRs(ctx context.Context, owner, repo string) ([]openPR, error) {
+	cmd := exec.CommandContext(ctx, "gh", "pr", "list",
+		"--repo", fmt.Sprintf("%s/%s", owner, repo),
+		"--state", "open",
+		"--json", "number,url,author",
+		"--limit", "50")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("gh pr list %s/%s: %w", owner, repo, err)
+	}
+	return parseOpenPRsJSON(out)
+}
+
+func checkPRReviewedBy(ctx context.Context, owner, repo string, prNum int, botLogin string) bool {
+	cmd := exec.CommandContext(ctx, "gh", "pr", "view", strconv.Itoa(prNum),
+		"--repo", fmt.Sprintf("%s/%s", owner, repo),
+		"--json", "comments")
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return hasCommentByUser(out, botLogin)
+}
+
+func startAutoReviewPoller(ctx context.Context, repos []repoRef, botLogin string, interval time.Duration, submitFn func(prURL, flags string)) {
+	if len(repos) == 0 {
+		return
+	}
+	log.Printf("auto-review: polling %d repo(s) every %s as %q", len(repos), interval, botLogin)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	poll := func() {
+		for _, r := range repos {
+			prs, err := listOpenPRs(ctx, r.Owner, r.Repo)
+			if err != nil {
+				log.Printf("auto-review: %v", err)
+				continue
+			}
+			if len(prs) == 0 {
+				continue
+			}
+			reviewed := make(map[int]bool)
+			for _, pr := range prs {
+				if checkPRReviewedBy(ctx, r.Owner, r.Repo, pr.Number, botLogin) {
+					reviewed[pr.Number] = true
+				}
+			}
+			unreviewed := filterUnreviewedPRs(prs, reviewed)
+			for _, pr := range unreviewed {
+				log.Printf("auto-review: queuing %s/%s#%d (%s)", r.Owner, r.Repo, pr.Number, pr.Author)
+				submitFn(pr.URL, "")
+			}
+			if len(unreviewed) > 0 {
+				log.Printf("auto-review: queued %d new review(s) for %s/%s", len(unreviewed), r.Owner, r.Repo)
+			}
+		}
+	}
+
+	poll()
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("auto-review: stopped")
+			return
+		case <-ticker.C:
+			poll()
+		}
+	}
+}
+
 var (
 	ghPRPattern       = regexp.MustCompile(`<?https://github\.com/([^/>\s]+)/([^/>\s]+)/pull/(\d+)[^>\s]*>?`)
 	graphitePRPattern = regexp.MustCompile(`<?https://app\.graphite\.com/github/pr/([^/>\s]+)/([^/>\s]+)/(\d+)[^>\s]*>?`)
@@ -1808,6 +1966,14 @@ func main() {
 	}()
 
 	log.Println("PR Review Bot running...")
+
+	autoReviewRepos := parseAutoReviewRepos(os.Getenv("AUTO_REVIEW_REPOS"))
+	autoReviewBotLogin := os.Getenv("AUTO_REVIEW_BOT_LOGIN")
+	if autoReviewBotLogin == "" {
+		autoReviewBotLogin = "qompass-pr-review-bot"
+	}
+	autoReviewInterval := parseAutoReviewInterval(os.Getenv("AUTO_REVIEW_INTERVAL"))
+	go startAutoReviewPoller(ctx, autoReviewRepos, autoReviewBotLogin, autoReviewInterval, reviewHandler)
 
 	go func() {
 		if err := client.RunContext(ctx); err != nil && ctx.Err() == nil {

@@ -3050,3 +3050,129 @@ func TestAgentPrompts_ContainLineNumberGuidance(t *testing.T) {
 		t.Error("ethos should contain line number accuracy guidance")
 	}
 }
+
+func TestParseAutoReviewRepos(t *testing.T) {
+	tests := []struct {
+		input string
+		want  []repoRef
+	}{
+		{"", nil},
+		{"Qumulo/qompass", []repoRef{{"Qumulo", "qompass"}}},
+		{"Qumulo/qompass,Qumulo/qatalyst", []repoRef{{"Qumulo", "qompass"}, {"Qumulo", "qatalyst"}}},
+		{" Qumulo/qompass , Qumulo/qatalyst ", []repoRef{{"Qumulo", "qompass"}, {"Qumulo", "qatalyst"}}},
+		{"bad-format", nil},
+		{"Qumulo/qompass,bad,Qumulo/qatalyst", []repoRef{{"Qumulo", "qompass"}, {"Qumulo", "qatalyst"}}},
+	}
+	for _, tt := range tests {
+		got := parseAutoReviewRepos(tt.input)
+		if len(got) != len(tt.want) {
+			t.Errorf("parseAutoReviewRepos(%q) = %d repos, want %d", tt.input, len(got), len(tt.want))
+			continue
+		}
+		for i := range got {
+			if got[i] != tt.want[i] {
+				t.Errorf("parseAutoReviewRepos(%q)[%d] = %v, want %v", tt.input, i, got[i], tt.want[i])
+			}
+		}
+	}
+}
+
+func TestParseOpenPRsJSON(t *testing.T) {
+	jsonData := `[
+		{"number": 42, "url": "https://github.com/Qumulo/qompass/pull/42", "author": {"login": "alice"}},
+		{"number": 99, "url": "https://github.com/Qumulo/qompass/pull/99", "author": {"login": "bob"}}
+	]`
+	prs, err := parseOpenPRsJSON([]byte(jsonData))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(prs) != 2 {
+		t.Fatalf("got %d PRs, want 2", len(prs))
+	}
+	if prs[0].Number != 42 || prs[0].Author != "alice" {
+		t.Errorf("pr[0] = %+v", prs[0])
+	}
+	if prs[1].Number != 99 || prs[1].Author != "bob" {
+		t.Errorf("pr[1] = %+v", prs[1])
+	}
+}
+
+func TestParseOpenPRsJSON_Empty(t *testing.T) {
+	prs, err := parseOpenPRsJSON([]byte(`[]`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(prs) != 0 {
+		t.Fatalf("got %d PRs, want 0", len(prs))
+	}
+}
+
+func TestHasCommentByUser(t *testing.T) {
+	tests := []struct {
+		name     string
+		json     string
+		botLogin string
+		want     bool
+	}{
+		{
+			name:     "bot has commented",
+			json:     `{"comments": [{"author": {"login": "alice"}}, {"author": {"login": "qompass-pr-review-bot"}}]}`,
+			botLogin: "qompass-pr-review-bot",
+			want:     true,
+		},
+		{
+			name:     "bot has not commented",
+			json:     `{"comments": [{"author": {"login": "alice"}}, {"author": {"login": "bob"}}]}`,
+			botLogin: "qompass-pr-review-bot",
+			want:     false,
+		},
+		{
+			name:     "no comments",
+			json:     `{"comments": []}`,
+			botLogin: "qompass-pr-review-bot",
+			want:     false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := hasCommentByUser([]byte(tt.json), tt.botLogin)
+			if got != tt.want {
+				t.Errorf("hasCommentByUser() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFilterUnreviewedPRs(t *testing.T) {
+	prs := []openPR{
+		{Number: 1, URL: "https://github.com/Qumulo/qompass/pull/1", Author: "alice"},
+		{Number: 2, URL: "https://github.com/Qumulo/qompass/pull/2", Author: "bob"},
+		{Number: 3, URL: "https://github.com/Qumulo/qompass/pull/3", Author: "charlie"},
+	}
+	reviewed := map[int]bool{2: true}
+	got := filterUnreviewedPRs(prs, reviewed)
+	if len(got) != 2 {
+		t.Fatalf("got %d unreviewed, want 2", len(got))
+	}
+	if got[0].Number != 1 || got[1].Number != 3 {
+		t.Errorf("wrong PRs filtered: %+v", got)
+	}
+}
+
+func TestAutoReviewInterval(t *testing.T) {
+	tests := []struct {
+		input string
+		want  time.Duration
+	}{
+		{"", 30 * time.Minute},
+		{"15m", 15 * time.Minute},
+		{"1h", time.Hour},
+		{"bad", 30 * time.Minute},
+	}
+	for _, tt := range tests {
+		got := parseAutoReviewInterval(tt.input)
+		if got != tt.want {
+			t.Errorf("parseAutoReviewInterval(%q) = %v, want %v", tt.input, got, tt.want)
+		}
+	}
+}
