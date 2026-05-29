@@ -3159,20 +3159,40 @@ func TestFilterUnreviewedPRs(t *testing.T) {
 	}
 }
 
-func TestAutoReviewInterval(t *testing.T) {
+func TestTimeUntilNext(t *testing.T) {
+	loc := time.UTC
 	tests := []struct {
-		input string
-		want  time.Duration
+		name string
+		now  time.Time
+		want time.Duration
 	}{
-		{"", 30 * time.Minute},
-		{"15m", 15 * time.Minute},
-		{"1h", time.Hour},
-		{"bad", 30 * time.Minute},
+		{
+			name: "before midnight",
+			now:  time.Date(2026, 5, 29, 22, 0, 0, 0, loc),
+			want: 2 * time.Hour,
+		},
+		{
+			name: "just after midnight",
+			now:  time.Date(2026, 5, 29, 0, 0, 1, 0, loc),
+			want: 24*time.Hour - time.Second,
+		},
+		{
+			name: "at noon",
+			now:  time.Date(2026, 5, 29, 12, 0, 0, 0, loc),
+			want: 12 * time.Hour,
+		},
+		{
+			name: "exactly midnight schedules next day",
+			now:  time.Date(2026, 5, 29, 0, 0, 0, 0, loc),
+			want: 24 * time.Hour,
+		},
 	}
 	for _, tt := range tests {
-		got := parseAutoReviewInterval(tt.input)
-		if got != tt.want {
-			t.Errorf("parseAutoReviewInterval(%q) = %v, want %v", tt.input, got, tt.want)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			got := timeUntilNext(0, 0, tt.now)
+			if got != tt.want {
+				t.Errorf("timeUntilNext(0, 0, %v) = %v, want %v", tt.now, got, tt.want)
+			}
+		})
 	}
 }

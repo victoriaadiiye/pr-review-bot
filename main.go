@@ -824,15 +824,12 @@ func parseAutoReviewRepos(s string) []repoRef {
 	return refs
 }
 
-func parseAutoReviewInterval(s string) time.Duration {
-	if s == "" {
-		return 30 * time.Minute
+func timeUntilNext(hour, min int, now time.Time) time.Duration {
+	next := time.Date(now.Year(), now.Month(), now.Day(), hour, min, 0, 0, now.Location())
+	if !next.After(now) {
+		next = next.Add(24 * time.Hour)
 	}
-	d, err := time.ParseDuration(s)
-	if err != nil {
-		return 30 * time.Minute
-	}
-	return d
+	return next.Sub(now)
 }
 
 func parseOpenPRsJSON(data []byte) ([]openPR, error) {
@@ -906,13 +903,10 @@ func checkPRReviewedBy(ctx context.Context, owner, repo string, prNum int, botLo
 	return hasCommentByUser(out, botLogin)
 }
 
-func startAutoReviewPoller(ctx context.Context, repos []repoRef, botLogin string, interval time.Duration, submitFn func(prURL, flags string)) {
+func startAutoReviewPoller(ctx context.Context, repos []repoRef, botLogin string, submitFn func(prURL, flags string)) {
 	if len(repos) == 0 {
 		return
 	}
-	log.Printf("auto-review: polling %d repo(s) every %s as %q", len(repos), interval, botLogin)
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
 
 	poll := func() {
 		for _, r := range repos {
@@ -941,14 +935,20 @@ func startAutoReviewPoller(ctx context.Context, repos []repoRef, botLogin string
 		}
 	}
 
-	poll()
+	wait := timeUntilNext(0, 0, time.Now())
+	log.Printf("auto-review: %d repo(s) as %q, next run in %s (midnight daily)", len(repos), botLogin, wait.Round(time.Minute))
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			log.Println("auto-review: stopped")
 			return
-		case <-ticker.C:
+		case <-timer.C:
+			log.Println("auto-review: midnight run starting")
 			poll()
+			timer.Reset(timeUntilNext(0, 0, time.Now()))
 		}
 	}
 }
@@ -1972,8 +1972,7 @@ func main() {
 	if autoReviewBotLogin == "" {
 		autoReviewBotLogin = "qompass-pr-review-bot"
 	}
-	autoReviewInterval := parseAutoReviewInterval(os.Getenv("AUTO_REVIEW_INTERVAL"))
-	go startAutoReviewPoller(ctx, autoReviewRepos, autoReviewBotLogin, autoReviewInterval, reviewHandler)
+	go startAutoReviewPoller(ctx, autoReviewRepos, autoReviewBotLogin, reviewHandler)
 
 	go func() {
 		if err := client.RunContext(ctx); err != nil && ctx.Err() == nil {
