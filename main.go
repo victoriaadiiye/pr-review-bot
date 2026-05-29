@@ -1859,10 +1859,6 @@ func main() {
 				if !ok {
 					continue
 				}
-				if !watchedChannels[ev.Channel] {
-					continue
-				}
-
 				refs := findPRRefs(ev.Text)
 				isReviewRequest := reviewRequestPattern.MatchString(ev.Text)
 				inThread := ev.ThreadTimeStamp != ""
