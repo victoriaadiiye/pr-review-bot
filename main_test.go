@@ -3199,9 +3199,9 @@ func TestTimeUntilNext(t *testing.T) {
 
 func TestParseStalePRCandidates(t *testing.T) {
 	data := `[
-		{"number":10,"url":"https://github.com/O/R/pull/10","title":"old PR","author":{"login":"alice"},"updatedAt":"2026-05-01T00:00:00Z"},
-		{"number":20,"url":"https://github.com/O/R/pull/20","title":"fresh PR","author":{"login":"bob"},"updatedAt":"2026-05-28T00:00:00Z"},
-		{"number":30,"url":"https://github.com/O/R/pull/30","title":"ancient PR","author":{"login":"charlie"},"updatedAt":"2026-04-01T00:00:00Z"}
+		{"number":10,"url":"https://github.com/O/R/pull/10","title":"old PR","body":"## Summary\nFixes the auth bug","author":{"login":"alice"},"updatedAt":"2026-05-01T00:00:00Z"},
+		{"number":20,"url":"https://github.com/O/R/pull/20","title":"fresh PR","body":"","author":{"login":"bob"},"updatedAt":"2026-05-28T00:00:00Z"},
+		{"number":30,"url":"https://github.com/O/R/pull/30","title":"ancient PR","body":"Long description here","author":{"login":"charlie"},"updatedAt":"2026-04-01T00:00:00Z"}
 	]`
 	prs, err := parseStalePRCandidates([]byte(data))
 	if err != nil {
@@ -3213,6 +3213,9 @@ func TestParseStalePRCandidates(t *testing.T) {
 	if prs[0].Title != "old PR" || prs[0].Author != "alice" {
 		t.Errorf("pr[0] = %+v", prs[0])
 	}
+	if prs[0].Body != "## Summary\nFixes the auth bug" {
+		t.Errorf("pr[0].Body = %q", prs[0].Body)
+	}
 	if prs[1].UpdatedAt.IsZero() {
 		t.Error("updatedAt should be parsed")
 	}
@@ -3221,9 +3224,9 @@ func TestParseStalePRCandidates(t *testing.T) {
 func TestFilterStalePRs(t *testing.T) {
 	now := time.Date(2026, 5, 29, 0, 0, 0, 0, time.UTC)
 	prs := []stalePRCandidate{
-		{Number: 10, Title: "old", Author: "alice", UpdatedAt: now.Add(-15 * 24 * time.Hour)},
+		{Number: 10, Title: "old", Author: "alice", Body: "Fixes stuff", UpdatedAt: now.Add(-15 * 24 * time.Hour)},
 		{Number: 20, Title: "fresh", Author: "bob", UpdatedAt: now.Add(-3 * 24 * time.Hour)},
-		{Number: 30, URL: "u", Title: "ancient", Author: "charlie", UpdatedAt: now.Add(-60 * 24 * time.Hour)},
+		{Number: 30, URL: "u", Title: "ancient", Author: "charlie", Body: "Big refactor", UpdatedAt: now.Add(-60 * 24 * time.Hour)},
 	}
 	stale := filterStalePRs(prs, 14, now)
 	if len(stale) != 2 {
@@ -3231,6 +3234,9 @@ func TestFilterStalePRs(t *testing.T) {
 	}
 	if stale[0].Number != 30 {
 		t.Errorf("expected most stale first, got #%d", stale[0].Number)
+	}
+	if stale[0].Body != "Big refactor" {
+		t.Errorf("stale[0].Body = %q, want %q", stale[0].Body, "Big refactor")
 	}
 	if stale[1].Number != 10 {
 		t.Errorf("expected second most stale, got #%d", stale[1].Number)
@@ -3248,11 +3254,38 @@ func TestFilterStalePRs_NoneStale(t *testing.T) {
 	}
 }
 
+func TestTruncateBody(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		max   int
+		want  string
+	}{
+		{"short", "hello", 200, "hello"},
+		{"empty", "", 200, ""},
+		{"exact limit", "abc", 3, "abc"},
+		{"truncated", "abcdef", 4, "abcd..."},
+		{"strips markdown headers", "## Summary\nFixes bug", 200, "Fixes bug"},
+		{"strips multiple headers", "## What\n### Why\nBecause reasons", 200, "Because reasons"},
+		{"multiline keeps first meaningful", "## Summary\n\nAdds new feature\n\nMore details here", 200, "Adds new feature"},
+		{"strips images", "![screenshot](http://img.png)\nActual text", 200, "Actual text"},
+		{"strips checkboxes", "- [x] done\n- [ ] todo\nReal content", 200, "Real content"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := truncateBody(tt.input, tt.max)
+			if got != tt.want {
+				t.Errorf("truncateBody(%q, %d) = %q, want %q", tt.input, tt.max, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestFormatStalePRReport(t *testing.T) {
 	now := time.Date(2026, 5, 29, 0, 0, 0, 0, time.UTC)
 	stale := []stalePR{
-		{Number: 10, URL: "https://github.com/O/R/pull/10", Title: "old PR", Author: "alice", DaysStale: 15},
-		{Number: 30, URL: "https://github.com/O/R/pull/30", Title: "ancient PR", Author: "charlie", DaysStale: 60},
+		{Number: 10, URL: "https://github.com/O/R/pull/10", Title: "old PR", Author: "alice", DaysStale: 15, Body: "Fixes auth"},
+		{Number: 30, URL: "https://github.com/O/R/pull/30", Title: "ancient PR", Author: "charlie", DaysStale: 60, Body: "Big refactor of the core module"},
 	}
 	report := formatStalePRReport("Org/Repo", stale, now)
 	if !strings.Contains(report, "Org/Repo") {
@@ -3267,12 +3300,48 @@ func TestFormatStalePRReport(t *testing.T) {
 	if !strings.Contains(report, "2 stale") {
 		t.Error("report should contain count")
 	}
+	if !strings.Contains(report, "Fixes auth") {
+		t.Error("report should contain PR body summary")
+	}
+	if !strings.Contains(report, "Big refactor") {
+		t.Error("report should contain PR body summary")
+	}
 }
 
 func TestFormatStalePRReport_Empty(t *testing.T) {
 	report := formatStalePRReport("Org/Repo", nil, time.Now())
 	if report != "" {
 		t.Errorf("empty stale list should produce empty report, got %q", report)
+	}
+}
+
+func TestStalePRNumbersSet(t *testing.T) {
+	now := time.Date(2026, 5, 29, 0, 0, 0, 0, time.UTC)
+	prs := []stalePRCandidate{
+		{Number: 10, UpdatedAt: now.Add(-20 * 24 * time.Hour)},
+		{Number: 20, UpdatedAt: now.Add(-3 * 24 * time.Hour)},
+		{Number: 30, UpdatedAt: now.Add(-60 * 24 * time.Hour)},
+	}
+	stale := filterStalePRs(prs, 14, now)
+	nums := stalePRNumbers(stale)
+	if !nums[10] || !nums[30] {
+		t.Errorf("expected 10 and 30 in stale set, got %v", nums)
+	}
+	if nums[20] {
+		t.Error("20 should not be stale")
+	}
+}
+
+func TestFilterUnreviewedPRs_SkipsStale(t *testing.T) {
+	prs := []openPR{
+		{Number: 1, URL: "u1"},
+		{Number: 2, URL: "u2"},
+		{Number: 3, URL: "u3"},
+	}
+	skip := map[int]bool{1: true, 3: true}
+	got := filterUnreviewedPRs(prs, skip)
+	if len(got) != 1 || got[0].Number != 2 {
+		t.Errorf("expected only PR #2, got %+v", got)
 	}
 }
 

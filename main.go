@@ -916,7 +916,7 @@ func startMidnightJobs(ctx context.Context, cfg midnightJobConfig) {
 		return
 	}
 
-	autoReview := func() {
+	autoReview := func(staleByRepo map[string]map[int]bool) {
 		for _, r := range cfg.Repos {
 			prs, err := listOpenPRs(ctx, r.Owner, r.Repo)
 			if err != nil {
@@ -926,13 +926,20 @@ func startMidnightJobs(ctx context.Context, cfg midnightJobConfig) {
 			if len(prs) == 0 {
 				continue
 			}
-			reviewed := make(map[int]bool)
+			key := fmt.Sprintf("%s/%s", r.Owner, r.Repo)
+			skip := make(map[int]bool)
 			for _, pr := range prs {
 				if checkPRReviewedBy(ctx, r.Owner, r.Repo, pr.Number, cfg.BotLogin) {
-					reviewed[pr.Number] = true
+					skip[pr.Number] = true
 				}
 			}
-			unreviewed := filterUnreviewedPRs(prs, reviewed)
+			for num := range staleByRepo[key] {
+				if !skip[num] {
+					log.Printf("auto-review: skipping %s#%d (stale)", key, num)
+				}
+				skip[num] = true
+			}
+			unreviewed := filterUnreviewedPRs(prs, skip)
 			for _, pr := range unreviewed {
 				log.Printf("auto-review: queuing %s/%s#%d (%s)", r.Owner, r.Repo, pr.Number, pr.Author)
 				cfg.SubmitReview(pr.URL, "")
@@ -955,8 +962,8 @@ func startMidnightJobs(ctx context.Context, cfg midnightJobConfig) {
 			return
 		case <-timer.C:
 			log.Println("midnight-jobs: starting")
-			autoReview()
-			runStalePRCheck(ctx, cfg.Repos, cfg.StaleDays, cfg.NotifyStale)
+			staleByRepo := runStalePRCheck(ctx, cfg.Repos, cfg.StaleDays, cfg.NotifyStale)
+			autoReview(staleByRepo)
 			timer.Reset(timeUntilNext(0, 0, time.Now()))
 		}
 	}
@@ -968,6 +975,7 @@ type stalePRCandidate struct {
 	Number    int       `json:"number"`
 	URL       string    `json:"url"`
 	Title     string    `json:"title"`
+	Body      string
 	Author    string
 	UpdatedAt time.Time
 }
@@ -976,6 +984,7 @@ type stalePR struct {
 	Number    int
 	URL       string
 	Title     string
+	Body      string
 	Author    string
 	DaysStale int
 }
@@ -996,6 +1005,7 @@ func parseStalePRCandidates(data []byte) ([]stalePRCandidate, error) {
 		Number    int    `json:"number"`
 		URL       string `json:"url"`
 		Title     string `json:"title"`
+		Body      string `json:"body"`
 		UpdatedAt string `json:"updatedAt"`
 		Author    struct {
 			Login string `json:"login"`
@@ -1011,6 +1021,7 @@ func parseStalePRCandidates(data []byte) ([]stalePRCandidate, error) {
 			Number:    r.Number,
 			URL:       r.URL,
 			Title:     r.Title,
+			Body:      r.Body,
 			Author:    r.Author.Login,
 			UpdatedAt: t,
 		}
@@ -1028,6 +1039,7 @@ func filterStalePRs(prs []stalePRCandidate, thresholdDays int, now time.Time) []
 				Number:    pr.Number,
 				URL:       pr.URL,
 				Title:     pr.Title,
+				Body:      pr.Body,
 				Author:    pr.Author,
 				DaysStale: days,
 			})
@@ -1039,6 +1051,32 @@ func filterStalePRs(prs []stalePRCandidate, thresholdDays int, now time.Time) []
 	return result
 }
 
+func stalePRNumbers(stale []stalePR) map[int]bool {
+	m := make(map[int]bool, len(stale))
+	for _, pr := range stale {
+		m[pr.Number] = true
+	}
+	return m
+}
+
+var bodyNoisePatterns = regexp.MustCompile(`(?m)(^#{1,6}\s.*$|^!\[.*\]\(.*\)$|^- \[[ x]\] .*$)`)
+
+func truncateBody(body string, max int) string {
+	cleaned := bodyNoisePatterns.ReplaceAllString(body, "")
+	var first string
+	for _, line := range strings.Split(cleaned, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			first = line
+			break
+		}
+	}
+	if len(first) <= max {
+		return first
+	}
+	return first[:max] + "..."
+}
+
 func formatStalePRReport(repoFullName string, stale []stalePR, now time.Time) string {
 	if len(stale) == 0 {
 		return ""
@@ -1047,6 +1085,9 @@ func formatStalePRReport(repoFullName string, stale []stalePR, now time.Time) st
 	fmt.Fprintf(&b, ":warning: *%d stale PR(s) in %s* (no activity >%dd)\n", len(stale), repoFullName, stale[len(stale)-1].DaysStale)
 	for _, pr := range stale {
 		fmt.Fprintf(&b, ">  • <%s|#%d> %s — @%s (%dd stale)\n", pr.URL, pr.Number, pr.Title, pr.Author, pr.DaysStale)
+		if summary := truncateBody(pr.Body, 150); summary != "" {
+			fmt.Fprintf(&b, ">    _%s_\n", summary)
+		}
 	}
 	b.WriteString("> _Close or update these PRs to keep the backlog clean._")
 	return b.String()
@@ -1056,7 +1097,7 @@ func listStalePRCandidates(ctx context.Context, owner, repo string) ([]stalePRCa
 	cmd := exec.CommandContext(ctx, "gh", "pr", "list",
 		"--repo", fmt.Sprintf("%s/%s", owner, repo),
 		"--state", "open",
-		"--json", "number,url,title,author,updatedAt",
+		"--json", "number,url,title,body,author,updatedAt",
 		"--limit", "100")
 	out, err := cmd.Output()
 	if err != nil {
@@ -1065,21 +1106,25 @@ func listStalePRCandidates(ctx context.Context, owner, repo string) ([]stalePRCa
 	return parseStalePRCandidates(out)
 }
 
-func runStalePRCheck(ctx context.Context, repos []repoRef, thresholdDays int, notify func(msg string)) {
+func runStalePRCheck(ctx context.Context, repos []repoRef, thresholdDays int, notify func(msg string)) map[string]map[int]bool {
 	now := time.Now()
+	staleByRepo := make(map[string]map[int]bool)
 	for _, r := range repos {
+		key := fmt.Sprintf("%s/%s", r.Owner, r.Repo)
 		candidates, err := listStalePRCandidates(ctx, r.Owner, r.Repo)
 		if err != nil {
 			log.Printf("stale-pr: %v", err)
 			continue
 		}
 		stale := filterStalePRs(candidates, thresholdDays, now)
-		report := formatStalePRReport(fmt.Sprintf("%s/%s", r.Owner, r.Repo), stale, now)
+		staleByRepo[key] = stalePRNumbers(stale)
+		report := formatStalePRReport(key, stale, now)
 		if report != "" {
-			log.Printf("stale-pr: found %d stale PR(s) in %s/%s", len(stale), r.Owner, r.Repo)
+			log.Printf("stale-pr: found %d stale PR(s) in %s", len(stale), key)
 			notify(report)
 		}
 	}
+	return staleByRepo
 }
 
 var (
