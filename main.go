@@ -1311,6 +1311,19 @@ func (q *ReviewQueue) Stats() (pending int, active int, completed int64, dropped
 	return
 }
 
+func submitReview(api SlackAPI, queue *ReviewQueue, channel, ts string, fn func()) {
+	_ = api.AddReaction("claude", slack.NewRefToMessage(channel, ts))
+	if !queue.Submit(func() {
+		_ = api.RemoveReaction("claude", slack.NewRefToMessage(channel, ts))
+		fn()
+		queue.completed.Add(1)
+	}) {
+		_ = api.RemoveReaction("claude", slack.NewRefToMessage(channel, ts))
+		_ = api.AddReaction("hourglass_flowing_sand", slack.NewRefToMessage(channel, ts))
+		api.PostMessage(channel, slack.MsgOptionText("Review queue full — try again shortly.", false))
+	}
+}
+
 // --- Log Buffer ---
 
 type LogBuffer struct {
@@ -1957,16 +1970,8 @@ func main() {
 
 	queue := NewReviewQueue(workers, queueSize)
 
-	submitReview := func(api SlackAPI, channel, ts string, fn func()) {
-		if !queue.Submit(func() {
-			_ = api.RemoveReaction("claude", slack.NewRefToMessage(channel, ts))
-			fn()
-			queue.completed.Add(1)
-		}) {
-			api.PostMessage(channel, slack.MsgOptionText("Review queue full — try again shortly.", false))
-		} else {
-			_ = api.AddReaction("claude", slack.NewRefToMessage(channel, ts))
-		}
+	submitReviewFn := func(api SlackAPI, channel, ts string, fn func()) {
+		submitReview(api, queue, channel, ts, fn)
 	}
 
 	api := slack.New(botToken, slack.OptionAppLevelToken(appToken))
@@ -2026,7 +2031,7 @@ func main() {
 					}
 				}
 				if rev.Reaction == "claude_it" {
-					submitReview(api, rev.Item.Channel, rev.Item.Timestamp, func() {
+					submitReviewFn(api, rev.Item.Channel, rev.Item.Timestamp, func() {
 						handleReactionReview(api, rev, rev.Item.Channel, notifyUserID, reviewQuestions, watchedChannels, botUserID)
 					})
 				}
@@ -2057,7 +2062,7 @@ func main() {
 						rCtx, cancel := context.WithCancel(ctx)
 						trackReview(msgEv.TimeStamp, prURL, cancel)
 						msgCopy, ownerC, repoC, prNumC, chC := *msgEv, owner, repo, prNum, ev.Channel
-						submitReview(api, ev.Channel, ev.TimeStamp, func() {
+						submitReviewFn(api, ev.Channel, ev.TimeStamp, func() {
 							handlePR(rCtx, api, &msgCopy, prURL, ownerC, repoC, prNumC, chC, notifyUserID, reviewQuestions)
 						})
 					}
@@ -2092,14 +2097,14 @@ func main() {
 						trackReview(msgEv.TimeStamp, prURL, cancel)
 						msgCopy := *msgEv
 						ownerC, repoC, prNumC, chC := owner, repo, prNum, ev.Channel
-						submitReview(api, ev.Channel, ev.TimeStamp, func() {
+						submitReviewFn(api, ev.Channel, ev.TimeStamp, func() {
 							handlePR(rCtx, api, &msgCopy, prURL, ownerC, repoC, prNumC, chC, notifyUserID, reviewQuestions)
 						})
 					} else {
 						rCtx, cancel := context.WithCancel(ctx)
 						trackReview(ev.TimeStamp, prURL, cancel)
 						evCopy := *ev
-						submitReview(api, ev.Channel, ev.TimeStamp, func() {
+						submitReviewFn(api, ev.Channel, ev.TimeStamp, func() {
 							defer untrackReview(evCopy.TimeStamp, prURL)
 							handleThreadFollowup(rCtx, api, &evCopy, owner, repo, prNum, notifyUserID)
 						})
@@ -2130,7 +2135,7 @@ func main() {
 					rCtx, cancel := context.WithCancel(ctx)
 					trackReview(ev.TimeStamp, prURL, cancel)
 					evCopy, ownerC, repoC, prNumC, chC := *ev, owner, repo, prNum, ev.Channel
-					submitReview(api, ev.Channel, ev.TimeStamp, func() {
+					submitReviewFn(api, ev.Channel, ev.TimeStamp, func() {
 						handlePR(rCtx, api, &evCopy, prURL, ownerC, repoC, prNumC, chC, notifyUserID, reviewQuestions)
 					})
 				}

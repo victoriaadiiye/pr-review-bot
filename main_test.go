@@ -3364,3 +3364,64 @@ func TestParseStalePRDays(t *testing.T) {
 		}
 	}
 }
+
+func TestSubmitReview_QueuedGetsClaudeReaction(t *testing.T) {
+	mock := &mockSlack{}
+	queue := NewReviewQueue(1, 5)
+	defer queue.Drain()
+
+	done := make(chan struct{})
+	submitReview(mock, queue, "C123", "1234.5678", func() {
+		close(done)
+	})
+
+	<-done
+	time.Sleep(10 * time.Millisecond)
+
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+
+	if len(mock.reactions) < 1 {
+		t.Fatal("expected at least 1 reaction, got 0")
+	}
+	if mock.reactions[0] != (reactionCall{action: "add", name: "claude"}) {
+		t.Errorf("first reaction = %+v, want add:claude", mock.reactions[0])
+	}
+	if mock.reactions[1] != (reactionCall{action: "remove", name: "claude"}) {
+		t.Errorf("second reaction = %+v, want remove:claude", mock.reactions[1])
+	}
+}
+
+func TestSubmitReview_QueueFullGetsEmoji(t *testing.T) {
+	mock := &mockSlack{}
+	queue := NewReviewQueue(1, 0)
+
+	block := make(chan struct{})
+	queue.Submit(func() { <-block })
+
+	submitReview(mock, queue, "C123", "1234.5678", func() {})
+
+	close(block)
+	queue.Drain()
+
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+
+	wantReactions := []reactionCall{
+		{action: "add", name: "claude"},
+		{action: "remove", name: "claude"},
+		{action: "add", name: "hourglass_flowing_sand"},
+	}
+	if len(mock.reactions) != len(wantReactions) {
+		t.Fatalf("got %d reactions, want %d: %+v", len(mock.reactions), len(wantReactions), mock.reactions)
+	}
+	for i, want := range wantReactions {
+		if mock.reactions[i] != want {
+			t.Errorf("reaction[%d] = %+v, want %+v", i, mock.reactions[i], want)
+		}
+	}
+
+	if len(mock.messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(mock.messages))
+	}
+}
