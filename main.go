@@ -1006,9 +1006,27 @@ func startAuthChecker(ctx context.Context, notify func(msg string)) {
 	}
 }
 
-func handleAuthCommand(ctx context.Context, api SlackAPI, channel, ts, notifyUserID string) {
+type pendingAuthLogin struct {
+	stdin   io.WriteCloser
+	cancel  context.CancelFunc
+	done    chan error
+	started time.Time
+}
+
+var (
+	pendingLoginMu sync.Mutex
+	activeLogin    *pendingAuthLogin
+)
+
+func handleAuthCommand(ctx context.Context, api SlackAPI, channel, ts, notifyUserID, messageText string) {
 	_ = api.AddReaction("key", slack.NewRefToMessage(channel, ts))
 	defer api.RemoveReaction("key", slack.NewRefToMessage(channel, ts))
+
+	code := extractAuthCode(messageText)
+	if code != "" {
+		completeAuthLogin(api, channel, ts, code)
+		return
+	}
 
 	ok, detail := checkClaudeAuth(ctx)
 	if ok {
@@ -1019,40 +1037,191 @@ func handleAuthCommand(ctx context.Context, api SlackAPI, channel, ts, notifyUse
 	}
 
 	_, _, _ = api.PostMessage(channel,
-		slack.MsgOptionText(":x: Claude auth is broken. Attempting headless re-login...", false),
+		slack.MsgOptionText(":x: Claude auth is broken. Starting re-login...", false),
 		slack.MsgOptionTS(ts))
 
 	url, err := startHeadlessLogin(ctx)
 	if err != nil {
 		_, _, _ = api.PostMessage(channel,
-			slack.MsgOptionText(fmt.Sprintf(":rotating_light: Headless login failed: `%v`\nSSH into the host and run `claude auth login` manually.", err), false),
+			slack.MsgOptionText(fmt.Sprintf(":rotating_light: Login failed: `%v`\nSSH into the host and run `claude auth login` manually.", err), false),
 			slack.MsgOptionTS(ts))
 		return
 	}
 
-	dmUser(api, notifyUserID, fmt.Sprintf(":key: *Claude auth expired — complete re-login:*\n%s\n\nOpen this URL in your browser to re-authenticate.", url))
+	dmUser(api, notifyUserID, fmt.Sprintf(":key: *Claude auth expired — complete re-login:*\n<%s>\n\n1. Open the URL above in your browser\n2. Copy the code shown after authorization\n3. Come back here and say `@bot auth <paste-code-here>`", url))
 	_, _, _ = api.PostMessage(channel,
-		slack.MsgOptionText(":arrow_right: Login URL sent via DM. Open it in your browser to re-authenticate.", false),
+		slack.MsgOptionText(":arrow_right: Login URL sent via DM. After authorizing, say `@bot auth <code>` to complete.", false),
 		slack.MsgOptionTS(ts))
 }
 
+func extractAuthCode(text string) string {
+	lower := strings.ToLower(text)
+	idx := strings.Index(lower, "auth")
+	if idx < 0 {
+		return ""
+	}
+	after := strings.TrimSpace(text[idx+4:])
+	after = strings.TrimPrefix(after, " ")
+	fields := strings.Fields(after)
+	if len(fields) == 0 {
+		return ""
+	}
+	candidate := fields[0]
+	if len(candidate) < 10 {
+		return ""
+	}
+	return candidate
+}
+
 func startHeadlessLogin(ctx context.Context) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "claude", "auth", "login")
+	pendingLoginMu.Lock()
+	if activeLogin != nil {
+		activeLogin.cancel()
+		activeLogin = nil
+	}
+	pendingLoginMu.Unlock()
+
+	loginCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+
+	cmd := exec.CommandContext(loginCtx, "claude", "auth", "login")
 	cmd.Env = append(os.Environ(), "BROWSER=echo")
-	out, err := cmd.CombinedOutput()
-	output := strings.TrimSpace(string(out))
-	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://") {
-			return line, nil
-		}
-	}
+
+	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
-		return "", fmt.Errorf("%v — %s", err, output)
+		cancel()
+		return "", fmt.Errorf("stdin pipe: %w", err)
 	}
-	return "", fmt.Errorf("no login URL found in output: %s", output)
+
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		cancel()
+		return "", fmt.Errorf("output pipe: %w", err)
+	}
+	cmd.Stdout = outW
+	cmd.Stderr = outW
+
+	if err := cmd.Start(); err != nil {
+		cancel()
+		return "", fmt.Errorf("start: %w", err)
+	}
+	outW.Close()
+
+	urlCh := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 8192)
+		var collected string
+		for {
+			n, readErr := outR.Read(buf)
+			if n > 0 {
+				collected += string(buf[:n])
+				if u := extractURLFromOutput(collected); u != "" {
+					urlCh <- u
+					return
+				}
+			}
+			if readErr != nil {
+				urlCh <- ""
+				return
+			}
+		}
+	}()
+
+	select {
+	case u := <-urlCh:
+		if u == "" {
+			cancel()
+			_ = cmd.Wait()
+			return "", fmt.Errorf("no login URL found in output")
+		}
+
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+
+		pendingLoginMu.Lock()
+		activeLogin = &pendingAuthLogin{
+			stdin:   stdinPipe,
+			cancel:  cancel,
+			done:    done,
+			started: time.Now(),
+		}
+		pendingLoginMu.Unlock()
+
+		return u, nil
+
+	case <-time.After(15 * time.Second):
+		cancel()
+		_ = cmd.Wait()
+		return "", fmt.Errorf("timeout waiting for login URL")
+	}
+}
+
+var urlInOutputPattern = regexp.MustCompile(`https?://[^\s>]+`)
+
+func extractURLFromOutput(s string) string {
+	m := urlInOutputPattern.FindString(s)
+	return m
+}
+
+func completeAuthLogin(api SlackAPI, channel, ts, code string) {
+	pendingLoginMu.Lock()
+	login := activeLogin
+	pendingLoginMu.Unlock()
+
+	if login == nil {
+		_, _, _ = api.PostMessage(channel,
+			slack.MsgOptionText(":warning: No pending login. Say `@bot auth` first to start the flow.", false),
+			slack.MsgOptionTS(ts))
+		return
+	}
+
+	_, err := io.WriteString(login.stdin, code+"\n")
+	login.stdin.Close()
+	if err != nil {
+		_, _, _ = api.PostMessage(channel,
+			slack.MsgOptionText(fmt.Sprintf(":x: Failed to send code: `%v`", err), false),
+			slack.MsgOptionTS(ts))
+		login.cancel()
+		pendingLoginMu.Lock()
+		activeLogin = nil
+		pendingLoginMu.Unlock()
+		return
+	}
+
+	select {
+	case waitErr := <-login.done:
+		pendingLoginMu.Lock()
+		activeLogin = nil
+		pendingLoginMu.Unlock()
+
+		if waitErr != nil {
+			_, _, _ = api.PostMessage(channel,
+				slack.MsgOptionText(fmt.Sprintf(":x: Login process failed: `%v`", waitErr), false),
+				slack.MsgOptionTS(ts))
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		ok, detail := checkClaudeAuth(ctx)
+		if ok {
+			_, _, _ = api.PostMessage(channel,
+				slack.MsgOptionText(":white_check_mark: Claude auth restored!\n```"+detail+"```", false),
+				slack.MsgOptionTS(ts))
+		} else {
+			_, _, _ = api.PostMessage(channel,
+				slack.MsgOptionText(fmt.Sprintf(":warning: Login process completed but auth still failing:\n```%s```", detail), false),
+				slack.MsgOptionTS(ts))
+		}
+
+	case <-time.After(30 * time.Second):
+		login.cancel()
+		pendingLoginMu.Lock()
+		activeLogin = nil
+		pendingLoginMu.Unlock()
+		_, _, _ = api.PostMessage(channel,
+			slack.MsgOptionText(":x: Login process timed out after submitting code.", false),
+			slack.MsgOptionTS(ts))
+	}
 }
 
 // --- Stale PR Detection ---
@@ -1507,6 +1676,46 @@ func startHealthServer(port string, queue *ReviewQueue, logBuf *LogBuffer, revie
 
 	mux.HandleFunc("/auth-login", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost {
+			var req struct {
+				Code string `json:"code"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Code == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": "code required"})
+				return
+			}
+			pendingLoginMu.Lock()
+			login := activeLogin
+			pendingLoginMu.Unlock()
+			if login == nil {
+				w.WriteHeader(http.StatusConflict)
+				json.NewEncoder(w).Encode(map[string]string{"error": "no pending login — GET /auth-login first"})
+				return
+			}
+			io.WriteString(login.stdin, req.Code+"\n")
+			login.stdin.Close()
+			select {
+			case err := <-login.done:
+				pendingLoginMu.Lock()
+				activeLogin = nil
+				pendingLoginMu.Unlock()
+				if err != nil {
+					w.WriteHeader(http.StatusInternalServerError)
+					json.NewEncoder(w).Encode(map[string]string{"status": "failed", "error": err.Error()})
+				} else {
+					json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+				}
+			case <-time.After(30 * time.Second):
+				login.cancel()
+				pendingLoginMu.Lock()
+				activeLogin = nil
+				pendingLoginMu.Unlock()
+				w.WriteHeader(http.StatusGatewayTimeout)
+				json.NewEncoder(w).Encode(map[string]string{"status": "timeout"})
+			}
+			return
+		}
 		url, err := startHeadlessLogin(r.Context())
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -2151,7 +2360,7 @@ func main() {
 				}
 
 				if strings.Contains(strings.ToLower(ev.Text), "auth") && !isPRURL(ev.Text) {
-					go handleAuthCommand(ctx, api, ev.Channel, ev.TimeStamp, notifyUserID)
+					go handleAuthCommand(ctx, api, ev.Channel, ev.TimeStamp, notifyUserID, ev.Text)
 					continue
 				}
 

@@ -67,9 +67,14 @@ tasks:
       - 'sudo docker compose exec bot claude -p "say ok" --max-turns 1'
 
   fix-auth:
-    desc: Trigger headless Claude re-login and print the auth URL
+    desc: "Start headless Claude re-login (prints URL, then: task fix-auth-complete -- <code>)"
     cmds:
       - 'curl -s http://localhost:${HEALTH_PORT:-8080}/auth-login | python3 -m json.tool'
+
+  fix-auth-complete:
+    desc: Complete headless re-login by submitting the auth code
+    cmds:
+      - 'curl -s -X POST http://localhost:${HEALTH_PORT:-8080}/auth-login -H "Content-Type: application/json" -d "{\"code\":\"{{.CLI_ARGS}}\"}" | python3 -m json.tool'
 
   deploy-legacy:
     desc: "Legacy: Pull, rebuild, restart in tmux (no Docker)"
