@@ -61,6 +61,16 @@ tasks:
     cmds:
       - echo "$VSCODE_PROXY_URI/dashboard" | sed 's/{{"{{"}}port{{"}}"}}/8080/'
 
+  check-auth:
+    desc: Verify Claude CLI auth inside the running container
+    cmds:
+      - 'sudo docker compose exec bot claude -p "say ok" --max-turns 1'
+
+  fix-auth:
+    desc: Trigger headless Claude re-login and print the auth URL
+    cmds:
+      - 'curl -s http://localhost:${HEALTH_PORT:-8080}/auth-login | python3 -m json.tool'
+
   deploy-legacy:
     desc: "Legacy: Pull, rebuild, restart in tmux (no Docker)"
     cmds:

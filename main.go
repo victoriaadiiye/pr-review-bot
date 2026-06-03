@@ -969,6 +969,92 @@ func startMidnightJobs(ctx context.Context, cfg midnightJobConfig) {
 	}
 }
 
+// --- Auth Checker ---
+
+func checkClaudeAuth(ctx context.Context) (ok bool, detail string) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "claude", "-p", "say ok", "--max-turns", "1")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, fmt.Sprintf("claude auth failed: %v — %s", err, strings.TrimSpace(string(out)))
+	}
+	return true, strings.TrimSpace(string(out))
+}
+
+func startAuthChecker(ctx context.Context, notify func(msg string)) {
+	wait := timeUntilNext(8, 0, time.Now())
+	log.Printf("auth-checker: next run in %s", wait.Round(time.Minute))
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			log.Println("auth-checker: verifying claude auth...")
+			ok, detail := checkClaudeAuth(ctx)
+			if ok {
+				log.Printf("auth-checker: claude auth ok")
+			} else {
+				log.Printf("auth-checker: %s", detail)
+				notify(fmt.Sprintf(":rotating_light: *Daily auth check failed*\n```%s```\nRe-authenticate with `claude login` on the bot host.", detail))
+			}
+			timer.Reset(timeUntilNext(8, 0, time.Now()))
+		}
+	}
+}
+
+func handleAuthCommand(ctx context.Context, api SlackAPI, channel, ts, notifyUserID string) {
+	_ = api.AddReaction("key", slack.NewRefToMessage(channel, ts))
+	defer api.RemoveReaction("key", slack.NewRefToMessage(channel, ts))
+
+	ok, detail := checkClaudeAuth(ctx)
+	if ok {
+		_, _, _ = api.PostMessage(channel,
+			slack.MsgOptionText(":white_check_mark: Claude auth is healthy.\n```"+detail+"```", false),
+			slack.MsgOptionTS(ts))
+		return
+	}
+
+	_, _, _ = api.PostMessage(channel,
+		slack.MsgOptionText(":x: Claude auth is broken. Attempting headless re-login...", false),
+		slack.MsgOptionTS(ts))
+
+	url, err := startHeadlessLogin(ctx)
+	if err != nil {
+		_, _, _ = api.PostMessage(channel,
+			slack.MsgOptionText(fmt.Sprintf(":rotating_light: Headless login failed: `%v`\nSSH into the host and run `claude auth login` manually.", err), false),
+			slack.MsgOptionTS(ts))
+		return
+	}
+
+	dmUser(api, notifyUserID, fmt.Sprintf(":key: *Claude auth expired — complete re-login:*\n%s\n\nOpen this URL in your browser to re-authenticate.", url))
+	_, _, _ = api.PostMessage(channel,
+		slack.MsgOptionText(":arrow_right: Login URL sent via DM. Open it in your browser to re-authenticate.", false),
+		slack.MsgOptionTS(ts))
+}
+
+func startHeadlessLogin(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "claude", "auth", "login")
+	cmd.Env = append(os.Environ(), "BROWSER=echo")
+	out, err := cmd.CombinedOutput()
+	output := strings.TrimSpace(string(out))
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "http://") || strings.HasPrefix(line, "https://") {
+			return line, nil
+		}
+	}
+	if err != nil {
+		return "", fmt.Errorf("%v — %s", err, output)
+	}
+	return "", fmt.Errorf("no login URL found in output: %s", output)
+}
+
 // --- Stale PR Detection ---
 
 type stalePRCandidate struct {
@@ -1406,6 +1492,28 @@ func startHealthServer(port string, queue *ReviewQueue, logBuf *LogBuffer, revie
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, `{"status":"ok","uptime":"%s"}`, time.Since(queue.startTime).Round(time.Second))
+	})
+
+	mux.HandleFunc("/auth-check", func(w http.ResponseWriter, r *http.Request) {
+		ok, detail := checkClaudeAuth(r.Context())
+		w.Header().Set("Content-Type", "application/json")
+		status := "ok"
+		if !ok {
+			status = "failed"
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		json.NewEncoder(w).Encode(map[string]string{"claude_auth": status, "detail": detail})
+	})
+
+	mux.HandleFunc("/auth-login", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		url, err := startHeadlessLogin(r.Context())
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"status": "failed", "error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{"status": "login_required", "url": url})
 	})
 
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
@@ -2041,6 +2149,12 @@ func main() {
 				if !ok {
 					continue
 				}
+
+				if strings.Contains(strings.ToLower(ev.Text), "auth") && !isPRURL(ev.Text) {
+					go handleAuthCommand(ctx, api, ev.Channel, ev.TimeStamp, notifyUserID)
+					continue
+				}
+
 				refs := findPRRefs(ev.Text)
 				isReviewRequest := reviewRequestPattern.MatchString(ev.Text)
 				inThread := ev.ThreadTimeStamp != ""
@@ -2158,6 +2272,7 @@ func main() {
 		SubmitReview: reviewHandler,
 		NotifyStale:  func(msg string) { dmUser(api, notifyUserID, msg) },
 	})
+	go startAuthChecker(ctx, func(msg string) { dmUser(api, notifyUserID, msg) })
 
 	go func() {
 		if err := client.RunContext(ctx); err != nil && ctx.Err() == nil {
