@@ -2490,12 +2490,19 @@ func main() {
 		autoReviewBotLogin = "qompass-pr-review-bot"
 	}
 	staleDays := parseStalePRDays(os.Getenv("STALE_PR_DAYS"))
+	staleReportChannel := os.Getenv("STALE_REPORT_CHANNEL")
 	go startMidnightJobs(ctx, midnightJobConfig{
 		Repos:        autoReviewRepos,
 		BotLogin:     autoReviewBotLogin,
 		StaleDays:    staleDays,
 		SubmitReview: reviewHandler,
-		NotifyStale:  func(msg string) { dmUser(api, notifyUserID, msg) },
+		NotifyStale: func(msg string) {
+			if staleReportChannel != "" {
+				api.PostMessage(staleReportChannel, slack.MsgOptionText(msg, false))
+			} else {
+				dmUser(api, notifyUserID, msg)
+			}
+		},
 	})
 	go startAuthChecker(ctx, func(msg string) { dmUser(api, notifyUserID, msg) })
 
