@@ -3079,8 +3079,8 @@ func TestParseAutoReviewRepos(t *testing.T) {
 
 func TestParseOpenPRsJSON(t *testing.T) {
 	jsonData := `[
-		{"number": 42, "url": "https://github.com/Qumulo/qompass/pull/42", "author": {"login": "alice"}},
-		{"number": 99, "url": "https://github.com/Qumulo/qompass/pull/99", "author": {"login": "bob"}}
+		{"number": 42, "url": "https://github.com/Qumulo/qompass/pull/42", "author": {"login": "alice"}, "isDraft": false},
+		{"number": 99, "url": "https://github.com/Qumulo/qompass/pull/99", "author": {"login": "bob"}, "isDraft": true}
 	]`
 	prs, err := parseOpenPRsJSON([]byte(jsonData))
 	if err != nil {
@@ -3089,11 +3089,26 @@ func TestParseOpenPRsJSON(t *testing.T) {
 	if len(prs) != 2 {
 		t.Fatalf("got %d PRs, want 2", len(prs))
 	}
-	if prs[0].Number != 42 || prs[0].Author != "alice" {
+	if prs[0].Number != 42 || prs[0].Author != "alice" || prs[0].IsDraft {
 		t.Errorf("pr[0] = %+v", prs[0])
 	}
-	if prs[1].Number != 99 || prs[1].Author != "bob" {
+	if prs[1].Number != 99 || prs[1].Author != "bob" || !prs[1].IsDraft {
 		t.Errorf("pr[1] = %+v", prs[1])
+	}
+}
+
+func TestFilterUnreviewedPRs_SkipsDrafts(t *testing.T) {
+	prs := []openPR{
+		{Number: 1, URL: "u1", Author: "alice", IsDraft: false},
+		{Number: 2, URL: "u2", Author: "bob", IsDraft: true},
+		{Number: 3, URL: "u3", Author: "charlie", IsDraft: false},
+	}
+	got := filterUnreviewedPRs(prs, map[int]bool{})
+	if len(got) != 2 {
+		t.Fatalf("got %d unreviewed, want 2 (draft should be filtered)", len(got))
+	}
+	if got[0].Number != 1 || got[1].Number != 3 {
+		t.Errorf("wrong PRs: %+v", got)
 	}
 }
 
@@ -3199,9 +3214,9 @@ func TestTimeUntilNext(t *testing.T) {
 
 func TestParseStalePRCandidates(t *testing.T) {
 	data := `[
-		{"number":10,"url":"https://github.com/O/R/pull/10","title":"old PR","body":"## Summary\nFixes the auth bug","author":{"login":"alice"},"updatedAt":"2026-05-01T00:00:00Z"},
-		{"number":20,"url":"https://github.com/O/R/pull/20","title":"fresh PR","body":"","author":{"login":"bob"},"updatedAt":"2026-05-28T00:00:00Z"},
-		{"number":30,"url":"https://github.com/O/R/pull/30","title":"ancient PR","body":"Long description here","author":{"login":"charlie"},"updatedAt":"2026-04-01T00:00:00Z"}
+		{"number":10,"url":"https://github.com/O/R/pull/10","title":"old PR","body":"## Summary\nFixes the auth bug","author":{"login":"alice"},"updatedAt":"2026-05-01T00:00:00Z","isDraft":false},
+		{"number":20,"url":"https://github.com/O/R/pull/20","title":"fresh PR","body":"","author":{"login":"bob"},"updatedAt":"2026-05-28T00:00:00Z","isDraft":true},
+		{"number":30,"url":"https://github.com/O/R/pull/30","title":"ancient PR","body":"Long description here","author":{"login":"charlie"},"updatedAt":"2026-04-01T00:00:00Z","isDraft":false}
 	]`
 	prs, err := parseStalePRCandidates([]byte(data))
 	if err != nil {
@@ -3210,7 +3225,7 @@ func TestParseStalePRCandidates(t *testing.T) {
 	if len(prs) != 3 {
 		t.Fatalf("got %d PRs, want 3", len(prs))
 	}
-	if prs[0].Title != "old PR" || prs[0].Author != "alice" {
+	if prs[0].Title != "old PR" || prs[0].Author != "alice" || prs[0].IsDraft {
 		t.Errorf("pr[0] = %+v", prs[0])
 	}
 	if prs[0].Body != "## Summary\nFixes the auth bug" {
@@ -3219,6 +3234,9 @@ func TestParseStalePRCandidates(t *testing.T) {
 	if prs[1].UpdatedAt.IsZero() {
 		t.Error("updatedAt should be parsed")
 	}
+	if !prs[1].IsDraft {
+		t.Error("pr[1] should be draft")
+	}
 }
 
 func TestFilterStalePRs(t *testing.T) {
@@ -3226,7 +3244,7 @@ func TestFilterStalePRs(t *testing.T) {
 	prs := []stalePRCandidate{
 		{Number: 10, Title: "old", Author: "alice", Body: "Fixes stuff", UpdatedAt: now.Add(-15 * 24 * time.Hour)},
 		{Number: 20, Title: "fresh", Author: "bob", UpdatedAt: now.Add(-3 * 24 * time.Hour)},
-		{Number: 30, URL: "u", Title: "ancient", Author: "charlie", Body: "Big refactor", UpdatedAt: now.Add(-60 * 24 * time.Hour)},
+		{Number: 30, URL: "u", Title: "ancient", Author: "charlie", Body: "Big refactor", IsDraft: true, UpdatedAt: now.Add(-60 * 24 * time.Hour)},
 	}
 	stale := filterStalePRs(prs, 14, now)
 	if len(stale) != 2 {
@@ -3237,6 +3255,9 @@ func TestFilterStalePRs(t *testing.T) {
 	}
 	if stale[0].Body != "Big refactor" {
 		t.Errorf("stale[0].Body = %q, want %q", stale[0].Body, "Big refactor")
+	}
+	if !stale[0].IsDraft {
+		t.Error("stale[0] should preserve IsDraft=true from candidate")
 	}
 	if stale[1].Number != 10 {
 		t.Errorf("expected second most stale, got #%d", stale[1].Number)
@@ -3285,7 +3306,7 @@ func TestFormatStalePRReport(t *testing.T) {
 	now := time.Date(2026, 5, 29, 0, 0, 0, 0, time.UTC)
 	stale := []stalePR{
 		{Number: 10, URL: "https://github.com/O/R/pull/10", Title: "old PR", Author: "alice", DaysStale: 15, Body: "Fixes auth"},
-		{Number: 30, URL: "https://github.com/O/R/pull/30", Title: "ancient PR", Author: "charlie", DaysStale: 60, Body: "Big refactor of the core module"},
+		{Number: 30, URL: "https://github.com/O/R/pull/30", Title: "ancient PR", Author: "charlie", DaysStale: 60, Body: "Big refactor of the core module", IsDraft: true},
 	}
 	report := formatStalePRReport("Org/Repo", stale, now)
 	if !strings.Contains(report, "Org/Repo") {
@@ -3305,6 +3326,9 @@ func TestFormatStalePRReport(t *testing.T) {
 	}
 	if !strings.Contains(report, "Big refactor") {
 		t.Error("report should contain PR body summary")
+	}
+	if !strings.Contains(report, "[Draft]") {
+		t.Error("report should annotate draft PRs with [Draft]")
 	}
 }
 

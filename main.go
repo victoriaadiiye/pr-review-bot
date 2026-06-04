@@ -803,9 +803,10 @@ type repoRef struct {
 }
 
 type openPR struct {
-	Number int    `json:"number"`
-	URL    string `json:"url"`
-	Author string
+	Number  int    `json:"number"`
+	URL     string `json:"url"`
+	Author  string
+	IsDraft bool
 }
 
 func parseAutoReviewRepos(s string) []repoRef {
@@ -834,9 +835,10 @@ func timeUntilNext(hour, min int, now time.Time) time.Duration {
 
 func parseOpenPRsJSON(data []byte) ([]openPR, error) {
 	var raw []struct {
-		Number int    `json:"number"`
-		URL    string `json:"url"`
-		Author struct {
+		Number  int    `json:"number"`
+		URL     string `json:"url"`
+		IsDraft bool   `json:"isDraft"`
+		Author  struct {
 			Login string `json:"login"`
 		} `json:"author"`
 	}
@@ -845,7 +847,7 @@ func parseOpenPRsJSON(data []byte) ([]openPR, error) {
 	}
 	prs := make([]openPR, len(raw))
 	for i, r := range raw {
-		prs[i] = openPR{Number: r.Number, URL: r.URL, Author: r.Author.Login}
+		prs[i] = openPR{Number: r.Number, URL: r.URL, Author: r.Author.Login, IsDraft: r.IsDraft}
 	}
 	return prs, nil
 }
@@ -872,7 +874,7 @@ func hasCommentByUser(data []byte, login string) bool {
 func filterUnreviewedPRs(prs []openPR, reviewed map[int]bool) []openPR {
 	var result []openPR
 	for _, pr := range prs {
-		if !reviewed[pr.Number] {
+		if !reviewed[pr.Number] && !pr.IsDraft {
 			result = append(result, pr)
 		}
 	}
@@ -883,7 +885,7 @@ func listOpenPRs(ctx context.Context, owner, repo string) ([]openPR, error) {
 	cmd := exec.CommandContext(ctx, "gh", "pr", "list",
 		"--repo", fmt.Sprintf("%s/%s", owner, repo),
 		"--state", "open",
-		"--json", "number,url,author",
+		"--json", "number,url,author,isDraft",
 		"--limit", "50")
 	out, err := cmd.Output()
 	if err != nil {
@@ -929,6 +931,11 @@ func startMidnightJobs(ctx context.Context, cfg midnightJobConfig) {
 			key := fmt.Sprintf("%s/%s", r.Owner, r.Repo)
 			skip := make(map[int]bool)
 			for _, pr := range prs {
+				if pr.IsDraft {
+					log.Printf("auto-review: skipping %s#%d (draft)", key, pr.Number)
+					skip[pr.Number] = true
+					continue
+				}
 				if checkPRReviewedBy(ctx, r.Owner, r.Repo, pr.Number, cfg.BotLogin) {
 					skip[pr.Number] = true
 				}
@@ -1232,6 +1239,7 @@ type stalePRCandidate struct {
 	Title     string    `json:"title"`
 	Body      string
 	Author    string
+	IsDraft   bool
 	UpdatedAt time.Time
 }
 
@@ -1241,6 +1249,7 @@ type stalePR struct {
 	Title     string
 	Body      string
 	Author    string
+	IsDraft   bool
 	DaysStale int
 }
 
@@ -1261,6 +1270,7 @@ func parseStalePRCandidates(data []byte) ([]stalePRCandidate, error) {
 		URL       string `json:"url"`
 		Title     string `json:"title"`
 		Body      string `json:"body"`
+		IsDraft   bool   `json:"isDraft"`
 		UpdatedAt string `json:"updatedAt"`
 		Author    struct {
 			Login string `json:"login"`
@@ -1278,6 +1288,7 @@ func parseStalePRCandidates(data []byte) ([]stalePRCandidate, error) {
 			Title:     r.Title,
 			Body:      r.Body,
 			Author:    r.Author.Login,
+			IsDraft:   r.IsDraft,
 			UpdatedAt: t,
 		}
 	}
@@ -1296,6 +1307,7 @@ func filterStalePRs(prs []stalePRCandidate, thresholdDays int, now time.Time) []
 				Title:     pr.Title,
 				Body:      pr.Body,
 				Author:    pr.Author,
+				IsDraft:   pr.IsDraft,
 				DaysStale: days,
 			})
 		}
@@ -1339,7 +1351,11 @@ func formatStalePRReport(repoFullName string, stale []stalePR, now time.Time) st
 	var b strings.Builder
 	fmt.Fprintf(&b, ":warning: *%d stale PR(s) in %s* (no activity >%dd)\n", len(stale), repoFullName, stale[len(stale)-1].DaysStale)
 	for _, pr := range stale {
-		fmt.Fprintf(&b, ">  • <%s|#%d> %s — @%s (%dd stale)\n", pr.URL, pr.Number, pr.Title, pr.Author, pr.DaysStale)
+		draft := ""
+		if pr.IsDraft {
+			draft = " [Draft]"
+		}
+		fmt.Fprintf(&b, ">  • <%s|#%d> %s%s — @%s (%dd stale)\n", pr.URL, pr.Number, pr.Title, draft, pr.Author, pr.DaysStale)
 		if summary := truncateBody(pr.Body, 150); summary != "" {
 			fmt.Fprintf(&b, ">    _%s_\n", summary)
 		}
@@ -1352,7 +1368,7 @@ func listStalePRCandidates(ctx context.Context, owner, repo string) ([]stalePRCa
 	cmd := exec.CommandContext(ctx, "gh", "pr", "list",
 		"--repo", fmt.Sprintf("%s/%s", owner, repo),
 		"--state", "open",
-		"--json", "number,url,title,body,author,updatedAt",
+		"--json", "number,url,title,body,author,updatedAt,isDraft",
 		"--limit", "100")
 	out, err := cmd.Output()
 	if err != nil {
