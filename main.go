@@ -2339,6 +2339,9 @@ func main() {
 	logBuf := NewLogBuffer(500)
 	log.SetOutput(io.MultiWriter(os.Stderr, logBuf))
 
+	autoReviewRepos := parseAutoReviewRepos(os.Getenv("AUTO_REVIEW_REPOS"))
+	staleDays := parseStalePRDays(os.Getenv("STALE_PR_DAYS"))
+
 	healthSrv := startHealthServer(healthPort, queue, logBuf, reviewHandler)
 
 	go func() {
@@ -2377,6 +2380,24 @@ func main() {
 
 				if strings.Contains(strings.ToLower(ev.Text), "auth") && !isPRURL(ev.Text) {
 					go handleAuthCommand(ctx, api, ev.Channel, ev.TimeStamp, notifyUserID, ev.Text)
+					continue
+				}
+
+				if strings.Contains(strings.ToLower(ev.Text), "stale") && !isPRURL(ev.Text) {
+					go func() {
+						api.AddReaction("hourglass_flowing_sand", slack.ItemRef{Channel: ev.Channel, Timestamp: ev.TimeStamp})
+						if len(autoReviewRepos) == 0 {
+							api.PostMessage(ev.Channel, slack.MsgOptionText("No repos configured for stale PR tracking (set AUTO_REVIEW_REPOS).", false),
+								slack.MsgOptionTS(ev.TimeStamp))
+							return
+						}
+						notify := func(msg string) {
+							api.PostMessage(ev.Channel, slack.MsgOptionText(msg, false),
+								slack.MsgOptionTS(ev.TimeStamp))
+						}
+						runStalePRCheck(ctx, autoReviewRepos, staleDays, notify)
+						api.AddReaction("white_check_mark", slack.ItemRef{Channel: ev.Channel, Timestamp: ev.TimeStamp})
+					}()
 					continue
 				}
 
@@ -2484,12 +2505,10 @@ func main() {
 
 	log.Println("PR Review Bot running...")
 
-	autoReviewRepos := parseAutoReviewRepos(os.Getenv("AUTO_REVIEW_REPOS"))
 	autoReviewBotLogin := os.Getenv("AUTO_REVIEW_BOT_LOGIN")
 	if autoReviewBotLogin == "" {
 		autoReviewBotLogin = "qompass-pr-review-bot"
 	}
-	staleDays := parseStalePRDays(os.Getenv("STALE_PR_DAYS"))
 	staleReportChannel := os.Getenv("STALE_REPORT_CHANNEL")
 	go startMidnightJobs(ctx, midnightJobConfig{
 		Repos:        autoReviewRepos,
